@@ -148,6 +148,17 @@ def save_model(
     print(f"Model saved to [bold]{save_directory}[/].")
 
 
+def apply_path_settings(settings: Settings) -> None:
+    """Apply path-related settings as environment variables."""
+    if settings.tmpdir is not None:
+        os.makedirs(settings.tmpdir, exist_ok=True)
+        os.environ["TMPDIR"] = settings.tmpdir
+
+    if settings.hf_home is not None:
+        os.makedirs(settings.hf_home, exist_ok=True)
+        os.environ["HF_HOME"] = settings.hf_home
+
+
 def run():
     # Enable expandable segments to reduce memory fragmentation on multi-GPU setups.
     if (
@@ -190,6 +201,9 @@ def run():
             "Run [bold]heretic --help[/] or see [bold]config.default.toml[/] for details about configuration parameters."
         )
         return
+
+    # Apply path settings as environment variables before any HuggingFace operations.
+    apply_path_settings(settings)
 
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
@@ -423,8 +437,8 @@ def run():
             # adjusted for future models.
             max_weight = trial.suggest_float(
                 f"{component}.max_weight",
-                0.8,
-                1.5,
+                settings.max_weight_min,
+                settings.max_weight_max,
             )
             max_weight_position = trial.suggest_float(
                 f"{component}.max_weight_position",

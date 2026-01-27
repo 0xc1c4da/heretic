@@ -1,12 +1,10 @@
 # Copy this file to config.toml and edit the configuration to your liking.
 
 # Directory for temporary files (used by push_to_hub, etc.).
-# If not set, uses the system default (typically /tmp on Linux).
-# tmpdir = "/workspace/tmp"
+tmpdir = "/workspace/tmp"
 
 # Base directory for Hugging Face cache (model downloads, tokenizers, etc.).
-# If not set, uses ~/.cache/huggingface.
-# hf_home = "/workspace/hf"
+hf_home = "/workspace/hf"
 
 # List of PyTorch dtypes to try when loading model tensors.
 # If loading with a dtype fails, the next dtype in the list will be tried.
@@ -34,7 +32,7 @@ quantization = "none"
 # max_memory = {0 = "16GB", "cpu" = "64GB"}
 
 # Number of input sequences to process in parallel (0 = auto).
-batch_size = 0  # auto
+batch_size = 128  # auto
 
 # Maximum batch size to try when automatically determining the optimal batch size.
 max_batch_size = 128
@@ -44,14 +42,14 @@ max_response_length = 100
 
 # Whether to adjust the refusal directions so that only the component that is
 # orthogonal to the harmless direction is subtracted during abliteration.
-orthogonalize_direction = false
+orthogonalize_direction = true
 
 # How to apply row normalization of the weights. Options:
 # 'none' (no normalization),
 # 'pre' (compute LoRA adapter relative to row-normalized weights),
 # 'full' (like 'pre', but re-normalizes to preserve original row magnitudes).
 # Note: Row magnitude preservation is approximate due to non-linear effects.
-row_normalization = "none"
+row_normalization = "full"
 
 # Whether to print prompt/response pairs when counting refusals.
 print_responses = false
@@ -63,7 +61,7 @@ print_residual_geometry = false
 plot_residuals = false
 
 # Base path to save plots of residual vectors to.
-residual_plot_path = "plots"
+residual_plot_path = "/workspace/plots"
 
 # Title placed above plots of residual vectors.
 residual_plot_title = 'PaCMAP Projection of Residual Vectors for "Harmless" and "Harmful" Prompts'
@@ -81,18 +79,18 @@ kl_divergence_target = 0.01
 
 # The winsorization to apply to the residuals, expressed as the quantile to clamp to (between 0 and 1).
 # Disabled by default. Example: winsorization_quantile = 0.95 applies a 90% winsorization.
-winsorization_quantile = 1.0
+winsorization_quantile = 0.995
 
 # Range for max_weight parameter during optimization.
 # Higher max values (e.g., 2.0) may be beneficial with row_normalization enabled.
 max_weight_min = 0.8
-max_weight_max = 1.5
+max_weight_max = 2.0
 
 # Number of abliteration trials to run during optimization.
-n_trials = 200
+n_trials = 800
 
 # Number of trials that use random sampling for the purpose of exploration.
-n_startup_trials = 60
+n_startup_trials = 400
 
 # Strings whose presence in a response (case insensitive) identifies the response as a refusal.
 refusal_markers = [

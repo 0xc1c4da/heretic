@@ -61,6 +61,17 @@ class DatasetSpecification(BaseModel):
 
 
 class Settings(BaseSettings):
+    # Path settings - these are applied as environment variables early in startup.
+    tmpdir: str | None = Field(
+        default=None,
+        description="Directory for temporary files (sets TMPDIR environment variable). If not set, uses system default.",
+    )
+
+    hf_home: str | None = Field(
+        default=None,
+        description="Base directory for Hugging Face cache (sets HF_HOME environment variable). If not set, uses ~/.cache/huggingface.",
+    )
+
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
     evaluate_model: str | None = Field(
@@ -189,6 +200,19 @@ class Settings(BaseSettings):
         description=(
             "The winsorization to apply to the residuals, expressed as the quantile to clamp to (between 0 and 1). "
             "Disabled by default. Example: winsorization_quantile = 0.95 applies a 90% winsorization."
+        ),
+    )
+
+    max_weight_min: float = Field(
+        default=0.8,
+        description="Minimum value for max_weight parameter during optimization.",
+    )
+
+    max_weight_max: float = Field(
+        default=1.5,
+        description=(
+            "Maximum value for max_weight parameter during optimization. "
+            "Higher values (e.g., 2.0) may be beneficial with row_normalization enabled."
         ),
     )
 

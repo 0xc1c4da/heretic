@@ -16,4 +16,4 @@ wheels/
 /.vscode/
 
 # Configuration files
-/config.toml
+# /config.toml
