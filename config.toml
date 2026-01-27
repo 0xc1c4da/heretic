@@ -26,7 +26,7 @@ device_map = "auto"
 
 # Quantization method to use when loading the model.
 # Options: "none" (no quantization), "bnb_4bit" (4-bit quantization using bitsandbytes).
-quantization = "none"
+quantization = "bnb_4bit"
 
 # Memory limits to impose. 0 is usually your first graphics card.
 # max_memory = {0 = "16GB", "cpu" = "64GB"}
