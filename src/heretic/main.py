@@ -535,8 +535,8 @@ def run():
             # adjusted for future models.
             max_weight = trial.suggest_float(
                 f"{component}.max_weight",
-                0.8,
-                1.5,
+                settings.max_weight_min,
+                settings.max_weight_max,
             )
             max_weight_position = trial.suggest_float(
                 f"{component}.max_weight_position",

@@ -232,6 +232,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    max_weight_min: float = Field(
+        default=0.8,
+        description="Minimum value for max_weight parameter during optimization.",
+    )
+
+    max_weight_max: float = Field(
+        default=1.5,
+        description=(
+            "Maximum value for max_weight parameter during optimization. "
+            "Higher values (e.g., 2.0+) may be beneficial with row_normalization enabled."
+        ),
+    )
+
     n_trials: int = Field(
         default=200,
         description="Number of abliteration trials to run during optimization.",
