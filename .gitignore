@@ -16,7 +16,7 @@ wheels/
 /.vscode/
 
 # Configuration files
-/config.toml
+# /config.toml
 
 # Study checkpoints
 /checkpoints/*.jsonl
