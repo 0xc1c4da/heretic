@@ -34,8 +34,11 @@ max_batch_size = 128
 # Maximum number of tokens to generate for each response.
 max_response_length = 100
 
-# Whether to adjust the refusal directions so that only the component that is
-# orthogonal to the harmless direction is subtracted during abliteration.
+# Controls whether refusal directions are orthogonalized against the harmless direction.
+#
+# - true / false: lock the choice for the entire run.
+# - N (non-negative int): run an early A/B gate for N trials total (split across both choices),
+#   then lock the better choice for the remainder of the run.
 orthogonalize_direction = false
 
 # How to apply row normalization of the weights. Options:

@@ -87,6 +87,10 @@ greater control. Run `heretic --help` to see available command-line options,
 or look at [`config.default.toml`](config.default.toml) if you prefer to use
 a configuration file.
 
+For expensive runs, you can set `orthogonalize_direction` to a **non-negative integer**
+to run an early A/B gate (that many trials total) to choose whether orthogonalization
+helps for your model, then lock the better choice for the rest of the optimization.
+
 At the start of a program run, Heretic benchmarks the system to determine
 the optimal batch size to make the most of the available hardware.
 On an RTX 3090, with the default configuration, decensoring Llama-3.1-8B

@@ -419,18 +419,30 @@ def run():
     harmless_means = good_residuals.mean(dim=0)
     harmful_means = bad_residuals.mean(dim=0)
 
-    refusal_directions = F.normalize(harmful_means - harmless_means, p=2, dim=1)
+    def compute_refusal_directions(orthogonalize: bool) -> torch.Tensor:
+        directions = F.normalize(harmful_means - harmless_means, p=2, dim=1)
 
-    if settings.orthogonalize_direction:
-        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the refusal directions so that only the component that is
-        # orthogonal to the harmless direction is subtracted during abliteration.
-        harmless_directions = F.normalize(harmless_means, p=2, dim=1)
-        projection_vector = torch.sum(refusal_directions * harmless_directions, dim=1)
-        refusal_directions = (
-            refusal_directions - projection_vector.unsqueeze(1) * harmless_directions
-        )
-        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+        if orthogonalize:
+            # Implements https://huggingface.co/blog/grimjim/projected-abliteration
+            # Adjust the refusal directions so that only the component that is
+            # orthogonal to the harmless direction is subtracted during abliteration.
+            harmless_directions = F.normalize(harmless_means, p=2, dim=1)
+            projection_vector = torch.sum(directions * harmless_directions, dim=1)
+            directions = directions - projection_vector.unsqueeze(1) * harmless_directions
+            directions = F.normalize(directions, p=2, dim=1)
+
+        return directions
+
+    orthogonalize_setting = settings.orthogonalize_direction
+    if isinstance(orthogonalize_setting, bool):
+        refusal_directions = compute_refusal_directions(orthogonalize_setting)
+        refusal_directions_raw = None
+        refusal_directions_ortho = None
+    else:
+        # A/B gating mode: precompute both and decide later.
+        refusal_directions_raw = compute_refusal_directions(False)
+        refusal_directions_ortho = compute_refusal_directions(True)
+        refusal_directions = refusal_directions_raw
 
     analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
 
@@ -448,10 +460,39 @@ def run():
     start_index = 0
     start_time = time.perf_counter()
 
+    # A/B gating state for orthogonalization.
+    locked_orthogonalize_direction: bool | None = None
+    gating_trials_total = 0
+    gating_mode = False
+    gating_index = 0
+
     def objective(trial: Trial) -> tuple[float, float]:
-        nonlocal trial_index
+        nonlocal trial_index, gating_index
         trial_index += 1
         trial.set_user_attr("index", trial_index)
+
+        # Decide which refusal directions to use for this trial.
+        if locked_orthogonalize_direction is not None:
+            ortho_choice = locked_orthogonalize_direction
+            trial.set_user_attr("gating_phase", False)
+        elif gating_mode:
+            # Alternate to keep the split roughly even.
+            ortho_choice = (gating_index % 2) == 1
+            gating_index += 1
+            trial.set_user_attr("gating_phase", True)
+        else:
+            # No gating: fall back to the (already validated) setting.
+            setting = settings.orthogonalize_direction
+            ortho_choice = setting if isinstance(setting, bool) else False
+            trial.set_user_attr("gating_phase", False)
+
+        trial.set_user_attr("orthogonalize_direction", ortho_choice)
+
+        current_refusal_directions = refusal_directions
+        if refusal_directions_raw is not None and refusal_directions_ortho is not None:
+            current_refusal_directions = (
+                refusal_directions_ortho if ortho_choice else refusal_directions_raw
+            )
 
         direction_scope = trial.suggest_categorical(
             "direction_scope",
@@ -524,12 +565,13 @@ def run():
             f"Running trial [bold]{trial_index}[/] of [bold]{settings.n_trials}[/]..."
         )
         print("* Parameters:")
+        print(f"  * orthogonalize_direction = [bold]{ortho_choice}[/]")
         for name, value in get_trial_parameters(trial).items():
             print(f"  * {name} = [bold]{value}[/]")
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        model.abliterate(current_refusal_directions, direction_index, parameters)
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
 
@@ -576,14 +618,136 @@ def run():
         # Count number of complete trials to compute trials to run.
         return sum([(1 if t.state == TrialState.COMPLETE else 0) for t in study.trials])
 
+    def count_completed_gating_trials() -> int:
+        return sum(
+            [
+                1
+                for t in study.trials
+                if t.state == TrialState.COMPLETE and t.user_attrs.get("gating_phase") is True
+            ]
+        )
+
+    def run_trials(n: int) -> None:
+        nonlocal start_index, start_time
+        if n <= 0:
+            return
+        start_index = trial_index
+        start_time = time.perf_counter()
+        study.optimize(objective_wrapper, n_trials=n)
+
     start_index = trial_index = count_completed_trials()
     if start_index > 0:
         print("Resuming existing study.")
 
     try:
-        study.optimize(
-            objective_wrapper, n_trials=settings.n_trials - count_completed_trials()
-        )
+        # Determine orthogonalization mode (including resume support).
+        existing_lock = study.user_attrs.get("locked_orthogonalize_direction")
+        if isinstance(existing_lock, bool):
+            locked_orthogonalize_direction = existing_lock
+
+        orthogonalize_setting = settings.orthogonalize_direction
+        if locked_orthogonalize_direction is None:
+            if isinstance(orthogonalize_setting, bool):
+                locked_orthogonalize_direction = orthogonalize_setting
+            else:
+                gating_trials_total = int(orthogonalize_setting)
+                if gating_trials_total == 0:
+                    locked_orthogonalize_direction = False
+
+        # If already locked, ensure the active directions match and discard extras.
+        if (
+            locked_orthogonalize_direction is not None
+            and refusal_directions_raw is not None
+            and refusal_directions_ortho is not None
+        ):
+            refusal_directions = (
+                refusal_directions_ortho
+                if locked_orthogonalize_direction
+                else refusal_directions_raw
+            )
+            refusal_directions_raw = None
+            refusal_directions_ortho = None
+            empty_cache()
+
+        # Run early A/B gating trials if requested and not yet locked.
+        if (
+            locked_orthogonalize_direction is None
+            and gating_trials_total > 0
+            and refusal_directions_raw is not None
+            and refusal_directions_ortho is not None
+        ):
+            completed_gating = count_completed_gating_trials()
+            gating_index = completed_gating
+            to_run = min(
+                gating_trials_total - completed_gating,
+                settings.n_trials - count_completed_trials(),
+            )
+            if to_run > 0:
+                print()
+                print(
+                    f"Running [bold]{to_run}[/] early A/B trials to choose [bold]orthogonalize_direction[/]..."
+                )
+                gating_mode = True
+                run_trials(to_run)
+                gating_mode = False
+
+            # If gating finished (and we have both branches), pick the winner and lock it.
+            completed_gating = count_completed_gating_trials()
+            if completed_gating >= gating_trials_total:
+                gating_trials = [
+                    t
+                    for t in study.trials
+                    if t.state == TrialState.COMPLETE and t.user_attrs.get("gating_phase") is True
+                ]
+                trials_by_choice: dict[bool, list[Trial]] = {False: [], True: []}
+                for t in gating_trials:
+                    choice = bool(t.user_attrs.get("orthogonalize_direction", False))
+                    trials_by_choice[choice].append(t)
+
+                def best_pair(trials: list[Trial]) -> tuple[int, float] | None:
+                    if not trials:
+                        return None
+                    # Per-branch Pareto preference:
+                    # primary: min refusals, tie-break: min KL.
+                    sorted_trials = sorted(
+                        trials,
+                        key=lambda tr: (
+                            tr.user_attrs.get("refusals", math.inf),
+                            tr.user_attrs.get("kl_divergence", math.inf),
+                        ),
+                    )
+                    best = sorted_trials[0]
+                    return (
+                        int(best.user_attrs.get("refusals", math.inf)),
+                        float(best.user_attrs.get("kl_divergence", math.inf)),
+                    )
+
+                best_false = best_pair(trials_by_choice[False])
+                best_true = best_pair(trials_by_choice[True])
+
+                if best_false is not None and best_true is not None:
+                    locked_orthogonalize_direction = best_true < best_false
+                    study.set_user_attr(
+                        "locked_orthogonalize_direction", locked_orthogonalize_direction
+                    )
+
+                    refusal_directions = (
+                        refusal_directions_ortho
+                        if locked_orthogonalize_direction
+                        else refusal_directions_raw
+                    )
+                    refusal_directions_raw = None
+                    refusal_directions_ortho = None
+                    empty_cache()
+
+                    print()
+                    print(
+                        f"Locked [bold]orthogonalize_direction[/] to [bold]{locked_orthogonalize_direction}[/] "
+                        f"based on early A/B trials (best false={best_false}, best true={best_true})."
+                    )
+
+        # Continue (or start) main optimization.
+        run_trials(settings.n_trials - count_completed_trials())
 
     except KeyboardInterrupt:
         # This additional handler takes care of the small chance that KeyboardInterrupt
@@ -594,11 +758,37 @@ def run():
     if count_completed_trials() == settings.n_trials:
         study.set_user_attr("finished", True)
 
+    def refusal_directions_for_trial(trial: Trial) -> torch.Tensor:
+        default_choice = settings.orthogonalize_direction
+        default_choice = default_choice if isinstance(default_choice, bool) else False
+        choice = bool(
+            trial.user_attrs.get(
+                "orthogonalize_direction", default_choice
+            )
+        )
+        if refusal_directions_raw is not None and refusal_directions_ortho is not None:
+            return refusal_directions_ortho if choice else refusal_directions_raw
+        return refusal_directions
+
     while True:
         # If no trials at all have been evaluated, the study must have been stopped
         # by pressing Ctrl+C while the first trial was running. In this case, we just
         # re-raise the interrupt to invoke the standard handler defined below.
         completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        if locked_orthogonalize_direction is None:
+            lock_from_study = study.user_attrs.get("locked_orthogonalize_direction")
+            if isinstance(lock_from_study, bool):
+                locked_orthogonalize_direction = lock_from_study
+
+        if locked_orthogonalize_direction is not None:
+            # After locking, hide trials from the losing branch so they can't be selected
+            # (we discard its precomputed directions to save memory).
+            completed_trials = [
+                t
+                for t in completed_trials
+                if bool(t.user_attrs.get("orthogonalize_direction", locked_orthogonalize_direction))
+                == locked_orthogonalize_direction
+            ]
         if not completed_trials:
             raise KeyboardInterrupt
 
@@ -678,10 +868,7 @@ def run():
                 study.set_user_attr("settings", settings.model_dump_json())
                 study.set_user_attr("finished", False)
                 try:
-                    study.optimize(
-                        objective_wrapper,
-                        n_trials=settings.n_trials - count_completed_trials(),
-                    )
+                    run_trials(settings.n_trials - count_completed_trials())
                 except KeyboardInterrupt:
                     pass
                 if count_completed_trials() == settings.n_trials:
@@ -700,7 +887,7 @@ def run():
             model.reset_model()
             print("* Abliterating...")
             model.abliterate(
-                refusal_directions,
+                refusal_directions_for_trial(trial),
                 trial.user_attrs["direction_index"],
                 {
                     k: AbliterationParameters(**v)

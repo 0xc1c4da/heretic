@@ -4,7 +4,7 @@
 from enum import Enum
 from typing import Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     CliSettingsSource,
@@ -120,13 +120,42 @@ class Settings(BaseSettings):
         description="Maximum number of tokens to generate for each response.",
     )
 
-    orthogonalize_direction: bool = Field(
+    orthogonalize_direction: bool | int = Field(
         default=False,
         description=(
-            "Whether to adjust the refusal directions so that only the component that is "
-            "orthogonal to the harmless direction is subtracted during abliteration."
+            "Controls whether refusal directions are orthogonalized against the harmless direction.\n"
+            "\n"
+            "- true / false: lock the choice for the entire run.\n"
+            "- N (non-negative int): run an early A/B gate for N trials total (split across both choices),\n"
+            "  then lock the better choice for the remainder of the run."
         ),
     )
+
+    @field_validator("orthogonalize_direction", mode="before")
+    @classmethod
+    def _validate_orthogonalize_direction(cls, value: object) -> bool | int:
+        # Note: bool is a subclass of int in Python, so order matters.
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, int):
+            if value < 0:
+                raise ValueError("must be a non-negative integer")
+            return value
+
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in {"true", "false"}:
+                return v == "true"
+            try:
+                i = int(v)
+            except ValueError as e:
+                raise ValueError("must be a boolean or a non-negative integer") from e
+            if i < 0:
+                raise ValueError("must be a non-negative integer")
+            return i
+
+        raise ValueError("must be a boolean or a non-negative integer")
 
     row_normalization: RowNormalization = Field(
         default=RowNormalization.NONE,
