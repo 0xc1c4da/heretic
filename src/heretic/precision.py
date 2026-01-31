@@ -195,26 +195,25 @@ class PolicyApplier:
         def pre_hook(
             mod: Module,
             args: tuple[Any, ...],
-            kwargs: dict[str, Any],
-        ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-            input_tensor = self._first_tensor(args, kwargs)
+        ) -> tuple[Any, ...] | None:
+            input_tensor = self._first_tensor(args)
             if input_tensor is None:
-                return args, kwargs
+                return None
             name = getattr(mod, "_precision_policy_name", None)
             if name and name in self._module_no_fallback:
-                return args, kwargs
+                return None
             cached = self._module_fallbacks.get(name) if name else None
             if cached is not None:
                 if cached == input_tensor.dtype:
-                    return args, kwargs
-                cast_args, cast_kwargs = self._cast_tensors(args, kwargs, cached)
+                    return None
+                cast_args = self._cast_tensors(args, cached)
                 restore = _prepare_cast(mod, cached)
                 _push_restore(mod, restore)
-                return cast_args, cast_kwargs
+                return cast_args
             if self.policy.is_op_dtype_supported(op, input_tensor.dtype, input_tensor.device):
                 if name:
                     self._module_no_fallback.add(name)
-                return args, kwargs
+                return None
             fallback = self._choose_fallback(op, input_tensor)
             if self._warn_module_once(mod, input_tensor.dtype):
                 self.logger(
@@ -222,33 +221,28 @@ class PolicyApplier:
                 )
             if name:
                 self._module_fallbacks[name] = fallback
-            cast_args, cast_kwargs = self._cast_tensors(args, kwargs, fallback)
+            cast_args = self._cast_tensors(args, fallback)
             restore = _prepare_cast(mod, fallback)
             _push_restore(mod, restore)
-            return cast_args, cast_kwargs
+            return cast_args
 
         def post_hook(
             mod: Module,
             _args: tuple[Any, ...],
-            _kwargs: dict[str, Any],
             _output: Any,
         ) -> None:
             restore = _pop_restore(mod)
             if restore is not None:
                 _restore_cast(restore)
 
-        module.register_forward_pre_hook(pre_hook, with_kwargs=True)
-        module.register_forward_hook(post_hook, with_kwargs=True, always_call=True)
+        module.register_forward_pre_hook(pre_hook)
+        module.register_forward_hook(post_hook, always_call=True)
 
     def _first_tensor(
         self,
         args: tuple[Any, ...],
-        kwargs: dict[str, Any],
     ) -> Tensor | None:
         for value in args:
-            if isinstance(value, Tensor):
-                return value
-        for value in kwargs.values():
             if isinstance(value, Tensor):
                 return value
         return None
@@ -292,12 +286,9 @@ class PolicyApplier:
     def _cast_tensors(
         self,
         args: tuple[Any, ...],
-        kwargs: dict[str, Any],
         dtype: torch.dtype,
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        cast_args = tuple(self._cast_tree(value, dtype) for value in args)
-        cast_kwargs = {key: self._cast_tree(value, dtype) for key, value in kwargs.items()}
-        return cast_args, cast_kwargs
+    ) -> tuple[Any, ...]:
+        return tuple(self._cast_tree(value, dtype) for value in args)
 
     def _cast_tree(self, value: Any, dtype: torch.dtype) -> Any:
         if isinstance(value, Tensor):
