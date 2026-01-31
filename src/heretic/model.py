@@ -249,17 +249,13 @@ class Model:
             return logged
 
         def wrapper(func=None, *, tie_last_hidden_states=True):
-            if func is not None:
-                wrapped = original(func)
-                return _wrap_logged(func, wrapped)
-
-            decorated = original(None, tie_last_hidden_states=tie_last_hidden_states)
-
-            def decorator(inner_func):
-                wrapped = decorated(inner_func)
+            def decorate(inner_func):
+                wrapped = original(inner_func, tie_last_hidden_states=tie_last_hidden_states)
                 return _wrap_logged(inner_func, wrapped)
 
-            return decorator
+            if func is not None:
+                return decorate(func)
+            return decorate
 
         transformers_generic.check_model_inputs = wrapper
         transformers_generic.check_model_inputs._heretic_debug_wrapped = True  # type: ignore[attr-defined]
