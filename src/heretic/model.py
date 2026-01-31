@@ -229,31 +229,37 @@ class Model:
 
         original = transformers_generic.check_model_inputs
 
-        def wrapper(func=None, *, tie_last_hidden_states=True):
-            def wrapped_fn(inner_func):
-                wrapped = original(inner_func, tie_last_hidden_states=tie_last_hidden_states)
-
-                def logged(self, *args, **kwargs):
+        def _wrap_logged(inner_func, wrapped):
+            def logged(self, *args, **kwargs):
+                print(
+                    "[yellow]check_model_inputs wrapper[/]: "
+                    f"func={inner_func.__qualname__}, module={inner_func.__module__}, "
+                    f"kwargs={list(kwargs.keys())}"
+                )
+                try:
+                    return wrapped(self, *args, **kwargs)
+                except TypeError as error:
                     print(
-                        "[yellow]check_model_inputs wrapper[/]: "
+                        "[yellow]check_model_inputs TypeError[/]: "
                         f"func={inner_func.__qualname__}, module={inner_func.__module__}, "
-                        f"kwargs={list(kwargs.keys())}"
+                        f"kwargs={list(kwargs.keys())}, error={error}"
                     )
-                    try:
-                        return wrapped(self, *args, **kwargs)
-                    except TypeError as error:
-                        print(
-                            "[yellow]check_model_inputs TypeError[/]: "
-                            f"func={inner_func.__qualname__}, module={inner_func.__module__}, "
-                            f"kwargs={list(kwargs.keys())}, error={error}"
-                        )
-                        raise
+                    raise
 
-                return logged
+            return logged
 
+        def wrapper(func=None, *, tie_last_hidden_states=True):
             if func is not None:
-                return wrapped_fn(func)
-            return wrapped_fn
+                wrapped = original(func)
+                return _wrap_logged(func, wrapped)
+
+            decorated = original(None, tie_last_hidden_states=tie_last_hidden_states)
+
+            def decorator(inner_func):
+                wrapped = decorated(inner_func)
+                return _wrap_logged(inner_func, wrapped)
+
+            return decorator
 
         transformers_generic.check_model_inputs = wrapper
         transformers_generic.check_model_inputs._heretic_debug_wrapped = True  # type: ignore[attr-defined]
