@@ -155,6 +155,7 @@ class PolicyApplier:
         self._logged_modules: set[str] = set()
         self._module_fallbacks: dict[str, torch.dtype] = {}
         self._module_no_fallback: set[str] = set()
+        self._failure_logged: set[str] = set()
 
     def apply(self, model: Module) -> None:
         if not self.policy.should_apply_hooks(model):
@@ -186,6 +187,8 @@ class PolicyApplier:
             self.logger(
                 f"[bold]Precision hooks applied[/]: linear={linear_count}, conv2d={conv_count}"
             )
+        if self.policy.settings.debug:
+            _install_matmul_guard(self.policy, self.logger)
 
     def _attach_hooks(self, module: Module, name: str, op: str) -> None:
         module._precision_policy_name = name  # type: ignore[attr-defined]
@@ -200,6 +203,8 @@ class PolicyApplier:
             if input_tensor is None:
                 return None
             name = getattr(mod, "_precision_policy_name", None)
+            if self.policy.settings.debug:
+                self._log_probe_context(mod, input_tensor)
             if name and name in self._module_no_fallback:
                 return None
             cached = self._module_fallbacks.get(name) if name else None
@@ -262,6 +267,20 @@ class PolicyApplier:
             return False
         self._logged_modules.add(key)
         return True
+
+    def _log_probe_context(self, module: Module, input_tensor: Tensor) -> None:
+        name = getattr(module, "_precision_policy_name", "<unknown>")
+        weight = getattr(module, "weight", None)
+        bias = getattr(module, "bias", None)
+        base_layer = getattr(module, "base_layer", None)
+        base_weight = getattr(base_layer, "weight", None) if base_layer is not None else None
+        self.logger(
+            "[blue]Precision hook context[/]: "
+            f"name={name}, input={input_tensor.dtype}, "
+            f"weight={getattr(weight, 'dtype', None)}, "
+            f"bias={getattr(bias, 'dtype', None)}, "
+            f"base_weight={getattr(base_weight, 'dtype', None)}"
+        )
 
     def _log_module_dtypes(
         self,
@@ -363,3 +382,54 @@ def _cast_tensor_attrs(
         if isinstance(attr, Tensor) and attr.dtype != dtype:
             original_attrs.append((module, name, attr))
             setattr(module, name, attr.to(dtype))
+
+
+_ORIGINAL_MATMUL = None
+
+
+def _install_matmul_guard(policy: PrecisionPolicy, logger: Callable[[str], None]) -> None:
+    global _ORIGINAL_MATMUL
+    if _ORIGINAL_MATMUL is not None:
+        return
+
+    _ORIGINAL_MATMUL = torch.matmul
+
+    def guarded_matmul(a: Tensor, b: Tensor, *args: Any, **kwargs: Any) -> Tensor:
+        if policy.settings.policy == "off":
+            return _ORIGINAL_MATMUL(a, b, *args, **kwargs)
+        if a.dtype == b.dtype and policy.is_op_dtype_supported("matmul", a.dtype, a.device):
+            return _ORIGINAL_MATMUL(a, b, *args, **kwargs)
+        fallback = policy.op_fallback_dtype(a.dtype)
+        if not policy.is_op_dtype_supported("matmul", fallback, a.device):
+            fallback = torch.float32
+        if policy.settings.debug:
+            logger(
+                f"[yellow]Precision fallback for matmul: {a.dtype} -> {fallback}[/]"
+            )
+        if _scaled_mm_available(a, b, fallback):
+            return _scaled_mm(a, b, fallback)
+        return _ORIGINAL_MATMUL(a.to(fallback), b.to(fallback), *args, **kwargs)
+
+    torch.matmul = guarded_matmul
+
+
+def _scaled_mm_available(a: Tensor, b: Tensor, out_dtype: torch.dtype) -> bool:
+    return (
+        hasattr(torch, "_scaled_mm")
+        and a.is_cuda
+        and b.is_cuda
+        and a.dtype == b.dtype
+        and out_dtype is not None
+    )
+
+
+def _scaled_mm(a: Tensor, b: Tensor, out_dtype: torch.dtype) -> Tensor:
+    scale_a = torch.tensor(1.0, device=a.device)
+    scale_b = torch.tensor(1.0, device=b.device)
+    return torch._scaled_mm(  # type: ignore[attr-defined]
+        a,
+        b,
+        out_dtype=out_dtype,
+        scale_a=scale_a,
+        scale_b=scale_b,
+    )
