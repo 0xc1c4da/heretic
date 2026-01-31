@@ -12,7 +12,6 @@ import torch.linalg as LA
 import torch.nn.functional as F
 import transformers
 from peft import LoraConfig, PeftModel, get_peft_model
-from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
 from transformers import (
@@ -31,6 +30,7 @@ from transformers.generation import (
 )
 
 from .config import QuantizationMethod, RowNormalization, Settings
+from .precision import PolicyApplier, PrecisionPolicy
 from .utils import Prompt, batchify, empty_cache, print
 
 
@@ -63,6 +63,7 @@ class Model:
         self.needs_reload = False
         self.is_quantized = False
         self.lora_rank: int = None
+        self.precision_policy = PrecisionPolicy.from_settings(settings)
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
@@ -106,7 +107,10 @@ class Model:
                     extra_kwargs["quantization_config"] = quantization_config
 
                 load_kwargs = {
-                    "torch_dtype": self._resolve_torch_dtype(dtype),
+                    "torch_dtype": self.precision_policy.resolve_model_dtype(
+                        dtype,
+                        torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                    ),
                     "device_map": settings.device_map,
                     "max_memory": self.max_memory,
                     "trust_remote_code": self.trusted_models.get(settings.model),
@@ -124,7 +128,6 @@ class Model:
                     self.trusted_models[settings.model] = True
 
                 self.is_quantized = self._detect_model_quantization(quantization_config)
-                self._cast_fp8_weights_if_needed(dtype)
 
                 # A test run can reveal dtype-related problems such as the infamous
                 # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
@@ -154,6 +157,7 @@ class Model:
             raise Exception("Failed to load model with all configured dtypes.")
 
         self._apply_lora()
+        PolicyApplier(self.precision_policy, print).apply(self.model)
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
@@ -207,7 +211,6 @@ class Model:
         print(
             f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
         )
-
     def _get_quantization_config(self, dtype: str) -> object | None:
         """
         Creates quantization config based on settings.
@@ -276,59 +279,6 @@ class Model:
             return config_class(**self._get_quantization_kwargs())
 
         return None
-
-    def _resolve_torch_dtype(self, dtype: str) -> str | torch.dtype:
-        if dtype == "auto":
-            return "auto"
-        return getattr(torch, dtype)
-
-    def _pick_fp8_fallback_dtype(self, requested_dtype: str) -> torch.dtype:
-        if requested_dtype != "auto":
-            return getattr(torch, requested_dtype)
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-        return torch.float16
-
-    def _fp8_dtypes(self) -> tuple[torch.dtype, ...]:
-        candidates = []
-        for name in ("float8_e4m3fn", "float8_e5m2"):
-            dtype = getattr(torch, name, None)
-            if dtype is not None:
-                candidates.append(dtype)
-        return tuple(candidates)
-
-    def _cast_fp8_weights_if_needed(self, requested_dtype: str) -> None:
-        if self.settings.quantization != QuantizationMethod.NONE:
-            return
-
-        fp8_dtypes = self._fp8_dtypes()
-        if not fp8_dtypes:
-            return
-
-        found_fp8 = False
-        for param in self.model.parameters():
-            if param.dtype in fp8_dtypes:
-                found_fp8 = True
-                break
-        if not found_fp8:
-            for buf in self.model.buffers():
-                if buf.dtype in fp8_dtypes:
-                    found_fp8 = True
-                    break
-
-        if not found_fp8:
-            return
-
-        cast_dtype = self._pick_fp8_fallback_dtype(requested_dtype)
-        print(
-            f"[yellow]Model weights are FP8; casting to {cast_dtype} for runtime compatibility.[/]"
-        )
-        for param in self.model.parameters():
-            if param.dtype in fp8_dtypes:
-                param.data = param.data.to(cast_dtype)
-        for buf in self.model.buffers():
-            if buf.dtype in fp8_dtypes:
-                buf.data = buf.data.to(cast_dtype)
 
     def _get_quantization_kwargs(self) -> dict[str, Any]:
         return dict(self.settings.quantization_kwargs or {})
@@ -453,7 +403,10 @@ class Model:
             extra_kwargs["quantization_config"] = quantization_config
 
         load_kwargs = {
-            "torch_dtype": self._resolve_torch_dtype(str(dtype).split(".")[-1]),
+            "torch_dtype": self.precision_policy.resolve_model_dtype(
+                str(dtype).split(".")[-1],
+                torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            ),
             "device_map": self.settings.device_map,
             "max_memory": self.max_memory,
             "trust_remote_code": self.trusted_models.get(self.settings.model),
@@ -466,8 +419,8 @@ class Model:
         )
 
         self.is_quantized = self._detect_model_quantization(quantization_config)
-        self._cast_fp8_weights_if_needed(str(dtype).split(".")[-1])
         self._apply_lora()
+        PolicyApplier(self.precision_policy, print).apply(self.model)
 
         self.needs_reload = False
 

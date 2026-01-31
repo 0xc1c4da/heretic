@@ -136,6 +136,28 @@ class Settings(BaseSettings):
         ),
     )
 
+    precision_policy: str = Field(
+        default="auto",
+        description=(
+            "Precision policy mode. Options: 'auto' (probe and fall back only when "
+            "required), 'strict' (always enforce fallback for unsupported dtypes), "
+            "'off' (no precision hooks)."
+        ),
+    )
+
+    precision_fallback_dtype: str = Field(
+        default="auto",
+        description=(
+            "Fallback dtype used when an op is unsupported. "
+            "Options: 'auto', 'bfloat16', 'float16', 'float32'."
+        ),
+    )
+
+    precision_debug: bool = Field(
+        default=False,
+        description="Whether to emit precision policy debug logs.",
+    )
+
     batch_size: int = Field(
         default=0,  # auto
         description="Number of input sequences to process in parallel (0 = auto).",
@@ -187,6 +209,28 @@ class Settings(BaseSettings):
             return i
 
         raise ValueError("must be a boolean or a non-negative integer")
+
+    @field_validator("precision_policy", mode="before")
+    @classmethod
+    def _validate_precision_policy(cls, value: object) -> str:
+        allowed = {"auto", "strict", "off"}
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in allowed:
+                return v
+        raise ValueError("precision_policy must be one of: auto, strict, off")
+
+    @field_validator("precision_fallback_dtype", mode="before")
+    @classmethod
+    def _validate_precision_fallback_dtype(cls, value: object) -> str:
+        allowed = {"auto", "bfloat16", "float16", "float32"}
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in allowed:
+                return v
+        raise ValueError(
+            "precision_fallback_dtype must be one of: auto, bfloat16, float16, float32"
+        )
 
     row_normalization: RowNormalization = Field(
         default=RowNormalization.NONE,

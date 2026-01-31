@@ -35,6 +35,17 @@ quantization = "none"
 # Example: quantization_kwargs = { bits=4, group_size=128 }
 # quantization_kwargs = {}
 
+# Precision policy mode.
+# Options: "auto", "strict", "off"
+precision_policy = "auto"
+
+# Fallback dtype for unsupported ops.
+# Options: "auto", "bfloat16", "float16", "float32"
+precision_fallback_dtype = "auto"
+
+# Whether to emit precision policy debug logs.
+precision_debug = false
+
 # Memory limits to impose. 0 is usually your first graphics card.
 # max_memory = {0 = "16GB", "cpu" = "64GB"}
 
