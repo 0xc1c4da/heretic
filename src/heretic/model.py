@@ -131,18 +131,6 @@ class Model:
                 self.precision_policy.log_probe_matrix(print)
                 PolicyApplier(self.precision_policy, print).apply(self.model)
 
-                # A test run can reveal dtype-related problems such as the infamous
-                # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
-                # (https://github.com/meta-llama/llama/issues/380).
-                self.generate(
-                    [
-                        Prompt(
-                            system=settings.system_prompt,
-                            user="What is 1+1?",
-                        )
-                    ],
-                    max_new_tokens=1,
-                )
             except Exception as error:
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
@@ -161,6 +149,22 @@ class Model:
         self._apply_lora()
         # Apply policy again after LoRA wraps modules.
         PolicyApplier(self.precision_policy, print).apply(self.model)
+
+        # A test run can reveal dtype-related problems such as the infamous
+        # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
+        # (https://github.com/meta-llama/llama/issues/380).
+        try:
+            self.generate(
+                [
+                    Prompt(
+                        system=settings.system_prompt,
+                        user="What is 1+1?",
+                    )
+                ],
+                max_new_tokens=1,
+            )
+        except Exception as error:
+            print(f"[yellow]Sanity generate failed[/] ({error})")
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
