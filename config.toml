@@ -29,7 +29,7 @@ device_map = "auto"
 #   "bnb_4bit" - 4-bit quantization using bitsandbytes
 #   "fp8"   - FineGrainedFP8Config
 #   "custom" - use quantization_config_type + quantization_kwargs
-quantization = "bnb_4bit"
+quantization = "auto"
 
 # When quantization = "custom", set the transformers quantization config class name.
 # Example: quantization_config_type = "GPTQConfig"

@@ -105,14 +105,44 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                self.model = get_model_class(settings.model).from_pretrained(
-                    settings.model,
-                    dtype=dtype,
-                    device_map=settings.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
-                    **extra_kwargs,
+                disable_model_quantization = (
+                    self.settings.quantization == QuantizationMethod.NONE
+                    and self.model_quantization_config is not None
                 )
+
+                load_kwargs = {
+                    "torch_dtype": dtype,
+                    "device_map": settings.device_map,
+                    "max_memory": self.max_memory,
+                    "trust_remote_code": self.trusted_models.get(settings.model),
+                    **extra_kwargs,
+                }
+
+                if (
+                    disable_model_quantization
+                    and "quantization_config" not in load_kwargs
+                ):
+                    try:
+                        self.model = get_model_class(settings.model).from_pretrained(
+                            settings.model,
+                            **load_kwargs,
+                            quantization_config=None,
+                        )
+                    except Exception as error:
+                        if "quantization_config" in str(error):
+                            self.model = get_model_class(
+                                settings.model
+                            ).from_pretrained(
+                                settings.model,
+                                **load_kwargs,
+                            )
+                        else:
+                            raise
+                else:
+                    self.model = get_model_class(settings.model).from_pretrained(
+                        settings.model,
+                        **load_kwargs,
+                    )
 
                 # If we reach this point and the model requires trust_remote_code,
                 # either the user accepted, or settings.trust_remote_code is True.
@@ -394,14 +424,41 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        self.model = get_model_class(self.settings.model).from_pretrained(
-            self.settings.model,
-            dtype=dtype,
-            device_map=self.settings.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
-            **extra_kwargs,
+        disable_model_quantization = (
+            self.settings.quantization == QuantizationMethod.NONE
+            and self.model_quantization_config is not None
         )
+
+        load_kwargs = {
+            "torch_dtype": dtype,
+            "device_map": self.settings.device_map,
+            "max_memory": self.max_memory,
+            "trust_remote_code": self.trusted_models.get(self.settings.model),
+            **extra_kwargs,
+        }
+
+        if disable_model_quantization and "quantization_config" not in load_kwargs:
+            try:
+                self.model = get_model_class(self.settings.model).from_pretrained(
+                    self.settings.model,
+                    **load_kwargs,
+                    quantization_config=None,
+                )
+            except Exception as error:
+                if "quantization_config" in str(error):
+                    self.model = get_model_class(
+                        self.settings.model
+                    ).from_pretrained(
+                        self.settings.model,
+                        **load_kwargs,
+                    )
+                else:
+                    raise
+        else:
+            self.model = get_model_class(self.settings.model).from_pretrained(
+                self.settings.model,
+                **load_kwargs,
+            )
 
         self.is_quantized = self._detect_model_quantization(quantization_config)
         self._apply_lora()
