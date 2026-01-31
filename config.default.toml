@@ -1,11 +1,5 @@
 # Copy this file to config.toml and edit the configuration to your liking.
 
-# Directory for temporary files (used by push_to_hub, etc.).
-tmpdir = "/workspace/tmp"
-
-# Base directory for Hugging Face cache (model downloads, tokenizers, etc.).
-hf_home = "/workspace/hf"
-
 # List of PyTorch dtypes to try when loading model tensors.
 # If loading with a dtype fails, the next dtype in the list will be tried.
 dtypes = [

@@ -67,16 +67,6 @@ class DatasetSpecification(BaseModel):
 
 
 class Settings(BaseSettings):
-    tmpdir: str = Field(
-        default="/workspace/tmp",
-        description="Directory for temporary files (used by push_to_hub, etc.).",
-    )
-
-    hf_home: str = Field(
-        default="/workspace/hf",
-        description="Base directory for Hugging Face cache (model downloads, tokenizers, etc.).",
-    )
-
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
     evaluate_model: str | None = Field(

@@ -217,13 +217,6 @@ def run():
         )
         return
 
-    # Apply filesystem/cache settings early (before downloading/loading anything).
-    os.makedirs(settings.tmpdir, exist_ok=True)
-    os.environ["TMPDIR"] = settings.tmpdir
-
-    os.makedirs(settings.hf_home, exist_ok=True)
-    os.environ["HF_HOME"] = settings.hf_home
-
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
         count = torch.cuda.device_count()
