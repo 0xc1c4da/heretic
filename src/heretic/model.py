@@ -159,6 +159,8 @@ class Model:
             raise Exception("Failed to load model with all configured dtypes.")
 
         self._apply_lora()
+        # Apply policy again after LoRA wraps modules.
+        PolicyApplier(self.precision_policy, print).apply(self.model)
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.

@@ -152,30 +152,41 @@ class PolicyApplier:
     def __init__(self, policy: PrecisionPolicy, logger: Callable[[str], None]):
         self.policy = policy
         self.logger = logger
+        self._logged_modules: set[str] = set()
 
     def apply(self, model: Module) -> None:
         if not self.policy.should_apply_hooks(model):
             return
-        for module in model.modules():
+        linear_count = 0
+        conv_count = 0
+        for name, module in model.named_modules():
             if getattr(module, "_precision_policy_applied", False):
                 continue
             if isinstance(module, Linear):
-                self._wrap_linear(module)
+                self._wrap_linear(module, name)
                 module._precision_policy_applied = True  # type: ignore[attr-defined]
+                linear_count += 1
             elif isinstance(module, Conv2d):
-                self._wrap_conv2d(module)
+                self._wrap_conv2d(module, name)
                 module._precision_policy_applied = True  # type: ignore[attr-defined]
+                conv_count += 1
+        if self.policy.settings.debug:
+            self.logger(
+                f"[bold]Precision hooks applied[/]: linear={linear_count}, conv2d={conv_count}"
+            )
 
-    def _wrap_linear(self, module: Linear) -> None:
+    def _wrap_linear(self, module: Linear, name: str) -> None:
         original_forward = module.forward
+        module._precision_policy_name = name  # type: ignore[attr-defined]
 
         def forward(*args: Any, **kwargs: Any) -> Tensor:
             return self._dispatch_linear(module, original_forward, args, kwargs)
 
         module.forward = forward  # type: ignore[assignment]
 
-    def _wrap_conv2d(self, module: Conv2d) -> None:
+    def _wrap_conv2d(self, module: Conv2d, name: str) -> None:
         original_forward = module.forward
+        module._precision_policy_name = name  # type: ignore[attr-defined]
 
         def forward(*args: Any, **kwargs: Any) -> Tensor:
             return self._dispatch_conv2d(module, original_forward, args, kwargs)
@@ -193,9 +204,15 @@ class PolicyApplier:
         if input_tensor is None:
             return original_forward(*args, **kwargs)
         if self.policy.is_op_dtype_supported("linear", input_tensor.dtype, input_tensor.device):
-            return original_forward(*args, **kwargs)
+            try:
+                return original_forward(*args, **kwargs)
+            except Exception as error:
+                if not self._should_retry(error):
+                    raise
+                if self.policy.settings.debug:
+                    self._log_module_dtypes(module, input_tensor, error)
         fallback = self._choose_fallback("linear", input_tensor)
-        if self.policy.warn_once("linear", input_tensor.dtype):
+        if self._warn_module_once(module, input_tensor.dtype):
             self.logger(
                 f"[yellow]Precision fallback for linear: {input_tensor.dtype} -> {fallback}[/]"
             )
@@ -214,9 +231,15 @@ class PolicyApplier:
         if input_tensor is None:
             return original_forward(*args, **kwargs)
         if self.policy.is_op_dtype_supported("conv2d", input_tensor.dtype, input_tensor.device):
-            return original_forward(*args, **kwargs)
+            try:
+                return original_forward(*args, **kwargs)
+            except Exception as error:
+                if not self._should_retry(error):
+                    raise
+                if self.policy.settings.debug:
+                    self._log_module_dtypes(module, input_tensor, error)
         fallback = self._choose_fallback("conv2d", input_tensor)
-        if self.policy.warn_once("conv2d", input_tensor.dtype):
+        if self._warn_module_once(module, input_tensor.dtype):
             self.logger(
                 f"[yellow]Precision fallback for conv2d: {input_tensor.dtype} -> {fallback}[/]"
             )
@@ -235,6 +258,40 @@ class PolicyApplier:
         if self.policy.is_op_dtype_supported(op, fallback, input_tensor.device):
             return fallback
         return torch.float32
+
+    def _warn_module_once(self, module: Module, dtype: torch.dtype) -> bool:
+        name = getattr(module, "_precision_policy_name", None)
+        if name is None:
+            return self.policy.warn_once("op", dtype)
+        key = f"{name}:{dtype}"
+        if key in self._logged_modules:
+            return False
+        self._logged_modules.add(key)
+        return True
+
+    def _should_retry(self, error: Exception) -> bool:
+        message = str(error).lower()
+        return "addmm_cuda" in message or "same dtype" in message
+
+    def _log_module_dtypes(
+        self,
+        module: Module,
+        input_tensor: Tensor,
+        error: Exception,
+    ) -> None:
+        name = getattr(module, "_precision_policy_name", "<unknown>")
+        weight = getattr(module, "weight", None)
+        bias = getattr(module, "bias", None)
+        base_layer = getattr(module, "base_layer", None)
+        base_weight = getattr(base_layer, "weight", None) if base_layer is not None else None
+        self.logger(
+            "[yellow]Precision op failed[/]: "
+            f"name={name}, input={input_tensor.dtype}, "
+            f"weight={getattr(weight, 'dtype', None)}, "
+            f"bias={getattr(bias, 'dtype', None)}, "
+            f"base_weight={getattr(base_weight, 'dtype', None)}, "
+            f"error={type(error).__name__}: {error}"
+        )
 
     def _cast_tensors(
         self,
