@@ -224,13 +224,14 @@ class Model:
         )
 
     def _install_check_model_inputs_debug(self) -> None:
+        if getattr(transformers_generic.check_model_inputs, "_heretic_debug_wrapped", False):
+            return
+
         original = transformers_generic.check_model_inputs
 
         def wrapper(func=None, *, tie_last_hidden_states=True):
             def wrapped_fn(inner_func):
-                wrapped = original(
-                    inner_func, tie_last_hidden_states=tie_last_hidden_states
-                )
+                wrapped = original(inner_func, tie_last_hidden_states=tie_last_hidden_states)
 
                 def logged(self, *args, **kwargs):
                     print(
@@ -255,6 +256,7 @@ class Model:
             return wrapped_fn
 
         transformers_generic.check_model_inputs = wrapper
+        transformers_generic.check_model_inputs._heretic_debug_wrapped = True  # type: ignore[attr-defined]
     def _get_quantization_config(self, dtype: str) -> object | None:
         """
         Creates quantization config based on settings.
