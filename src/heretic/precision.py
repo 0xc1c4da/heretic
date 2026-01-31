@@ -227,7 +227,12 @@ class PolicyApplier:
             _push_restore(mod, restore)
             return cast_args, cast_kwargs
 
-        def post_hook(mod: Module, _args: tuple[Any, ...], _output: Any) -> None:
+        def post_hook(
+            mod: Module,
+            _args: tuple[Any, ...],
+            _kwargs: dict[str, Any],
+            _output: Any,
+        ) -> None:
             restore = _pop_restore(mod)
             if restore is not None:
                 _restore_cast(restore)
