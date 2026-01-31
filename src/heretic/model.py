@@ -128,6 +128,8 @@ class Model:
                     self.trusted_models[settings.model] = True
 
                 self.is_quantized = self._detect_model_quantization(quantization_config)
+                self.precision_policy.log_probe_matrix(print)
+                PolicyApplier(self.precision_policy, print).apply(self.model)
 
                 # A test run can reveal dtype-related problems such as the infamous
                 # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
@@ -157,7 +159,6 @@ class Model:
             raise Exception("Failed to load model with all configured dtypes.")
 
         self._apply_lora()
-        PolicyApplier(self.precision_policy, print).apply(self.model)
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
@@ -420,6 +421,8 @@ class Model:
 
         self.is_quantized = self._detect_model_quantization(quantization_config)
         self._apply_lora()
+        if self.settings.precision_debug:
+            self.precision_policy.log_probe_matrix(print)
         PolicyApplier(self.precision_policy, print).apply(self.model)
 
         self.needs_reload = False

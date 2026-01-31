@@ -125,6 +125,28 @@ class PrecisionPolicy:
         self._warned.add(key)
         return True
 
+    def log_probe_matrix(self, logger: Callable[[str], None]) -> None:
+        if not self.settings.debug:
+            return
+        ops = ["linear", "conv2d", "matmul"]
+        dtypes = self._probe_dtypes()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger("[bold]Precision probe matrix (runtime capability)[/]")
+        for op in ops:
+            results = []
+            for dtype in dtypes:
+                supported = self.probe.is_supported(op, dtype, device)
+                results.append(f"{dtype}: {'ok' if supported else 'fail'}")
+            logger(f"  * {op}: {', '.join(results)}")
+
+    def _probe_dtypes(self) -> list[torch.dtype]:
+        dtypes: list[torch.dtype] = [torch.float16, torch.bfloat16, torch.float32]
+        for name in ("float8_e4m3fn", "float8_e5m2"):
+            dtype = getattr(torch, name, None)
+            if dtype is not None:
+                dtypes.append(dtype)
+        return dtypes
+
 
 class PolicyApplier:
     def __init__(self, policy: PrecisionPolicy, logger: Callable[[str], None]):
@@ -245,14 +267,29 @@ def _temporary_parameter_cast(module: Module, dtype: torch.dtype) -> Iterator[No
             if param.dtype != dtype:
                 original_data.append((param, param.data))
                 param.data = param.data.to(dtype)
-        for name in ("weight", "bias"):
-            attr = getattr(module, name, None)
-            if isinstance(attr, Tensor) and attr.dtype != dtype:
-                original_attrs.append((module, name, attr))
-                setattr(module, name, attr.to(dtype))
+        _cast_tensor_attrs(module, dtype, original_attrs)
+        base_layer = getattr(module, "base_layer", None)
+        if isinstance(base_layer, Module):
+            for param in base_layer.parameters(recurse=True):
+                if param.dtype != dtype:
+                    original_data.append((param, param.data))
+                    param.data = param.data.to(dtype)
+            _cast_tensor_attrs(base_layer, dtype, original_attrs)
         yield
     finally:
         for param, data in original_data:
             param.data = data
         for mod, name, value in original_attrs:
             setattr(mod, name, value)
+
+
+def _cast_tensor_attrs(
+    module: Module,
+    dtype: torch.dtype,
+    original_attrs: list[tuple[Module, str, Tensor]],
+) -> None:
+    for name in ("weight", "bias"):
+        attr = getattr(module, name, None)
+        if isinstance(attr, Tensor) and attr.dtype != dtype:
+            original_attrs.append((module, name, attr))
+            setattr(module, name, attr.to(dtype))
