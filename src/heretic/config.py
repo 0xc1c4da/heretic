@@ -26,6 +26,11 @@ class RowNormalization(str, Enum):
     FULL = "full"
 
 
+class SamplerType(str, Enum):
+    GP = "gp"
+    TPE = "tpe"
+
+
 class DatasetSpecification(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
@@ -250,9 +255,41 @@ class Settings(BaseSettings):
         description="Number of abliteration trials to run during optimization.",
     )
 
+    sampler: SamplerType = Field(
+        default=SamplerType.TPE,
+        description=(
+            "Optimization sampler to use. Options: "
+            "'gp' (Gaussian Process), "
+            "'tpe' (Tree-structured Parzen Estimator)."
+        ),
+    )
+
     n_startup_trials: int = Field(
         default=60,
         description="Number of trials that use random sampling for the purpose of exploration.",
+    )
+
+    tpe_n_ei_candidates: int = Field(
+        default=128,
+        description="Number of candidate points used to calculate expected improvement for TPE.",
+    )
+
+    tpe_multivariate: bool = Field(
+        default=True,
+        description="Whether to use the multivariate TPE sampler (experimental in Optuna).",
+    )
+
+    gp_deterministic_objective: bool = Field(
+        default=True,
+        description=(
+            "Whether the objective function is deterministic (only used with GP sampler). "
+            "Set to False if using non-greedy decoding or other sources of randomness."
+        ),
+    )
+
+    sampler_seed: int | None = Field(
+        default=None,
+        description="Random seed for the optimization sampler.",
     )
 
     study_checkpoint_dir: str = Field(

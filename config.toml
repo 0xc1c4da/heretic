@@ -8,6 +8,8 @@ hf_home = "/workspace/hf"
 
 study_checkpoint_dir = "/workspace/studies"
 
+trust_remote_code = true
+
 # List of PyTorch dtypes to try when loading model tensors.
 # If loading with a dtype fails, the next dtype in the list will be tried.
 dtypes = [
@@ -90,6 +92,10 @@ max_weight_max = 4.0
 
 # Number of abliteration trials to run during optimization.
 n_trials = 800
+
+# Optimization sampler to use.
+# Options: "gp", "tpe"
+sampler = "gp"
 
 # Number of trials that use random sampling for the purpose of exploration.
 n_startup_trials = 150

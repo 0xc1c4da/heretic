@@ -6,7 +6,7 @@ Heretic is a tool that removes censorship (aka "safety alignment") from
 transformer-based language models without expensive post-training.
 It combines an advanced implementation of directional ablation, also known
 as "abliteration" ([Arditi et al. 2024](https://arxiv.org/abs/2406.11717)),
-with a TPE-based parameter optimizer powered by [Optuna](https://optuna.org/).
+with an Optuna-powered parameter optimizer (TPE or GP, configurable).
 
 This approach enables Heretic to work **completely automatically.** Heretic
 finds high-quality abliteration parameters by co-minimizing the number of
@@ -85,7 +85,7 @@ The process is fully automatic and does not require configuration; however,
 Heretic has a variety of configuration parameters that can be changed for
 greater control. Run `heretic --help` to see available command-line options,
 or look at [`config.default.toml`](config.default.toml) if you prefer to use
-a configuration file.
+a configuration file (including sampler selection).
 
 For expensive runs, you can set `orthogonalize_direction` to a **non-negative integer**
 to run an early A/B gate (that many trials total) to choose whether orthogonalization

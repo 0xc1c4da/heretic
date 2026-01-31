@@ -26,7 +26,7 @@ from accelerate.utils import (
 from huggingface_hub import ModelCard, ModelCardData
 from optuna import Trial, TrialPruned
 from optuna.exceptions import ExperimentalWarning
-from optuna.samplers import TPESampler
+from optuna.samplers import BaseSampler, GPSampler, TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 from optuna.study import StudyDirection
@@ -36,7 +36,7 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod, Settings
+from .config import QuantizationMethod, SamplerType, Settings
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .utils import (
@@ -51,6 +51,30 @@ from .utils import (
     prompt_select,
     prompt_text,
 )
+
+
+def create_sampler(settings: Settings) -> BaseSampler:
+    if settings.sampler == SamplerType.GP:
+        print(
+            f"Using [bold]GPSampler[/] "
+            f"(deterministic={settings.gp_deterministic_objective})"
+        )
+        return GPSampler(
+            n_startup_trials=settings.n_startup_trials,
+            deterministic_objective=settings.gp_deterministic_objective,
+            seed=settings.sampler_seed,
+        )
+
+    print(
+        f"Using [bold]TPESampler[/] "
+        f"(multivariate={settings.tpe_multivariate})"
+    )
+    return TPESampler(
+        n_startup_trials=settings.n_startup_trials,
+        n_ei_candidates=settings.tpe_n_ei_candidates,
+        multivariate=settings.tpe_multivariate,
+        seed=settings.sampler_seed,
+    )
 
 
 def obtain_merge_strategy(settings: Settings) -> str | None:
@@ -253,7 +277,8 @@ def run():
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     # Silence the warning about multivariate TPE being experimental.
-    warnings.filterwarnings("ignore", category=ExperimentalWarning)
+    if settings.sampler == SamplerType.TPE and settings.tpe_multivariate:
+        warnings.filterwarnings("ignore", category=ExperimentalWarning)
 
     study_checkpoint_file = os.path.join(
         settings.study_checkpoint_dir,
@@ -606,13 +631,10 @@ def run():
             trial.study.stop()
             raise TrialPruned()
 
+    sampler = create_sampler(settings)
     study = optuna.create_study(
         study_name="heretic",
-        sampler=TPESampler(
-            n_startup_trials=settings.n_startup_trials,
-            n_ei_candidates=128,
-            multivariate=True,
-        ),
+        sampler=sampler,
         storage=storage,
         directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
         load_if_exists=True,
