@@ -239,12 +239,20 @@ class PolicyApplier:
 @contextmanager
 def _temporary_parameter_cast(module: Module, dtype: torch.dtype) -> Iterator[None]:
     original_data: list[tuple[Tensor, Tensor]] = []
+    original_attrs: list[tuple[Module, str, Tensor]] = []
     try:
         for param in module.parameters(recurse=True):
             if param.dtype != dtype:
                 original_data.append((param, param.data))
                 param.data = param.data.to(dtype)
+        for name in ("weight", "bias"):
+            attr = getattr(module, name, None)
+            if isinstance(attr, Tensor) and attr.dtype != dtype:
+                original_attrs.append((module, name, attr))
+                setattr(module, name, attr.to(dtype))
         yield
     finally:
         for param, data in original_data:
             param.data = data
+        for mod, name, value in original_attrs:
+            setattr(mod, name, value)

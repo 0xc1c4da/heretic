@@ -29,5 +29,5 @@ mkdir -p "$TMPDIR" "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$HF_DATASETS_CACHE"
 
 # uv add tiktoken
 # uv add git+https://github.com/huggingface/transformers.git
-uv sync
+uv sync --upgrade-package transformers
 uv run heretic "$1"
