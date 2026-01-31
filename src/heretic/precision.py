@@ -153,6 +153,8 @@ class PolicyApplier:
         self.policy = policy
         self.logger = logger
         self._logged_modules: set[str] = set()
+        self._module_fallbacks: dict[str, torch.dtype] = {}
+        self._module_no_fallback: set[str] = set()
 
     def apply(self, model: Module) -> None:
         if not self.policy.should_apply_hooks(model):
@@ -163,92 +165,85 @@ class PolicyApplier:
             if getattr(module, "_precision_policy_applied", False):
                 continue
             if isinstance(module, Linear):
-                self._wrap_linear(module, name)
-                module._precision_policy_applied = True  # type: ignore[attr-defined]
+                self._attach_hooks(module, name, "linear")
                 linear_count += 1
             elif isinstance(module, Conv2d):
-                self._wrap_conv2d(module, name)
-                module._precision_policy_applied = True  # type: ignore[attr-defined]
+                self._attach_hooks(module, name, "conv2d")
                 conv_count += 1
+            else:
+                base_layer = getattr(module, "base_layer", None)
+                if isinstance(base_layer, Linear) and not getattr(
+                    base_layer, "_precision_policy_applied", False
+                ):
+                    self._attach_hooks(base_layer, f"{name}.base_layer", "linear")
+                    linear_count += 1
+                elif isinstance(base_layer, Conv2d) and not getattr(
+                    base_layer, "_precision_policy_applied", False
+                ):
+                    self._attach_hooks(base_layer, f"{name}.base_layer", "conv2d")
+                    conv_count += 1
         if self.policy.settings.debug:
             self.logger(
                 f"[bold]Precision hooks applied[/]: linear={linear_count}, conv2d={conv_count}"
             )
 
-    def _wrap_linear(self, module: Linear, name: str) -> None:
-        original_forward = module.forward
+    def _attach_hooks(self, module: Module, name: str, op: str) -> None:
         module._precision_policy_name = name  # type: ignore[attr-defined]
+        module._precision_policy_applied = True  # type: ignore[attr-defined]
+        module._precision_policy_op = op  # type: ignore[attr-defined]
 
-        def forward(*args: Any, **kwargs: Any) -> Tensor:
-            return self._dispatch_linear(module, original_forward, args, kwargs)
+        def pre_hook(
+            mod: Module,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+        ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+            input_tensor = self._first_tensor(args, kwargs)
+            if input_tensor is None:
+                return args, kwargs
+            name = getattr(mod, "_precision_policy_name", None)
+            if name and name in self._module_no_fallback:
+                return args, kwargs
+            cached = self._module_fallbacks.get(name) if name else None
+            if cached is not None:
+                if cached == input_tensor.dtype:
+                    return args, kwargs
+                cast_args, cast_kwargs = self._cast_tensors(args, kwargs, cached)
+                restore = _prepare_cast(mod, cached)
+                _push_restore(mod, restore)
+                return cast_args, cast_kwargs
+            if self.policy.is_op_dtype_supported(op, input_tensor.dtype, input_tensor.device):
+                if name:
+                    self._module_no_fallback.add(name)
+                return args, kwargs
+            fallback = self._choose_fallback(op, input_tensor)
+            if self._warn_module_once(mod, input_tensor.dtype):
+                self.logger(
+                    f"[yellow]Precision fallback for {op}: {input_tensor.dtype} -> {fallback}[/]"
+                )
+            if name:
+                self._module_fallbacks[name] = fallback
+            cast_args, cast_kwargs = self._cast_tensors(args, kwargs, fallback)
+            restore = _prepare_cast(mod, fallback)
+            _push_restore(mod, restore)
+            return cast_args, cast_kwargs
 
-        module.forward = forward  # type: ignore[assignment]
+        def post_hook(mod: Module, _args: tuple[Any, ...], _output: Any) -> None:
+            restore = _pop_restore(mod)
+            if restore is not None:
+                _restore_cast(restore)
 
-    def _wrap_conv2d(self, module: Conv2d, name: str) -> None:
-        original_forward = module.forward
-        module._precision_policy_name = name  # type: ignore[attr-defined]
+        module.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        module.register_forward_hook(post_hook, with_kwargs=True, always_call=True)
 
-        def forward(*args: Any, **kwargs: Any) -> Tensor:
-            return self._dispatch_conv2d(module, original_forward, args, kwargs)
-
-        module.forward = forward  # type: ignore[assignment]
-
-    def _dispatch_linear(
+    def _first_tensor(
         self,
-        module: Linear,
-        original_forward: Callable[..., Tensor],
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> Tensor:
-        input_tensor = self._first_tensor(args)
-        if input_tensor is None:
-            return original_forward(*args, **kwargs)
-        if self.policy.is_op_dtype_supported("linear", input_tensor.dtype, input_tensor.device):
-            try:
-                return original_forward(*args, **kwargs)
-            except Exception as error:
-                if not self._should_retry(error):
-                    raise
-                if self.policy.settings.debug:
-                    self._log_module_dtypes(module, input_tensor, error)
-        fallback = self._choose_fallback("linear", input_tensor)
-        if self._warn_module_once(module, input_tensor.dtype):
-            self.logger(
-                f"[yellow]Precision fallback for linear: {input_tensor.dtype} -> {fallback}[/]"
-            )
-        cast_args, cast_kwargs = self._cast_tensors(args, kwargs, fallback)
-        with _temporary_parameter_cast(module, fallback):
-            return original_forward(*cast_args, **cast_kwargs)
-
-    def _dispatch_conv2d(
-        self,
-        module: Conv2d,
-        original_forward: Callable[..., Tensor],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> Tensor:
-        input_tensor = self._first_tensor(args)
-        if input_tensor is None:
-            return original_forward(*args, **kwargs)
-        if self.policy.is_op_dtype_supported("conv2d", input_tensor.dtype, input_tensor.device):
-            try:
-                return original_forward(*args, **kwargs)
-            except Exception as error:
-                if not self._should_retry(error):
-                    raise
-                if self.policy.settings.debug:
-                    self._log_module_dtypes(module, input_tensor, error)
-        fallback = self._choose_fallback("conv2d", input_tensor)
-        if self._warn_module_once(module, input_tensor.dtype):
-            self.logger(
-                f"[yellow]Precision fallback for conv2d: {input_tensor.dtype} -> {fallback}[/]"
-            )
-        cast_args, cast_kwargs = self._cast_tensors(args, kwargs, fallback)
-        with _temporary_parameter_cast(module, fallback):
-            return original_forward(*cast_args, **cast_kwargs)
-
-    def _first_tensor(self, args: tuple[Any, ...]) -> Tensor | None:
+    ) -> Tensor | None:
         for value in args:
+            if isinstance(value, Tensor):
+                return value
+        for value in kwargs.values():
             if isinstance(value, Tensor):
                 return value
         return None
@@ -268,10 +263,6 @@ class PolicyApplier:
             return False
         self._logged_modules.add(key)
         return True
-
-    def _should_retry(self, error: Exception) -> bool:
-        message = str(error).lower()
-        return "addmm_cuda" in message or "same dtype" in message
 
     def _log_module_dtypes(
         self,
@@ -315,29 +306,55 @@ class PolicyApplier:
         return value
 
 
-@contextmanager
-def _temporary_parameter_cast(module: Module, dtype: torch.dtype) -> Iterator[None]:
+def _prepare_cast(
+    module: Module,
+    dtype: torch.dtype,
+) -> tuple[list[tuple[Tensor, Tensor]], list[tuple[Module, str, Tensor]]]:
     original_data: list[tuple[Tensor, Tensor]] = []
     original_attrs: list[tuple[Module, str, Tensor]] = []
-    try:
-        for param in module.parameters(recurse=True):
+    for param in module.parameters(recurse=True):
+        if param.dtype != dtype:
+            original_data.append((param, param.data))
+            param.data = param.data.to(dtype)
+    _cast_tensor_attrs(module, dtype, original_attrs)
+    base_layer = getattr(module, "base_layer", None)
+    if isinstance(base_layer, Module):
+        for param in base_layer.parameters(recurse=True):
             if param.dtype != dtype:
                 original_data.append((param, param.data))
                 param.data = param.data.to(dtype)
-        _cast_tensor_attrs(module, dtype, original_attrs)
-        base_layer = getattr(module, "base_layer", None)
-        if isinstance(base_layer, Module):
-            for param in base_layer.parameters(recurse=True):
-                if param.dtype != dtype:
-                    original_data.append((param, param.data))
-                    param.data = param.data.to(dtype)
-            _cast_tensor_attrs(base_layer, dtype, original_attrs)
-        yield
-    finally:
-        for param, data in original_data:
-            param.data = data
-        for mod, name, value in original_attrs:
-            setattr(mod, name, value)
+        _cast_tensor_attrs(base_layer, dtype, original_attrs)
+    return original_data, original_attrs
+
+
+def _restore_cast(
+    restore: tuple[list[tuple[Tensor, Tensor]], list[tuple[Module, str, Tensor]]],
+) -> None:
+    original_data, original_attrs = restore
+    for param, data in original_data:
+        param.data = data
+    for mod, name, value in original_attrs:
+        setattr(mod, name, value)
+
+
+def _push_restore(
+    module: Module,
+    restore: tuple[list[tuple[Tensor, Tensor]], list[tuple[Module, str, Tensor]]],
+) -> None:
+    stack = getattr(module, "_precision_policy_restore_stack", None)
+    if stack is None:
+        stack = []
+        module._precision_policy_restore_stack = stack  # type: ignore[attr-defined]
+    stack.append(restore)
+
+
+def _pop_restore(
+    module: Module,
+) -> tuple[list[tuple[Tensor, Tensor]], list[tuple[Module, str, Tensor]]] | None:
+    stack = getattr(module, "_precision_policy_restore_stack", None)
+    if not stack:
+        return None
+    return stack.pop()
 
 
 def _cast_tensor_attrs(
