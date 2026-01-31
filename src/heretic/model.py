@@ -10,6 +10,7 @@ import bitsandbytes as bnb
 import torch
 import torch.linalg as LA
 import torch.nn.functional as F
+import transformers
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
@@ -60,6 +61,7 @@ class Model:
         self.settings = settings
         self.response_prefix = ""
         self.needs_reload = False
+        self.is_quantized = False
         self.lora_rank: int = None
 
         print()
@@ -86,6 +88,7 @@ class Model:
             else None
         )
         self.trusted_models = {settings.model: settings.trust_remote_code}
+        self.model_quantization_config = self._get_model_quantization_config()
 
         if self.settings.evaluate_model is not None:
             self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
@@ -116,6 +119,8 @@ class Model:
                 if self.trusted_models.get(settings.model) is None:
                     self.trusted_models[settings.model] = True
 
+                self.is_quantized = self._detect_model_quantization(quantization_config)
+
                 # A test run can reveal dtype-related problems such as the infamous
                 # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
                 # (https://github.com/meta-llama/llama/issues/380).
@@ -135,8 +140,9 @@ class Model:
                 continue
 
             print("[green]Ok[/]")
-            if settings.quantization == QuantizationMethod.BNB_4BIT:
-                print("[bold green]Model loaded in 4-bit precision.[/]")
+            if self.is_quantized:
+                label = self._format_quantization_label(quantization_config)
+                print(f"[bold green]Model loaded with {label}.[/]")
             break
 
         if self.model is None:
@@ -197,7 +203,7 @@ class Model:
             f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
         )
 
-    def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _get_quantization_config(self, dtype: str) -> object | None:
         """
         Creates quantization config based on settings.
 
@@ -205,8 +211,21 @@ class Model:
             dtype: The dtype string (e.g., "auto", "bfloat16")
 
         Returns:
-            BitsAndBytesConfig or None
+            Quantization config instance or None
         """
+        if (
+            self.model_quantization_config is not None
+            and self.settings.quantization
+            not in {QuantizationMethod.AUTO, QuantizationMethod.NONE}
+        ):
+            raise ValueError(
+                "Model already provides a quantization_config. "
+                "Set quantization='auto' to use it or quantization='none' to disable."
+            )
+
+        if self.settings.quantization == QuantizationMethod.AUTO:
+            return None
+
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
             # BitsAndBytesConfig expects a torch.dtype, not a string.
             if dtype == "auto":
@@ -214,20 +233,85 @@ class Model:
             else:
                 compute_dtype = getattr(torch, dtype)
 
-            return BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
+            bnb_kwargs = {
+                "load_in_4bit": True,
+                "bnb_4bit_compute_dtype": compute_dtype,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_use_double_quant": True,
+            }
+            bnb_kwargs.update(self._get_quantization_kwargs())
+            return BitsAndBytesConfig(**bnb_kwargs)
+
+        if self.settings.quantization == QuantizationMethod.FP8:
+            try:
+                from transformers import FineGrainedFP8Config
+            except ImportError as exc:
+                raise Exception(
+                    "FineGrainedFP8Config is not available in this transformers version."
+                ) from exc
+
+            return FineGrainedFP8Config(**self._get_quantization_kwargs())
+
+        if self.settings.quantization == QuantizationMethod.CUSTOM:
+            if not self.settings.quantization_config_type:
+                raise ValueError(
+                    "quantization_config_type must be set when quantization='custom'."
+                )
+
+            config_class = getattr(
+                transformers,
+                self.settings.quantization_config_type,
+                None,
             )
+            if config_class is None:
+                raise ValueError(
+                    f"Unknown quantization config class: {self.settings.quantization_config_type}"
+                )
+
+            return config_class(**self._get_quantization_kwargs())
+
         return None
+
+    def _get_quantization_kwargs(self) -> dict[str, Any]:
+        return dict(self.settings.quantization_kwargs or {})
+
+    def _get_model_quantization_config(self) -> dict[str, Any] | None:
+        config_dict, _ = PretrainedConfig.get_config_dict(self.settings.model)
+        return config_dict.get("quantization_config")
+
+    def _detect_model_quantization(self, quantization_config: object | None) -> bool:
+        if quantization_config is not None:
+            return True
+        if getattr(self.model, "quantization_config", None) is not None:
+            return True
+        if getattr(self.model.config, "quantization_config", None) is not None:
+            return True
+        return self.model_quantization_config is not None
+
+    def _format_quantization_label(self, quantization_config: object | None) -> str:
+        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
+            return "4-bit bitsandbytes quantization"
+        if self.settings.quantization == QuantizationMethod.FP8:
+            return "FP8 quantization"
+        if self.settings.quantization == QuantizationMethod.CUSTOM:
+            config_type = self.settings.quantization_config_type or "custom"
+            return f"custom quantization ({config_type})"
+
+        model_qconfig = getattr(self.model, "quantization_config", None) or getattr(
+            self.model.config, "quantization_config", None
+        )
+        if model_qconfig is not None:
+            return f"model-provided quantization ({type(model_qconfig).__name__})"
+        if quantization_config is not None:
+            return f"quantization ({type(quantization_config).__name__})"
+        return "quantization"
 
     def get_merged_model(self) -> PreTrainedModel:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
         # Check if we need special handling for quantized models
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
+        if self.is_quantized:
             # Quantized models need special handling - we must reload the base model
             # in full precision to merge the LoRA adapters
 
@@ -302,6 +386,7 @@ class Model:
         self.model = None  # ty:ignore[invalid-assignment]
         empty_cache()
 
+        self.model_quantization_config = self._get_model_quantization_config()
         quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
 
         # Build kwargs, only include quantization_config if it's not None
@@ -318,6 +403,7 @@ class Model:
             **extra_kwargs,
         )
 
+        self.is_quantized = self._detect_model_quantization(quantization_config)
         self._apply_lora()
 
         self.needs_reload = False

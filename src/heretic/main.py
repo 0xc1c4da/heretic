@@ -36,7 +36,7 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod, SamplerType, Settings
+from .config import SamplerType, Settings
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .utils import (
@@ -77,7 +77,7 @@ def create_sampler(settings: Settings) -> BaseSampler:
     )
 
 
-def obtain_merge_strategy(settings: Settings) -> str | None:
+def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
     """
     Prompts the user for how to proceed with saving the model.
     Provides info to the user if the model is quantized on memory use.
@@ -85,7 +85,7 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
     """
 
     # Prompt for all PEFT models to ensure user is aware of merge implications
-    if settings.quantization == QuantizationMethod.BNB_4BIT:
+    if model.is_quantized:
         # Quantized models need special handling - we must reload the base model
         # in full precision to merge the LoRA adapters
         print()
@@ -134,7 +134,7 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
                 title="Merge full model"
                 + (
                     ""
-                    if settings.quantization == QuantizationMethod.NONE
+                    if not model.is_quantized
                     else " (reload base model on CPU - requires high RAM)"
                 ),
                 value="merge",
@@ -156,7 +156,7 @@ def save_model(
 ) -> None:
     print("Saving model...")
     if strategy is None:
-        strategy = obtain_merge_strategy(settings)
+        strategy = obtain_merge_strategy(settings, model)
         if strategy is None:
             print("[yellow]Action cancelled.[/]")
             return
@@ -983,7 +983,7 @@ def run():
                             )
                             private = visibility == "Private"
 
-                            strategy = obtain_merge_strategy(settings)
+                            strategy = obtain_merge_strategy(settings, model)
                             if strategy is None:
                                 print("[yellow]Action cancelled.[/]")
                                 continue

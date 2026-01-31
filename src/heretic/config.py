@@ -2,7 +2,7 @@
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
 
 from enum import Enum
-from typing import Dict
+from typing import Any, Dict
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import (
@@ -16,7 +16,10 @@ from pydantic_settings import (
 
 class QuantizationMethod(str, Enum):
     NONE = "none"
+    AUTO = "auto"
     BNB_4BIT = "bnb_4bit"
+    FP8 = "fp8"
+    CUSTOM = "custom"
 
 
 class RowNormalization(str, Enum):
@@ -107,7 +110,30 @@ class Settings(BaseSettings):
 
     quantization: QuantizationMethod = Field(
         default=QuantizationMethod.NONE,
-        description="Quantization method to use when loading the model. Options: 'none' (no quantization), 'bnb_4bit' (4-bit quantization using bitsandbytes).",
+        description=(
+            "Quantization method to use when loading the model. Options: "
+            "'none' (no quantization), "
+            "'auto' (use model-provided quantization config if available), "
+            "'bnb_4bit' (4-bit quantization using bitsandbytes), "
+            "'fp8' (FineGrainedFP8Config), "
+            "'custom' (use quantization_config_type + quantization_kwargs)."
+        ),
+    )
+
+    quantization_config_type: str | None = Field(
+        default=None,
+        description=(
+            "When quantization='custom', this is the transformers quantization config "
+            "class name to instantiate (e.g. 'GPTQConfig', 'AWQConfig')."
+        ),
+    )
+
+    quantization_kwargs: Dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional kwargs passed to the quantization config constructor (for any "
+            "quantization method that supports custom options)."
+        ),
     )
 
     batch_size: int = Field(

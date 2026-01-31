@@ -21,16 +21,13 @@ fi
 if [ -z "$HUGGINGFACE_HUB_CACHE" ]; then
     export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 fi
-if [ -z "$TRANSFORMERS_CACHE" ]; then
-    export TRANSFORMERS_CACHE="$HF_HOME/transformers"
-fi
 if [ -z "$HF_DATASETS_CACHE" ]; then
     export HF_DATASETS_CACHE="$HF_HOME/datasets"
 fi
 
-mkdir -p "$TMPDIR" "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" \
-    "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
+mkdir -p "$TMPDIR" "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$HF_DATASETS_CACHE"
 
+# uv add tiktoken
+# uv add git+https://github.com/huggingface/transformers.git
 uv sync
-uv run pip install git+https://github.com/huggingface/transformers.git
 uv run heretic "$1"

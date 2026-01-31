@@ -19,8 +19,21 @@ dtypes = [
 device_map = "auto"
 
 # Quantization method to use when loading the model.
-# Options: "none" (no quantization), "bnb_4bit" (4-bit quantization using bitsandbytes).
+# Options:
+#   "none"  - no quantization
+#   "auto"  - use model-provided quantization config if available
+#   "bnb_4bit" - 4-bit quantization using bitsandbytes
+#   "fp8"   - FineGrainedFP8Config
+#   "custom" - use quantization_config_type + quantization_kwargs
 quantization = "none"
+
+# When quantization = "custom", set the transformers quantization config class name.
+# Example: quantization_config_type = "GPTQConfig"
+# quantization_config_type = ""
+
+# Optional kwargs passed to the quantization config constructor.
+# Example: quantization_kwargs = { bits=4, group_size=128 }
+# quantization_kwargs = {}
 
 # Memory limits to impose. 0 is usually your first graphics card.
 # max_memory = {0 = "16GB", "cpu" = "64GB"}
