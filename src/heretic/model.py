@@ -62,6 +62,7 @@ class Model:
         self.response_prefix = ""
         self.needs_reload = False
         self.is_quantized = False
+        self.is_fp8 = False
         self.lora_rank: int = None
         self.precision_policy = PrecisionPolicy.from_settings(settings)
 
@@ -94,6 +95,9 @@ class Model:
         if self.settings.evaluate_model is not None:
             self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
 
+        # Detect the device we'll be using for precision probing
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         for dtype in settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
@@ -109,7 +113,7 @@ class Model:
                 load_kwargs = {
                     "torch_dtype": self.precision_policy.resolve_model_dtype(
                         dtype,
-                        torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                        self.device,
                     ),
                     "device_map": settings.device_map,
                     "max_memory": self.max_memory,
@@ -128,7 +132,12 @@ class Model:
                     self.trusted_models[settings.model] = True
 
                 self.is_quantized = self._detect_model_quantization(quantization_config)
-                self.precision_policy.log_probe_matrix(print)
+                self.is_fp8 = self._detect_fp8_quantization(quantization_config)
+
+                if self.settings.precision_debug:
+                    self.precision_policy.log_probe_matrix(print)
+
+                # Initial application of precision hooks to base model
                 PolicyApplier(self.precision_policy, print).apply(self.model)
 
             except Exception as error:
@@ -146,13 +155,13 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
+        # Apply LoRA for abliteration
         self._apply_lora()
-        # Apply policy again after LoRA wraps modules.
+
+        # Re-apply precision hooks to cover LoRA layers and ensure inter-layer compatibility
         PolicyApplier(self.precision_policy, print).apply(self.model)
 
-        # A test run can reveal dtype-related problems such as the infamous
-        # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
-        # (https://github.com/meta-llama/llama/issues/380).
+        # Sanity test generation to catch dtype/kernel issues early
         try:
             self.generate(
                 [
@@ -166,9 +175,6 @@ class Model:
         except Exception as error:
             print(f"[yellow]Sanity generate failed[/] ({error})")
 
-        # LoRA B matrices are initialized to zero by default in PEFT,
-        # so we don't need to do anything manually.
-
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
         print("* Abliterable components:")
         for component, modules in self.get_layer_modules(0).items():
@@ -176,43 +182,45 @@ class Model:
                 f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
             )
 
+    def _detect_fp8_quantization(self, quantization_config: Any) -> bool:
+        """Specifically detects if the model is using FP8 quantization."""
+        config = quantization_config
+        if config is None:
+            config = getattr(self.model, "quantization_config", None)
+        if config is None:
+            config = getattr(self.model.config, "quantization_config", None)
+        if config is None:
+            return False
+
+        method = getattr(config, "quant_method", None)
+        if method is None and isinstance(config, dict):
+            method = config.get("quant_method")
+
+        return method == "fp8"
+
     def _apply_lora(self):
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PreTrainedModel)
 
-        # Always use LoRA adapters for abliteration (faster reload, no weight modification)
-        # We use the leaf names (e.g. "o_proj") as target modules.
-        # This may cause LoRA adapters to be attached to unrelated modules (e.g. "conv.o_proj"),
-        # but this is harmless as we only abliterate the modules we target in `abliterate()`,
-        # leaving the others at their default (identity) state.
-        # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
+        # Always use LoRA adapters for abliteration
         target_modules = [
             comp.split(".")[-1] for comp in self.get_abliterable_components()
         ]
 
         if self.settings.row_normalization != RowNormalization.FULL:
-            # Rank 1 is sufficient for directional ablation without renormalization.
             self.lora_rank = 1
         else:
-            # Row magnitude preservation introduces nonlinear effects. A rank of 3 is enough to explain
-            # most of the variance in the delta matrix, and reduction of the spectral norm of the error
-            # of the reconstructed matrix falls off at higher ranks.
             self.lora_rank = 3
 
         peft_config = LoraConfig(
             r=self.lora_rank,
             target_modules=target_modules,
-            lora_alpha=self.lora_rank,  # Apply adapter at full strength.
+            lora_alpha=self.lora_rank,
             lora_dropout=0,
             bias="none",
-            # Even if we're using AutoModelForImageTextToText, this is still correct, as it is (post-vision)
-            # the same kind of model.
-            # https://github.com/huggingface/peft/blob/622c2821cb0d7897bee53aad7914d42b5fecbf61/src/peft/auto.py#L45
             task_type="CAUSAL_LM",
         )
 
-        # peft_config is a LoraConfig object rather than a dictionary,
-        # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, peft_config))
 
         print(
@@ -220,15 +228,7 @@ class Model:
         )
 
     def _get_quantization_config(self, dtype: str) -> object | None:
-        """
-        Creates quantization config based on settings.
-
-        Args:
-            dtype: The dtype string (e.g., "auto", "bfloat16")
-
-        Returns:
-            Quantization config instance or None
-        """
+        """Creates quantization config based on settings."""
         if (
             self.model_quantization_config is not None
             and self.settings.quantization
@@ -347,13 +347,12 @@ class Model:
             )
 
             # Apply LoRA adapters to the CPU model
-
             print("* Applying LoRA adapters...")
             target_modules = self.get_abliterable_components()
             peft_config = LoraConfig(
                 r=self.lora_rank,
                 target_modules=target_modules,
-                lora_alpha=self.lora_rank,  # Apply adapter at full strength.
+                lora_alpha=self.lora_rank,
                 lora_dropout=0,
                 bias="none",
                 task_type="CAUSAL_LM",
@@ -373,21 +372,12 @@ class Model:
             # Non-quantized model - can merge directly
             print("* Merging LoRA adapters into base model...")
             merged_model = self.model.merge_and_unload()
-            # merge_and_unload() modifies self.model in-place, destroying LoRA adapters.
             # Mark for full reload if user switches trials later.
             self.needs_reload = True
             return merged_model
 
     def reset_model(self):
-        """
-        Resets the model to a clean state for the next trial or evaluation.
-
-        Behavior:
-        - Fast path: If the same model is loaded and doesn't need full reload,
-          resets LoRA adapter weights to zero (identity transformation).
-        - Slow path: If switching models or after merge_and_unload(),
-          performs full model reload with quantization config.
-        """
+        """Resets the model to a clean state for the next trial or evaluation."""
         current_model = getattr(self.model.config, "name_or_path", None)
         if current_model == self.settings.model and not self.needs_reload:
             # Reset LoRA adapters to zero (identity transformation)
@@ -398,14 +388,14 @@ class Model:
 
         dtype = self.model.dtype
 
-        # Purge existing model object from memory to make space.
+        # Purge existing model object from memory.
         self.model = None  # ty:ignore[invalid-assignment]
         empty_cache()
 
         self.model_quantization_config = self._get_model_quantization_config()
         quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
 
-        # Build kwargs, only include quantization_config if it's not None
+        # Build kwargs
         extra_kwargs = {}
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
@@ -413,7 +403,7 @@ class Model:
         load_kwargs = {
             "torch_dtype": self.precision_policy.resolve_model_dtype(
                 str(dtype).split(".")[-1],
-                torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                self.device,
             ),
             "device_map": self.settings.device_map,
             "max_memory": self.max_memory,
@@ -427,9 +417,13 @@ class Model:
         )
 
         self.is_quantized = self._detect_model_quantization(quantization_config)
+        self.is_fp8 = self._detect_fp8_quantization(quantization_config)
+
         self._apply_lora()
+
         if self.settings.precision_debug:
             self.precision_policy.log_probe_matrix(print)
+
         PolicyApplier(self.precision_policy, print).apply(self.model)
 
         self.needs_reload = False
@@ -437,7 +431,7 @@ class Model:
     def get_layers(self) -> ModuleList:
         model = self.model
 
-        # Unwrap PeftModel (always true after _apply_lora)
+        # Unwrap PeftModel
         if isinstance(model, PeftModel):
             model = model.base_model.model
 
@@ -454,19 +448,15 @@ class Model:
         modules = {}
 
         def try_add(component: str, module: Any):
-            # Only add if it's a proper nn.Module (PEFT can wrap these with LoRA)
             if isinstance(module, Module):
                 if component not in modules:
                     modules[component] = []
                 modules[component].append(module)
             else:
-                # Assert for unexpected types (catches architecture changes)
                 assert not isinstance(module, Tensor), (
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # Exceptions aren't suppressed here, because there is currently
-        # no alternative location for the attention out-projection.
         try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Most dense models.
@@ -478,21 +468,19 @@ class Model:
             for expert in layer.mlp.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
 
-        # Phi-3.5-MoE (and possibly others).
+        # Phi-3.5-MoE.
         with suppress(Exception):
             for expert in layer.block_sparse_moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
 
-        # Granite MoE Hybrid - attention layers with shared_mlp.
+        # Granite MoE Hybrid.
         with suppress(Exception):
             try_add("mlp.down_proj", layer.shared_mlp.output_linear)  # ty:ignore[possibly-missing-attribute]
 
-        # Granite MoE Hybrid - MoE layers with experts.
         with suppress(Exception):
             for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
 
-        # We need at least one module across all components for abliteration to work.
         total_modules = sum(len(mods) for mods in modules.values())
         assert total_modules > 0, "No abliterable modules found in layer"
 
@@ -510,8 +498,6 @@ class Model:
         if direction_index is None:
             refusal_direction = None
         else:
-            # The index must be shifted by 1 because the first element
-            # of refusal_directions is the direction for the embeddings.
             weight, index = math.modf(direction_index + 1)
             refusal_direction = F.normalize(
                 refusal_directions[int(index)].lerp(
@@ -522,65 +508,35 @@ class Model:
                 dim=0,
             )
 
-        # Note that some implementations of abliteration also orthogonalize
-        # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(self.get_layers())):
             for component, modules in self.get_layer_modules(layer_index).items():
                 params = parameters[component]
-
-                # Type inference fails here for some reason.
                 distance = cast(float, abs(layer_index - params.max_weight_position))
 
-                # Don't orthogonalize layers that are more than
-                # min_weight_distance away from max_weight_position.
                 if distance > params.min_weight_distance:
                     continue
 
-                # Interpolate linearly between max_weight and min_weight
-                # over min_weight_distance.
                 weight = params.max_weight + (distance / params.min_weight_distance) * (
                     params.min_weight - params.max_weight
                 )
 
                 if refusal_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of refusal_directions is the direction for the embeddings.
                     layer_refusal_direction = refusal_directions[layer_index + 1]
                 else:
                     layer_refusal_direction = refusal_direction
 
                 for module in modules:
-                    # FIXME: This cast is potentially invalid, because the program logic
-                    #        does not guarantee that the module is of type Linear, and in fact
-                    #        the retrieved modules might not conform to the interface assumed
-                    #        below (though they do in practice). However, this is difficult
-                    #        to fix cleanly, because get_layer_modules is called twice on
-                    #        different model configurations, and PEFT employs different
-                    #        module types depending on the chosen quantization.
                     module = cast(Linear, module)
-
-                    # LoRA abliteration: delta W = -lambda * v * (v^T W)
-                    # lora_B = -lambda * v
-                    # lora_A = v^T W
-
-                    # Use the FP32 refusal direction directly (no downcast/upcast)
-                    # and move to the correct device.
                     v = layer_refusal_direction.to(module.weight.device)
 
-                    # Get W (dequantize if necessary).
-                    #
-                    # FIXME: This cast is valid only under the assumption that the original
-                    #        module wrapped by the LoRA adapter has a weight attribute.
-                    #        See the comment above for why this is currently not guaranteed.
+                    # Get base weight (dequantize if necessary).
                     base_weight = cast(Tensor, module.base_layer.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
                     if quant_state is None:
                         W = base_weight.to(torch.float32)
                     else:
-                        # 4-bit quantization.
-                        # This cast is always valid. Type inference fails here because the
-                        # bnb.functional module is not found by ty for some reason.
+                        # 4-bit quantization support
                         W = cast(
                             Tensor,
                             bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
@@ -589,56 +545,37 @@ class Model:
                             ).to(torch.float32),
                         )
 
-                    # Flatten weight matrix to (out_features, in_features).
                     W = W.view(W.shape[0], -1)
 
                     if self.settings.row_normalization != RowNormalization.NONE:
-                        # Keep a reference to the original weight matrix so we can subtract it later.
                         W_org = W
-                        # Get the row norms (cast to work around untyped LA).
                         W_row_norms = cast(
                             Tensor, LA.vector_norm(W, dim=1, keepdim=True)
                         )
-                        # Normalize the weight matrix along the rows.
                         W = F.normalize(W, p=2, dim=1)
 
                     # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
                     lora_A = (v @ W).view(1, -1)
 
                     # Calculate lora_B = -weight * v
-                    # v is (d_out,)
                     lora_B = (-weight * v).view(-1, 1)
 
                     if self.settings.row_normalization == RowNormalization.PRE:
-                        # Make the LoRA adapter apply to the original weight matrix.
                         lora_B = W_row_norms * lora_B
                     elif self.settings.row_normalization == RowNormalization.FULL:
-                        # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
                         W = W + lora_B @ lora_A
-                        # Normalize the adjusted weight matrix along the rows.
                         W = F.normalize(W, p=2, dim=1)
-                        # Restore the original row norms of the weight matrix.
                         W = W * W_row_norms
-                        # Subtract the original matrix to turn W into a delta.
                         W = W - W_org
-                        # Use a low-rank SVD to get an approximation of the matrix.
                         r = self.lora_rank
                         U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
-                        # Truncate it to the part we want to store in the LoRA adapter.
-                        # Note: svd_lowrank actually returns V, so transpose it to get Vh.
                         U = U[:, :r]
                         S = S[:r]
                         Vh = Vh[:, :r].T
-                        # Transfer it into the LoRA adapter components.
                         sqrt_S = torch.sqrt(S)
                         lora_B = U @ torch.diag(sqrt_S)
                         lora_A = torch.diag(sqrt_S) @ Vh
 
-                    # Assign to adapters. The adapter name is "default", because that's
-                    # what PEFT uses when no name is explicitly specified, as above.
-                    # These casts are therefore valid.
                     weight_A = cast(Tensor, module.lora_A["default"].weight)
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
@@ -657,8 +594,6 @@ class Model:
             for prompt in prompts
         ]
 
-        # This cast is valid because list[str] is the return type
-        # for batched operation with tokenize=False.
         chat_prompts = cast(
             list[str],
             self.tokenizer.apply_chat_template(
@@ -669,8 +604,6 @@ class Model:
         )
 
         if self.response_prefix:
-            # Append the common response prefix to the prompts so that evaluation happens
-            # at the point where responses start to differ for different prompts.
             chat_prompts = [prompt + self.response_prefix for prompt in chat_prompts]
 
         inputs = self.tokenizer(
@@ -680,13 +613,11 @@ class Model:
             return_token_type_ids=False,
         ).to(self.model.device)
 
-        # FIXME: The type checker has been disabled here because of the extremely complex
-        #        interplay between different generate() signatures and dynamic delegation.
         outputs = self.model.generate(
             **inputs,
             **kwargs,
             pad_token_id=self.tokenizer.pad_token_id,
-            do_sample=False,  # Use greedy decoding to ensure deterministic outputs.
+            do_sample=False,
         )  # ty:ignore[call-non-callable]
 
         return inputs, outputs
@@ -702,9 +633,6 @@ class Model:
         )
 
         return self.tokenizer.batch_decode(
-            # Extract the newly generated part.
-            # This cast is valid because the input_ids property is a Tensor
-            # if the tokenizer is invoked with return_tensors="pt", as above.
             outputs[:, cast(Tensor, inputs["input_ids"]).shape[1] :],
             skip_special_tokens=skip_special_tokens,
         )
@@ -726,8 +654,6 @@ class Model:
         return responses
 
     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
-        # We only generate one token, and we return the residual vectors
-        # at that token position, for each prompt and layer.
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,
@@ -735,29 +661,17 @@ class Model:
             return_dict_in_generate=True,
         )
 
-        # This cast is valid because GenerateDecoderOnlyOutput is the return type
-        # of model.generate with return_dict_in_generate=True.
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
-
-        # Hidden states for the first (only) generated token.
-        # This cast is valid because we passed output_hidden_states=True above.
         hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
 
-        # The returned tensor has shape (prompt, layer, component).
         residuals = torch.stack(
-            # layer_hidden_states has shape (prompt, position, component),
-            # so this extracts the hidden states at the end of each prompt,
-            # and stacks them up over the layers.
             [layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states],
             dim=1,
         )
 
-        # Upcast the data type to avoid precision (bfloat16) or range (float16)
-        # problems during calculations involving residual vectors.
         residuals = residuals.to(torch.float32)
 
         if 0 <= self.settings.winsorization_quantile < 1:
-            # Perform symmetric magnitude winsorization on the residuals.
             abs_residuals = torch.abs(residuals)
             thresholds = torch.quantile(
                 abs_residuals, self.settings.winsorization_quantile, 2, True
@@ -774,11 +688,7 @@ class Model:
 
         return torch.cat(residuals, dim=0)
 
-    # We work with logprobs rather than probabilities for numerical stability
-    # when computing the KL divergence.
     def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
-        # We only generate one token, and we return the (log) probability distributions
-        # over the vocabulary at that token position, for each prompt.
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,
@@ -786,15 +696,9 @@ class Model:
             return_dict_in_generate=True,
         )
 
-        # This cast is valid because GenerateDecoderOnlyOutput is the return type
-        # of model.generate with return_dict_in_generate=True.
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
-
-        # Logits for the first (only) generated token.
-        # This cast is valid because we passed output_scores=True above.
         logits = cast(tuple[FloatTensor], outputs.scores)[0]
 
-        # The returned tensor has shape (prompt, token).
         return F.log_softmax(logits, dim=-1)
 
     def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:
@@ -806,8 +710,6 @@ class Model:
         return torch.cat(logprobs, dim=0)
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
-        # This cast is valid because str is the return type
-        # for single-chat operation with tokenize=False.
         chat_prompt = cast(
             str,
             self.tokenizer.apply_chat_template(
@@ -824,16 +726,11 @@ class Model:
         ).to(self.model.device)
 
         streamer = TextStreamer(
-            # The TextStreamer constructor annotates this parameter with the AutoTokenizer
-            # type, which makes no sense because AutoTokenizer is a factory class,
-            # not a base class that tokenizers inherit from.
             self.tokenizer,  # ty:ignore[invalid-argument-type]
             skip_prompt=True,
             skip_special_tokens=True,
         )
 
-        # FIXME: The type checker has been disabled here because of the extremely complex
-        #        interplay between different generate() signatures and dynamic delegation.
         outputs = self.model.generate(
             **inputs,
             streamer=streamer,
