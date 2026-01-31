@@ -28,6 +28,7 @@ from transformers import (
 from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
+from transformers.utils import generic as transformers_generic
 
 from .config import QuantizationMethod, RowNormalization, Settings
 from .precision import PolicyApplier, PrecisionPolicy
@@ -67,6 +68,9 @@ class Model:
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
+
+        if self.settings.precision_debug:
+            self._install_check_model_inputs_debug()
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             settings.model,
@@ -218,6 +222,39 @@ class Model:
         print(
             f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
         )
+
+    def _install_check_model_inputs_debug(self) -> None:
+        original = transformers_generic.check_model_inputs
+
+        def wrapper(func=None, *, tie_last_hidden_states=True):
+            def wrapped_fn(inner_func):
+                wrapped = original(
+                    inner_func, tie_last_hidden_states=tie_last_hidden_states
+                )
+
+                def logged(self, *args, **kwargs):
+                    print(
+                        "[yellow]check_model_inputs wrapper[/]: "
+                        f"func={inner_func.__qualname__}, module={inner_func.__module__}, "
+                        f"kwargs={list(kwargs.keys())}"
+                    )
+                    try:
+                        return wrapped(self, *args, **kwargs)
+                    except TypeError as error:
+                        print(
+                            "[yellow]check_model_inputs TypeError[/]: "
+                            f"func={inner_func.__qualname__}, module={inner_func.__module__}, "
+                            f"kwargs={list(kwargs.keys())}, error={error}"
+                        )
+                        raise
+
+                return logged
+
+            if func is not None:
+                return wrapped_fn(func)
+            return wrapped_fn
+
+        transformers_generic.check_model_inputs = wrapper
     def _get_quantization_config(self, dtype: str) -> object | None:
         """
         Creates quantization config based on settings.
