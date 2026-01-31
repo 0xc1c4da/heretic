@@ -105,44 +105,18 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                disable_model_quantization = (
-                    self.settings.quantization == QuantizationMethod.NONE
-                    and self.model_quantization_config is not None
-                )
-
                 load_kwargs = {
-                    "torch_dtype": dtype,
+                    "torch_dtype": self._resolve_torch_dtype(dtype),
                     "device_map": settings.device_map,
                     "max_memory": self.max_memory,
                     "trust_remote_code": self.trusted_models.get(settings.model),
                     **extra_kwargs,
                 }
 
-                if (
-                    disable_model_quantization
-                    and "quantization_config" not in load_kwargs
-                ):
-                    try:
-                        self.model = get_model_class(settings.model).from_pretrained(
-                            settings.model,
-                            **load_kwargs,
-                            quantization_config=None,
-                        )
-                    except Exception as error:
-                        if "quantization_config" in str(error):
-                            self.model = get_model_class(
-                                settings.model
-                            ).from_pretrained(
-                                settings.model,
-                                **load_kwargs,
-                            )
-                        else:
-                            raise
-                else:
-                    self.model = get_model_class(settings.model).from_pretrained(
-                        settings.model,
-                        **load_kwargs,
-                    )
+                self.model = get_model_class(settings.model).from_pretrained(
+                    settings.model,
+                    **load_kwargs,
+                )
 
                 # If we reach this point and the model requires trust_remote_code,
                 # either the user accepted, or settings.trust_remote_code is True.
@@ -150,6 +124,7 @@ class Model:
                     self.trusted_models[settings.model] = True
 
                 self.is_quantized = self._detect_model_quantization(quantization_config)
+                self._cast_fp8_weights_if_needed(dtype)
 
                 # A test run can reveal dtype-related problems such as the infamous
                 # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
@@ -302,6 +277,59 @@ class Model:
 
         return None
 
+    def _resolve_torch_dtype(self, dtype: str) -> str | torch.dtype:
+        if dtype == "auto":
+            return "auto"
+        return getattr(torch, dtype)
+
+    def _pick_fp8_fallback_dtype(self, requested_dtype: str) -> torch.dtype:
+        if requested_dtype != "auto":
+            return getattr(torch, requested_dtype)
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+
+    def _fp8_dtypes(self) -> tuple[torch.dtype, ...]:
+        candidates = []
+        for name in ("float8_e4m3fn", "float8_e5m2"):
+            dtype = getattr(torch, name, None)
+            if dtype is not None:
+                candidates.append(dtype)
+        return tuple(candidates)
+
+    def _cast_fp8_weights_if_needed(self, requested_dtype: str) -> None:
+        if self.settings.quantization != QuantizationMethod.NONE:
+            return
+
+        fp8_dtypes = self._fp8_dtypes()
+        if not fp8_dtypes:
+            return
+
+        found_fp8 = False
+        for param in self.model.parameters():
+            if param.dtype in fp8_dtypes:
+                found_fp8 = True
+                break
+        if not found_fp8:
+            for buf in self.model.buffers():
+                if buf.dtype in fp8_dtypes:
+                    found_fp8 = True
+                    break
+
+        if not found_fp8:
+            return
+
+        cast_dtype = self._pick_fp8_fallback_dtype(requested_dtype)
+        print(
+            f"[yellow]Model weights are FP8; casting to {cast_dtype} for runtime compatibility.[/]"
+        )
+        for param in self.model.parameters():
+            if param.dtype in fp8_dtypes:
+                param.data = param.data.to(cast_dtype)
+        for buf in self.model.buffers():
+            if buf.dtype in fp8_dtypes:
+                buf.data = buf.data.to(cast_dtype)
+
     def _get_quantization_kwargs(self) -> dict[str, Any]:
         return dict(self.settings.quantization_kwargs or {})
 
@@ -424,43 +452,21 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        disable_model_quantization = (
-            self.settings.quantization == QuantizationMethod.NONE
-            and self.model_quantization_config is not None
-        )
-
         load_kwargs = {
-            "torch_dtype": dtype,
+            "torch_dtype": self._resolve_torch_dtype(str(dtype).split(".")[-1]),
             "device_map": self.settings.device_map,
             "max_memory": self.max_memory,
             "trust_remote_code": self.trusted_models.get(self.settings.model),
             **extra_kwargs,
         }
 
-        if disable_model_quantization and "quantization_config" not in load_kwargs:
-            try:
-                self.model = get_model_class(self.settings.model).from_pretrained(
-                    self.settings.model,
-                    **load_kwargs,
-                    quantization_config=None,
-                )
-            except Exception as error:
-                if "quantization_config" in str(error):
-                    self.model = get_model_class(
-                        self.settings.model
-                    ).from_pretrained(
-                        self.settings.model,
-                        **load_kwargs,
-                    )
-                else:
-                    raise
-        else:
-            self.model = get_model_class(self.settings.model).from_pretrained(
-                self.settings.model,
-                **load_kwargs,
-            )
+        self.model = get_model_class(self.settings.model).from_pretrained(
+            self.settings.model,
+            **load_kwargs,
+        )
 
         self.is_quantized = self._detect_model_quantization(quantization_config)
+        self._cast_fp8_weights_if_needed(str(dtype).split(".")[-1])
         self._apply_lora()
 
         self.needs_reload = False
