@@ -61,17 +61,19 @@ def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
     Returns "merge", "adapter", or None (if cancelled/invalid).
     """
 
-    # Prompt for all PEFT models to ensure user is aware of merge implications
+    # Prompt for all PEFT models to ensure user is aware of merge implications.
     if bool(getattr(model, "quant", None) and model.quant.is_quantized):
-        # Quantized models need special handling - we must reload the base model
-        # in full precision to merge the LoRA adapters
         print()
+        print("[yellow]Model was loaded with quantization.[/]")
         print(
-            "[yellow]Model was loaded with quantization. Merging requires reloading the base model.[/]"
+            "[yellow]Merge semantics:[/]\n"
+            "  - We will first try to merge while preserving quantization if the quantization backend supports\n"
+            "    serialization and the merge is validated.\n"
+            "  - Otherwise we will attempt a float merged export by loading dequantized weights (when supported).\n"
+            "  - If neither is possible, we will error and you should export the adapter-only format instead."
         )
-        print(
-            "[red](!) WARNING: CPU Merging requires dequantizing the entire model to System RAM.[/]"
-        )
+        print()
+        print("[red](!) WARNING: float merge may require dequantizing to System RAM.[/]")
         print("[red]    This can lead to SYSTEM FREEZES if you run out of memory.[/]")
         print(
             "[yellow]    Rule of thumb: You need approx. 3x the parameter count in GB.[/]"

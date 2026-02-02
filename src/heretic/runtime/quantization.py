@@ -41,12 +41,51 @@ class QuantizationInfo:
     load_quantization_config: object | None
     model_provided_config: Mapping[str, Any] | None
     compute_dtype: torch.dtype
+    has_model_quantization_config: bool = False
+    supports_dequantize_on_load: bool = False
 
 
 def get_model_provided_quantization_config(model_id_or_path: str) -> Mapping[str, Any] | None:
     config_dict, _ = PretrainedConfig.get_config_dict(model_id_or_path)
     raw = config_dict.get("quantization_config")
     return raw if isinstance(raw, Mapping) else None
+
+
+def supports_dequantize_on_load(
+    *,
+    load_config: object | None,
+    model_provided_config: Mapping[str, Any] | None,
+) -> bool:
+    """
+    Data-driven detection of dequantize-on-load support using pinned Transformers classes.
+
+    We only return True when the quantization config object (explicit or model-provided) exposes
+    a loading attribute named `dequantize` via `get_loading_attributes()`.
+    """
+
+    def _has_dequantize_loading_attr(cfg: object) -> bool:
+        get_attrs = getattr(cfg, "get_loading_attributes", None)
+        if not callable(get_attrs):
+            return False
+        try:
+            attrs = get_attrs()
+        except Exception:
+            return False
+        return isinstance(attrs, dict) and "dequantize" in attrs
+
+    if load_config is not None and _has_dequantize_loading_attr(load_config):
+        return True
+
+    if model_provided_config:
+        try:
+            from transformers.quantizers.auto import AutoQuantizationConfig
+
+            cfg = AutoQuantizationConfig.from_dict(dict(model_provided_config))
+        except Exception:
+            return False
+        return _has_dequantize_loading_attr(cfg)
+
+    return False
 
 
 def _infer_method_from_config_dict(cfg: Mapping[str, Any] | None) -> str | None:
@@ -194,5 +233,10 @@ def resolve_quantization(
         load_quantization_config=load_config,
         model_provided_config=model_provided,
         compute_dtype=compute_dtype,
+        has_model_quantization_config=model_provided is not None,
+        supports_dequantize_on_load=supports_dequantize_on_load(
+            load_config=load_config,
+            model_provided_config=model_provided,
+        ),
     )
 

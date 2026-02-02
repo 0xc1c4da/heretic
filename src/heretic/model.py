@@ -39,6 +39,7 @@ from .mock_models import (
 )
 from .runtime.precision import PrecisionApplier, PrecisionPolicy
 from .runtime.quantization import QuantizationInfo, QuantizationRequest, resolve_quantization
+from .runtime.weight_access import WeightAccess, WeightAccessError
 from .utils import Prompt, batchify, empty_cache, print
 
 
@@ -187,6 +188,16 @@ class Model:
         self._apply_lora()
         self._validate_lora_wrapper_contract()
         self._cast_lora_parameters_to_compute_dtype()
+        ok, reason = self._can_abliterate_with_current_weights()
+        if not ok:
+            raise RuntimeError(
+                "Abliteration requires access to effective float weights (W) for v^T W.\n"
+                f"- model={self.settings.model}\n"
+                f"- quant_method={getattr(self.quant, 'method', None) if self.quant else None}\n"
+                f"- details:\n{reason}\n"
+                "Remediation: use a quantization method that supports dequantize-on-load for float merge/abliteration, "
+                "or export adapter-only."
+            )
 
         # Re-apply precision hooks to cover LoRA wrappers (input casting) and any
         # FP8Linear outputs inside wrapped layers.
@@ -305,6 +316,10 @@ class Model:
         target_modules = self._resolve_lora_target_module_names()
         # Save for diagnostics / strict contract errors.
         self._lora_target_modules = list(target_modules)
+        self._lora_plan = {
+            "targets": list(target_modules),
+            "created_from_layer_index": 0,
+        }
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -334,6 +349,76 @@ class Model:
         print(
             f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
         )
+
+    def _lora_targets_for_merge(self) -> list[str]:
+        plan = getattr(self, "_lora_plan", None)
+        if isinstance(plan, dict) and isinstance(plan.get("targets"), list):
+            return list(plan["targets"])
+        targets = getattr(self, "_lora_target_modules", None)
+        if isinstance(targets, list) and targets:
+            return list(targets)
+        return self._resolve_lora_target_module_names()
+
+    def _probe_merge_correctness(
+        self,
+        *,
+        peft_model: Any,
+        tokenizer: Any,
+        max_new_tokens: int = 1,
+    ) -> bool:
+        """
+        Behavioral probe: compare a tiny forward pass before/after merge.
+        Returns True if outputs match within tolerance.
+        """
+        try:
+            device = getattr(peft_model, "device", None) or torch.device("cpu")
+            inputs = tokenizer("hello", return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                out_before = peft_model(**inputs).logits  # type: ignore[attr-defined]
+            merged = peft_model.merge_and_unload()
+            with torch.no_grad():
+                out_after = merged(**inputs).logits  # type: ignore[attr-defined]
+            # Compare a small slice for speed.
+            a = out_before[..., :8].float().cpu()
+            b = out_after[..., :8].float().cpu()
+            return torch.allclose(a, b, rtol=1e-3, atol=1e-3)
+        except Exception:
+            return False
+
+    def _can_abliterate_with_current_weights(self) -> tuple[bool, str | None]:
+        """
+        Capability check: can we materialize W for one module per component per layer?
+        """
+        try:
+            n_layers = len(self.get_layers())
+            for layer_index in range(n_layers):
+                layer_modules = self.get_layer_modules(layer_index)
+                for component, modules in layer_modules.items():
+                    if not modules:
+                        continue
+                    module = modules[0]
+                    module_any = cast(Any, module)
+                    base_layer = getattr(module_any, "base_layer", None)
+                    if base_layer is None:
+                        return (
+                            False,
+                            "\n".join(
+                                [
+                                    "Missing base_layer for weight access.",
+                                    f"- layer={layer_index}",
+                                    f"- component={component}",
+                                    f"- module_class={type(module).__name__}",
+                                    "Remediation: ensure LoRA wrappers are properly attached.",
+                                ]
+                            ),
+                        )
+                    _ = WeightAccess.materialize_W_float32(
+                        base_layer=base_layer, component=component, layer_index=layer_index
+                    )
+            return True, None
+        except WeightAccessError as exc:
+            return False, str(exc)
 
     def _require_lora_wrapper_contract(
         self,
@@ -471,57 +556,93 @@ class Model:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
-        # Check if we need special handling for quantized models
-        if self.quant is not None and self.quant.is_quantized:
-            # Quantized models need special handling - we must reload the base model
-            # in full precision to merge the LoRA adapters
+        is_quantized = bool(self.quant is not None and self.quant.is_quantized)
 
-            # Get the adapter state dict before we do anything
-            adapter_state = {}
-            for name, param in self.model.named_parameters():
-                if "lora_" in name:
-                    adapter_state[name] = param.data.clone().cpu()
+        # Prefer preserving quantization when possible and correct.
+        hf_quantizer = getattr(self.model, "hf_quantizer", None) or getattr(
+            getattr(self.model, "base_model", None), "hf_quantizer", None
+        )
+        if is_quantized and hf_quantizer is not None and getattr(hf_quantizer, "is_serializable", lambda: False)():
+            print("* Attempting in-place merge (preserve quantization)...")
+            if self._probe_merge_correctness(peft_model=self.model, tokenizer=self.tokenizer):
+                merged_model = self.model.merge_and_unload()
+                self.needs_reload = True
+                return merged_model
+            print("[yellow]In-place merge probe failed; falling back to float merge if supported.[/]")
 
-            # Load base model in full precision on CPU to avoid VRAM issues
-            print("* Loading base model on CPU (this may take a while)...")
+        # Float-merge path (dequantize-on-load when supported).
+        if is_quantized:
+            if not (self.quant and self.quant.supports_dequantize_on_load):
+                raise RuntimeError(
+                    "Cannot produce a float merged export for this quantized model.\n"
+                    f"- model={self.settings.model}\n"
+                    f"- quant_method={getattr(self.quant, 'method', None)}\n"
+                    "Reason: this quantization backend does not advertise dequantize-on-load support.\n"
+                    "Remediation: export adapter-only, or use a quantization method that supports dequantize-on-load."
+                )
+
+            # Capture adapter weights first.
+            adapter_state = {
+                name: param.data.clone().cpu()
+                for name, param in self.model.named_parameters()
+                if "lora_" in name
+            }
+
+            print("* Loading dequantized base model on CPU for float merge (this may take a while)...")
+            # If the model is pre-quantized via config.json, passing a quantization_config dict with
+            # dequantize=True will be merged as a loading attribute by Transformers.
+            qcfg = dict(getattr(self.quant, "model_provided_config", {}) or {})
+            if qcfg:
+                qcfg["dequantize"] = True
+            load_kwargs = {
+                "torch_dtype": self.model.dtype,
+                "device_map": "cpu",
+                "trust_remote_code": self.trusted_models.get(self.settings.model),
+            }
+            if qcfg:
+                load_kwargs["quantization_config"] = qcfg
             base_model = get_model_class(self.settings.model).from_pretrained(
                 self.settings.model,
-                torch_dtype=self.model.dtype,
-                device_map="cpu",
-                trust_remote_code=self.trusted_models.get(self.settings.model),
+                **load_kwargs,
             )
 
-            # Apply LoRA adapters to the CPU model
-
-            print("* Applying LoRA adapters...")
-            target_modules = self.get_abliterable_components()
+            print("* Applying LoRA adapters (float-merge path)...")
+            targets = self._lora_targets_for_merge()
             peft_config = LoraConfig(
                 r=self.lora_rank,
-                target_modules=target_modules,
-                lora_alpha=self.lora_rank,  # Apply adapter at full strength.
+                target_modules=targets,
+                lora_alpha=self.lora_rank,
                 lora_dropout=0,
                 bias="none",
                 task_type="CAUSAL_LM",
             )
             peft_model = get_peft_model(base_model, peft_config)
 
-            # Copy the trained adapter weights
+            # Ensure LoRA actually attached: all adapter params must exist.
+            peft_param_names = {n for n, _ in peft_model.named_parameters()}
+            missing = [n for n in adapter_state.keys() if n not in peft_param_names]
+            if missing:
+                raise RuntimeError(
+                    "Float-merge path failed to attach LoRA to the reloaded base model.\n"
+                    f"- model={self.settings.model}\n"
+                    f"- lora_targets={targets}\n"
+                    f"- missing_adapter_params_count={len(missing)}\n"
+                    f"- example_missing={missing[:5]}\n"
+                    "Remediation: ensure LoRA target_modules are correct for the model, or export adapter-only."
+                )
+
             for name, param in peft_model.named_parameters():
                 if name in adapter_state:
                     param.data = adapter_state[name].to(param.device)
 
-            # Merge and unload
-            print("* Merging LoRA adapters into base model...")
-            merged_model = peft_model.merge_and_unload()
-            return merged_model
-        else:
-            # Non-quantized model - can merge directly
-            print("* Merging LoRA adapters into base model...")
-            merged_model = self.model.merge_and_unload()
-            # merge_and_unload() modifies self.model in-place, destroying LoRA adapters.
-            # Mark for full reload if user switches trials later.
-            self.needs_reload = True
-            return merged_model
+            print("* Merging LoRA adapters into base model (float export)...")
+            return peft_model.merge_and_unload()
+
+        # Non-quantized model: merge directly.
+        print("* Merging LoRA adapters into base model...")
+        merged_model = self.model.merge_and_unload()
+        self.needs_reload = True
+        return merged_model
 
     def reset_model(self):
         """
@@ -581,6 +702,16 @@ class Model:
         self._apply_lora()
         self._validate_lora_wrapper_contract()
         self._cast_lora_parameters_to_compute_dtype()
+        ok, reason = self._can_abliterate_with_current_weights()
+        if not ok:
+            raise RuntimeError(
+                "Abliteration requires access to effective float weights (W) for v^T W.\n"
+                f"- model={self.settings.model}\n"
+                f"- quant_method={getattr(self.quant, 'method', None) if self.quant else None}\n"
+                f"- details:\n{reason}\n"
+                "Remediation: use a quantization method that supports dequantize-on-load for float merge/abliteration, "
+                "or export adapter-only."
+            )
 
         PrecisionApplier(
             self.precision_policy,
@@ -722,29 +853,22 @@ class Model:
                     v = layer_refusal_direction.to(module_any.weight.device)
 
                     # Get W (dequantize if necessary).
-                    #
-                    # FIXME: This cast is valid only under the assumption that the original
-                    #        module wrapped by the LoRA adapter has a weight attribute.
-                    #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module_any.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
-
-                    if quant_state is None:
-                        W = base_weight.to(torch.float32)
-                    else:
-                        # 4-bit quantization.
-                        # This cast is always valid. Type inference fails here because the
-                        # bnb.functional module is not found by ty for some reason.
-                        W = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
+                    base_layer = module_any.base_layer
+                    try:
+                        W = WeightAccess.materialize_W_float32(
+                            base_layer=base_layer,
+                            component=component,
+                            layer_index=layer_index,
                         )
-
-                    # Flatten weight matrix to (out_features, in_features).
-                    W = W.view(W.shape[0], -1)
+                    except WeightAccessError as exc:
+                        raise RuntimeError(
+                            "Unsupported quantization backend for abliteration weight access.\n"
+                            f"- model={self.settings.model}\n"
+                            f"- quant_method={getattr(self.quant, 'method', None) if self.quant else None}\n"
+                            f"{exc}\n"
+                            "Remediation: use a float model, a quantization backend that supports dequantize-on-load, "
+                            "or export adapter-only."
+                        ) from exc
 
                     if self.settings.row_normalization != RowNormalization.NONE:
                         # Keep a reference to the original weight matrix so we can subtract it later.
