@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import weakref
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -159,9 +161,16 @@ class PrecisionApplier:
         self.policy = policy
         self.logger = logger
         self.compute_dtype = compute_dtype
-        self._logged_modules: set[str] = set()
-        self._module_fallbacks: dict[str, torch.dtype] = {}
-        self._module_no_fallback: set[str] = set()
+        # IMPORTANT: caches are keyed by module identity, not name.
+        # Names from `named_modules()` are not globally unique when we traverse detached
+        # subgraphs (e.g. a non-registered `base_layer`), so name-keyed caches can collide.
+        self._module_fallbacks: weakref.WeakKeyDictionary[Module, torch.dtype] = (
+            weakref.WeakKeyDictionary()
+        )
+        self._module_no_fallback: weakref.WeakSet[Module] = weakref.WeakSet()
+        self._warned_by_module: weakref.WeakKeyDictionary[Module, set[torch.dtype]] = (
+            weakref.WeakKeyDictionary()
+        )
 
     def apply(self, model: Module) -> None:
         if not self.policy.should_apply_hooks():
@@ -178,36 +187,38 @@ class PrecisionApplier:
         except ImportError:
             pass
 
-        for name, module in model.named_modules():
+        # Graph-aware traversal:
+        # - Walks registered submodules (`named_modules`)
+        # - Also walks detached `base_layer` modules even if not registered as submodules
+        seen_ids: set[int] = set()
+        q: deque[tuple[str, Module]] = deque(model.named_modules())
+
+        while q:
+            name, module = q.popleft()
+            mid = id(module)
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+
+            # Always traverse base_layer edge if present.
+            base_layer = getattr(module, "base_layer", None)
+            if isinstance(base_layer, Module):
+                child_name = f"{name}.base_layer" if name else "base_layer"
+                q.append((child_name, base_layer))
+
+            # Skip if already hooked.
             if getattr(module, "_precision_policy_applied", False):
                 continue
 
-            # LoRA wrappers: force input dtype to compute dtype (or adapter dtype).
-            if self._looks_like_lora_wrapper(module):
-                self._attach_lora_input_hook(module, name)
+            kind = self._apply_to_one_module(module, name, FP8Linear)
+            if kind == "lora":
                 lora_count += 1
-                continue
-
-            is_fp8 = FP8Linear is not None and isinstance(module, FP8Linear)
-            if is_fp8:
-                self._attach_fp8_output_hook(module, name)
+            elif kind == "fp8":
                 fp8_count += 1
-                continue
-
-            if isinstance(module, Linear):
-                self._attach_fallback_hooks(module, name, op="linear")
+            elif kind == "linear":
                 linear_count += 1
-                continue
-
-            if isinstance(module, Conv2d):
-                self._attach_fallback_hooks(module, name, op="conv2d")
+            elif kind == "conv2d":
                 conv_count += 1
-                continue
-
-            # Handle wrappers which expose a base_layer
-            base_layer = getattr(module, "base_layer", None)
-            if base_layer is not None and not getattr(base_layer, "_precision_policy_applied", False):
-                self.apply(base_layer)
 
         if self.policy.settings.debug:
             parts = [
@@ -218,6 +229,27 @@ class PrecisionApplier:
             ]
             msg = ", ".join([p for p in parts if p])
             self.logger(f"[bold]Precision hooks applied[/]: {msg}")
+
+    def _apply_to_one_module(self, module: Module, name: str, FP8Linear: Any | None) -> str | None:
+        # LoRA wrappers: force input dtype to compute dtype (or adapter dtype).
+        if self._looks_like_lora_wrapper(module):
+            self._attach_lora_input_hook(module, name)
+            return "lora"
+
+        is_fp8 = FP8Linear is not None and isinstance(module, FP8Linear)
+        if is_fp8:
+            self._attach_fp8_output_hook(module, name)
+            return "fp8"
+
+        if isinstance(module, Linear):
+            self._attach_fallback_hooks(module, name, op="linear")
+            return "linear"
+
+        if isinstance(module, Conv2d):
+            self._attach_fallback_hooks(module, name, op="conv2d")
+            return "conv2d"
+
+        return None
 
     def _attach_fp8_output_hook(self, module: Module, name: str) -> None:
         module._precision_policy_name = name
@@ -259,6 +291,8 @@ class PrecisionApplier:
         module._precision_policy_applied = True
 
         def pre_hook(mod: Module, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
+            # NOTE: We currently cast only positional args. Some architectures may route
+            # activations via kwargs; if encountered, consider a guarded kwargs-cast path.
             x = self._first_tensor(args)
             if x is None:
                 return None
@@ -276,15 +310,16 @@ class PrecisionApplier:
 
         def pre_hook(mod: Module, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
             # Only positional args to avoid keyword conflicts with transformers decorators.
+            # NOTE: Some models may pass tensors via kwargs; if encountered, consider a guarded
+            # kwargs-cast path that only targets known activation keys.
             input_tensor = self._first_tensor(args)
             if input_tensor is None:
                 return None
 
-            mod_name = getattr(mod, "_precision_policy_name", None)
-            if mod_name and mod_name in self._module_no_fallback:
+            if mod in self._module_no_fallback:
                 return None
 
-            cached = self._module_fallbacks.get(mod_name) if mod_name else None
+            cached = self._module_fallbacks.get(mod)
             if cached is not None:
                 if cached == input_tensor.dtype:
                     return None
@@ -294,8 +329,7 @@ class PrecisionApplier:
                 return cast_args
 
             if self.policy.is_op_dtype_supported(op, input_tensor.dtype, input_tensor.device):
-                if mod_name:
-                    self._module_no_fallback.add(mod_name)
+                self._module_no_fallback.add(mod)
                 return None
 
             fallback = self._choose_fallback(op, input_tensor)
@@ -304,8 +338,7 @@ class PrecisionApplier:
                     f"[yellow]Precision fallback for {op}: {input_tensor.dtype} -> {fallback}[/]"
                 )
 
-            if mod_name:
-                self._module_fallbacks[mod_name] = fallback
+            self._module_fallbacks[mod] = fallback
 
             cast_args = self._cast_tensors(args, fallback)
             restore = _prepare_cast(mod, fallback)
@@ -321,13 +354,13 @@ class PrecisionApplier:
         module.register_forward_hook(post_hook, always_call=True)
 
     def _warn_module_once(self, module: Module, dtype: torch.dtype) -> bool:
-        name = getattr(module, "_precision_policy_name", None)
-        if name is None:
-            return self.policy.warn_once("op", dtype)
-        key = f"{name}:{dtype}"
-        if key in self._logged_modules:
+        warned = self._warned_by_module.get(module)
+        if warned is None:
+            warned = set()
+            self._warned_by_module[module] = warned
+        if dtype in warned:
             return False
-        self._logged_modules.add(key)
+        warned.add(dtype)
         return True
 
     def _choose_fallback(self, op: str, input_tensor: Tensor) -> torch.dtype:

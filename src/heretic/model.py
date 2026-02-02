@@ -185,6 +185,7 @@ class Model:
             raise Exception("Failed to load model with all configured dtypes.")
 
         self._apply_lora()
+        self._validate_lora_wrapper_contract()
         self._cast_lora_parameters_to_compute_dtype()
 
         # Re-apply precision hooks to cover LoRA wrappers (input casting) and any
@@ -302,6 +303,8 @@ class Model:
 
         # Always use LoRA adapters for abliteration.
         target_modules = self._resolve_lora_target_module_names()
+        # Save for diagnostics / strict contract errors.
+        self._lora_target_modules = list(target_modules)
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -331,6 +334,99 @@ class Model:
         print(
             f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
         )
+
+    def _require_lora_wrapper_contract(
+        self,
+        module: Any,
+        *,
+        layer_index: int,
+        component: str,
+        module_name: str | None = None,
+    ) -> None:
+        """
+        Strictly require the LoRA wrapper contract needed by `abliterate()`.
+
+        Contract:
+        - module.base_layer.weight exists (for reading/dequantizing W)
+        - module.lora_A[\"default\"].weight exists
+        - module.lora_B[\"default\"].weight exists
+        """
+        validated = getattr(self, "_validated_lora_module_ids", None)
+        if isinstance(validated, set) and id(module) in validated:
+            return
+
+        missing: list[str] = []
+        base_layer = getattr(module, "base_layer", None)
+        if base_layer is None:
+            missing.append("base_layer")
+        else:
+            if getattr(base_layer, "weight", None) is None:
+                missing.append("base_layer.weight")
+
+        def _get_default_adapter(container: Any) -> Any | None:
+            # PEFT uses different container types across versions (dict, ModuleDict, etc).
+            if container is None:
+                return None
+            get_fn = getattr(container, "get", None)
+            if callable(get_fn):
+                try:
+                    return get_fn("default")
+                except Exception:
+                    return None
+            try:
+                if "default" in container:  # type: ignore[operator]
+                    return container["default"]  # type: ignore[index]
+            except Exception:
+                return None
+            return None
+
+        lora_A = getattr(module, "lora_A", None)
+        sub = _get_default_adapter(lora_A)
+        if sub is None or getattr(sub, "weight", None) is None:
+            missing.append('lora_A["default"].weight')
+
+        lora_B = getattr(module, "lora_B", None)
+        sub = _get_default_adapter(lora_B)
+        if sub is None or getattr(sub, "weight", None) is None:
+            missing.append('lora_B["default"].weight')
+
+        if missing:
+            model_id = getattr(self.settings, "model", None)
+            target_modules = getattr(self, "_lora_target_modules", None)
+            cls_name = type(module).__name__
+            name_str = f" name={module_name}" if module_name else ""
+            raise RuntimeError(
+                "LoRA wrapper contract not satisfied for abliteration.\n"
+                f"- model={model_id}\n"
+                f"- layer={layer_index}\n"
+                f"- component={component}\n"
+                f"- module_class={cls_name}{name_str}\n"
+                f"- missing={missing}\n"
+                f"- lora_target_modules={target_modules}\n"
+                f"- model_dtype={getattr(self.model, 'dtype', None)}\n"
+                f"- compute_dtype={self.compute_dtype}\n"
+                "Remediation: PEFT did not attach LoRA to this module type/name. "
+                "Adjust target_modules or ensure PEFT supports this layer wrapper."
+            )
+
+        if isinstance(validated, set):
+            validated.add(id(module))
+
+    def _validate_lora_wrapper_contract(self) -> None:
+        """
+        Validate LoRA wrapper contract for all modules that will be ablated.
+        This is strict: raises immediately if any required wrapper is missing.
+        """
+        self._validated_lora_module_ids = set()
+        n_layers = len(self.get_layers())
+        for layer_index in range(n_layers):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module in modules:
+                    self._require_lora_wrapper_contract(
+                        module,
+                        layer_index=layer_index,
+                        component=component,
+                    )
 
     def _resolve_lora_target_module_names(self) -> list[str]:
         """
@@ -483,6 +579,7 @@ class Model:
         )
 
         self._apply_lora()
+        self._validate_lora_wrapper_contract()
         self._cast_lora_parameters_to_compute_dtype()
 
         PrecisionApplier(
@@ -610,6 +707,11 @@ class Model:
 
                 for module in modules:
                     module_any = cast(Any, module)
+                    self._require_lora_wrapper_contract(
+                        module_any,
+                        layer_index=layer_index,
+                        component=component,
+                    )
 
                     # LoRA abliteration: delta W = -lambda * v * (v^T W)
                     # lora_B = -lambda * v
