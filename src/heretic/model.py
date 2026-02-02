@@ -4,6 +4,7 @@
 import json
 import math
 import os
+import copy
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha1
@@ -140,6 +141,18 @@ class Model:
                     "trust_remote_code": self.trusted_models.get(self.settings.model),
                     **extra_kwargs,
                 }
+
+                # FP8 models can produce NaNs in batched generation when sequences have different
+                # prompt lengths (mixed padding/attention lengths). This can manifest as repeated
+                # low-id tokens (often "!") from greedy argmax over NaN logits.
+                # Using a more conservative attention implementation avoids this edge case.
+                if (
+                    self.quant is not None
+                    and self.quant.is_quantized
+                    and (self.quant.method or "")
+                    in {"fp8", "finegrained_fp8", "fine-grained-fp8"}
+                ):
+                    load_kwargs["attn_implementation"] = "eager"
 
                 self.model = get_model_class(self.settings.model).from_pretrained(
                     self.settings.model,
@@ -566,6 +579,7 @@ class Model:
             print("* Attempting in-place merge (preserve quantization)...")
             if self._probe_merge_correctness(peft_model=self.model, tokenizer=self.tokenizer):
                 merged_model = self.model.merge_and_unload()
+                self._prepare_model_for_saving(merged_model)
                 self.needs_reload = True
                 return merged_model
             print("[yellow]In-place merge probe failed; falling back to float merge if supported.[/]")
@@ -589,18 +603,44 @@ class Model:
             }
 
             print("* Loading dequantized base model on CPU for float merge (this may take a while)...")
-            # If the model is pre-quantized via config.json, passing a quantization_config dict with
-            # dequantize=True will be merged as a loading attribute by Transformers.
-            qcfg = dict(getattr(self.quant, "model_provided_config", {}) or {})
-            if qcfg:
-                qcfg["dequantize"] = True
+            # Transformers requires passing the *same quantization config class* as the model uses
+            # (e.g. FineGrainedFP8Config), not a raw dict. Passing a dict can raise:
+            #   ValueError: The model is quantized with FineGrainedFP8Config but you are passing a dict config.
+            qcfg_obj: object | None = None
+            try:
+                qcfg_obj = copy.deepcopy(getattr(self.model.config, "quantization_config", None))
+            except Exception:
+                qcfg_obj = getattr(self.model.config, "quantization_config", None)
+
+            if qcfg_obj is None and self.quant is not None:
+                model_cfg = getattr(self.quant, "model_provided_config", None)
+                if model_cfg:
+                    try:
+                        from transformers.quantizers.auto import AutoQuantizationConfig
+
+                        qcfg_obj = AutoQuantizationConfig.from_dict(dict(model_cfg))
+                    except Exception:
+                        qcfg_obj = None
+
+            if qcfg_obj is not None:
+                to_dict = getattr(qcfg_obj, "to_dict", None)
+                if callable(to_dict):
+                    try:
+                        d = dict(to_dict())
+                        d["dequantize"] = True
+                        qcfg_obj = type(qcfg_obj)(**d)
+                    except Exception:
+                        try:
+                            setattr(qcfg_obj, "dequantize", True)
+                        except Exception:
+                            pass
             load_kwargs = {
                 "torch_dtype": self.model.dtype,
                 "device_map": "cpu",
                 "trust_remote_code": self.trusted_models.get(self.settings.model),
             }
-            if qcfg:
-                load_kwargs["quantization_config"] = qcfg
+            if qcfg_obj is not None:
+                load_kwargs["quantization_config"] = qcfg_obj
             base_model = get_model_class(self.settings.model).from_pretrained(
                 self.settings.model,
                 **load_kwargs,
@@ -636,13 +676,36 @@ class Model:
                     param.data = adapter_state[name].to(param.device)
 
             print("* Merging LoRA adapters into base model (float export)...")
-            return peft_model.merge_and_unload()
+            merged_model = peft_model.merge_and_unload()
+            self._prepare_model_for_saving(merged_model)
+            return merged_model
 
         # Non-quantized model: merge directly.
         print("* Merging LoRA adapters into base model...")
         merged_model = self.model.merge_and_unload()
+        self._prepare_model_for_saving(merged_model)
         self.needs_reload = True
         return merged_model
+
+    @staticmethod
+    def _prepare_model_for_saving(model: PreTrainedModel) -> None:
+        """
+        Prepare a merged model for `save_pretrained()`.
+
+        Some checkpoints are loaded via Transformers weight conversion mappings which are stored
+        on the model. During `save_pretrained()`, Transformers may attempt to reverse those
+        conversions; for certain conversions in the pinned Transformers version, the reverse
+        operation is not implemented, leading to `NotImplementedError`.
+        """
+        for attr in ("_weight_conversions", "_checkpoint_conversion_mapping"):
+            if hasattr(model, attr):
+                try:
+                    delattr(model, attr)
+                except Exception:
+                    try:
+                        setattr(model, attr, None)
+                    except Exception:
+                        pass
 
     def reset_model(self):
         """
@@ -694,6 +757,12 @@ class Model:
             "trust_remote_code": self.trusted_models.get(self.settings.model),
             **extra_kwargs,
         }
+        if (
+            self.quant is not None
+            and self.quant.is_quantized
+            and (self.quant.method or "") in {"fp8", "finegrained_fp8", "fine-grained-fp8"}
+        ):
+            load_kwargs["attn_implementation"] = "eager"
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
             **load_kwargs,

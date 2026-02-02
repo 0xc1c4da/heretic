@@ -71,6 +71,48 @@ class WeightAccess:
             )
             return W.to(torch.float32).view(W.shape[0], -1)
 
+        # transformers FineGrainedFP8 / FP8Linear weights: float8 tensor with a blockwise
+        # scale tensor stored as `weight_scale_inv`.
+        #
+        # For these layers, the effective float weight used in forward includes the scale:
+        #   W_effective = weight_fp8.float() * expand(weight_scale_inv)
+        # If we ignore `weight_scale_inv`, computations that depend on W (like v^T W for
+        # abliteration) can be catastrophically wrong and corrupt the model.
+        if "float8" in str(w.dtype):
+            ws = getattr(base_layer, "weight_scale_inv", None)
+            if isinstance(ws, Tensor):
+                if ws.ndim != 2 or w.ndim != 2:
+                    raise WeightAccessError(
+                        "Unsupported FP8 weight scaling shape for abliteration.",
+                        {
+                            "layer": layer_index,
+                            "component": component,
+                            "weight_shape": tuple(w.shape),
+                            "weight_scale_inv_shape": tuple(ws.shape),
+                            "base_layer_class": type(base_layer).__name__,
+                        },
+                    )
+                if w.shape[0] % ws.shape[0] != 0 or w.shape[1] % ws.shape[1] != 0:
+                    raise WeightAccessError(
+                        "FP8 weight_scale_inv is not compatible with weight shape (non-integer block sizes).",
+                        {
+                            "layer": layer_index,
+                            "component": component,
+                            "weight_shape": tuple(w.shape),
+                            "weight_scale_inv_shape": tuple(ws.shape),
+                            "base_layer_class": type(base_layer).__name__,
+                        },
+                    )
+                bs0 = w.shape[0] // ws.shape[0]
+                bs1 = w.shape[1] // ws.shape[1]
+                ws_exp = (
+                    ws.to(torch.float32)
+                    .repeat_interleave(bs0, dim=0)
+                    .repeat_interleave(bs1, dim=1)
+                )
+                W = w.to(torch.float32) * ws_exp
+                return W.view(W.shape[0], -1)
+
         if not w.is_floating_point():
             raise WeightAccessError(
                 "Unsupported quantized weight tensor for abliteration (non-floating Tensor without bnb quant_state).",
