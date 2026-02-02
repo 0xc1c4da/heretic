@@ -290,29 +290,30 @@ class PrecisionApplier:
         module._precision_policy_name = name
         module._precision_policy_applied = True
 
-        def pre_hook(mod: Module, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
-            # NOTE: We currently cast only positional args. Some architectures may route
-            # activations via kwargs; if encountered, consider a guarded kwargs-cast path.
-            x = self._first_tensor(args)
+        def pre_hook(
+            mod: Module, args: tuple[Any, ...], kwargs: dict[str, Any]
+        ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+            x = self._first_floating_tensor(args, kwargs)
             if x is None:
                 return None
             target_dtype = self.compute_dtype or self._get_lora_compute_dtype(mod)
             if target_dtype is None or x.dtype == target_dtype:
                 return None
-            return self._cast_tensors(args, target_dtype)
+            cast_args = self._cast_args(args, target_dtype)
+            cast_kwargs = self._cast_kwargs(kwargs, target_dtype)
+            return cast_args, cast_kwargs
 
-        module.register_forward_pre_hook(pre_hook)
+        module.register_forward_pre_hook(pre_hook, with_kwargs=True)
 
     def _attach_fallback_hooks(self, module: Module, name: str, *, op: str) -> None:
         module._precision_policy_name = name
         module._precision_policy_applied = True
         module._precision_policy_op = op
 
-        def pre_hook(mod: Module, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
-            # Only positional args to avoid keyword conflicts with transformers decorators.
-            # NOTE: Some models may pass tensors via kwargs; if encountered, consider a guarded
-            # kwargs-cast path that only targets known activation keys.
-            input_tensor = self._first_tensor(args)
+        def pre_hook(
+            mod: Module, args: tuple[Any, ...], kwargs: dict[str, Any]
+        ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+            input_tensor = self._first_floating_tensor(args, kwargs)
             if input_tensor is None:
                 return None
 
@@ -323,10 +324,11 @@ class PrecisionApplier:
             if cached is not None:
                 if cached == input_tensor.dtype:
                     return None
-                cast_args = self._cast_tensors(args, cached)
+                cast_args = self._cast_args(args, cached)
+                cast_kwargs = self._cast_kwargs(kwargs, cached)
                 restore = _prepare_cast(mod, cached)
                 _push_restore(mod, restore)
-                return cast_args
+                return cast_args, cast_kwargs
 
             if self.policy.is_op_dtype_supported(op, input_tensor.dtype, input_tensor.device):
                 self._module_no_fallback.add(mod)
@@ -340,18 +342,19 @@ class PrecisionApplier:
 
             self._module_fallbacks[mod] = fallback
 
-            cast_args = self._cast_tensors(args, fallback)
+            cast_args = self._cast_args(args, fallback)
+            cast_kwargs = self._cast_kwargs(kwargs, fallback)
             restore = _prepare_cast(mod, fallback)
             _push_restore(mod, restore)
-            return cast_args
+            return cast_args, cast_kwargs
 
-        def post_hook(mod: Module, args: Any, output: Any) -> None:
+        def post_hook(mod: Module, args: Any, kwargs: dict[str, Any], output: Any) -> None:
             restore = _pop_restore(mod)
             if restore is not None:
                 _restore_cast(restore)
 
-        module.register_forward_pre_hook(pre_hook)
-        module.register_forward_hook(post_hook, always_call=True)
+        module.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        module.register_forward_hook(post_hook, always_call=True, with_kwargs=True)
 
     def _warn_module_once(self, module: Module, dtype: torch.dtype) -> bool:
         warned = self._warned_by_module.get(module)
@@ -369,18 +372,40 @@ class PrecisionApplier:
             return fallback
         return torch.float32
 
-    def _first_tensor(self, args: tuple[Any, ...]) -> Tensor | None:
+    def _first_floating_tensor(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None
+    ) -> Tensor | None:
         for value in args:
-            if isinstance(value, Tensor):
+            if isinstance(value, Tensor) and self._is_cast_candidate(value):
                 return value
+        if kwargs:
+            for value in kwargs.values():
+                if isinstance(value, Tensor) and self._is_cast_candidate(value):
+                    return value
         return None
 
-    def _cast_tensors(self, args: tuple[Any, ...], dtype: torch.dtype) -> tuple[Any, ...]:
+    def _cast_args(self, args: tuple[Any, ...], dtype: torch.dtype) -> tuple[Any, ...]:
         return tuple(self._cast_tree(v, dtype) for v in args)
+
+    def _cast_kwargs(self, kwargs: dict[str, Any], dtype: torch.dtype) -> dict[str, Any]:
+        if not kwargs:
+            return kwargs
+        return {k: self._cast_tree(v, dtype) for k, v in kwargs.items()}
+
+    def _is_cast_candidate(self, t: Tensor) -> bool:
+        # Only cast floating / float8 tensors (avoid input_ids, masks, etc.).
+        try:
+            if t.is_floating_point():
+                return True
+        except Exception:
+            pass
+        return "float8" in str(t.dtype)
 
     def _cast_tree(self, value: Any, dtype: torch.dtype) -> Any:
         if isinstance(value, Tensor):
-            return value if value.dtype == dtype else value.to(dtype)
+            if value.dtype == dtype or not self._is_cast_candidate(value):
+                return value
+            return value.to(dtype)
         if isinstance(value, (list, tuple)):
             return type(value)(self._cast_tree(v, dtype) for v in value)
         if isinstance(value, dict):
