@@ -2,7 +2,7 @@
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
 
 from enum import Enum
-from typing import Dict
+from typing import Any, Dict
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import (
@@ -16,7 +16,10 @@ from pydantic_settings import (
 
 class QuantizationMethod(str, Enum):
     NONE = "none"
+    AUTO = "auto"
     BNB_4BIT = "bnb_4bit"
+    FP8 = "fp8"
+    CUSTOM = "custom"
 
 
 class RowNormalization(str, Enum):
@@ -62,16 +65,6 @@ class DatasetSpecification(BaseModel):
 
 
 class Settings(BaseSettings):
-    tmpdir: str = Field(
-        default="/workspace/tmp",
-        description="Directory for temporary files (used by push_to_hub, etc.).",
-    )
-
-    hf_home: str = Field(
-        default="/workspace/hf",
-        description="Base directory for Hugging Face cache (model downloads, tokenizers, etc.).",
-    )
-
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
     evaluate_model: str | None = Field(
@@ -110,9 +103,85 @@ class Settings(BaseSettings):
         description="Whether to trust remote code when loading the model.",
     )
 
+    mock_tiny_model: bool = Field(
+        default=False,
+        description=(
+            "If true and `model` points to a local MiniMax M2.1 *code* directory (no weights), "
+            "materialize a tiny checkpoint (real weights, tiny config) for cheap loading/inference "
+            "to iterate on FP8+LoRA behavior."
+        ),
+    )
+
+    mock_tiny_out_dir: str = Field(
+        default="~/.cache/heretic/mock_models",
+        description="Directory where tiny mock checkpoints are materialized.",
+    )
+
+    mock_tiny_hidden_size: int = Field(default=64, description="Tiny MiniMax hidden size.")
+    mock_tiny_intermediate_size: int = Field(default=256, description="Tiny MiniMax intermediate size.")
+    mock_tiny_num_hidden_layers: int = Field(default=2, description="Tiny MiniMax number of layers.")
+    mock_tiny_num_attention_heads: int = Field(default=4, description="Tiny MiniMax attention heads.")
+    mock_tiny_num_key_value_heads: int = Field(default=2, description="Tiny MiniMax KV heads.")
+    mock_tiny_max_position_embeddings: int = Field(
+        default=2048,
+        description="Tiny MiniMax max position embeddings.",
+    )
+    mock_tiny_sliding_window: int | None = Field(
+        default=256,
+        description="Tiny MiniMax sliding window (set to null to disable).",
+    )
+    mock_tiny_num_experts_per_tok: int = Field(default=2, description="Tiny MiniMax top-k experts per token.")
+    mock_tiny_num_local_experts: int = Field(default=2, description="Tiny MiniMax number of experts.")
+    mock_tiny_seed: int = Field(default=0, description="Random seed for tiny model initialization.")
+
     quantization: QuantizationMethod = Field(
         default=QuantizationMethod.NONE,
-        description="Quantization method to use when loading the model. Options: 'none' (no quantization), 'bnb_4bit' (4-bit quantization using bitsandbytes).",
+        description=(
+            "Quantization method to use when loading the model. Options: "
+            "'none' (no quantization), "
+            "'auto' (use model-provided quantization config if available), "
+            "'bnb_4bit' (4-bit quantization using bitsandbytes), "
+            "'fp8' (FineGrainedFP8Config), "
+            "'custom' (use quantization_config_type + quantization_kwargs)."
+        ),
+    )
+
+    quantization_config_type: str | None = Field(
+        default=None,
+        description=(
+            "When quantization='custom', this is the transformers quantization config "
+            "class name to instantiate (e.g. 'GPTQConfig', 'AWQConfig')."
+        ),
+    )
+
+    quantization_kwargs: Dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional kwargs passed to the quantization config constructor (for any "
+            "quantization method that supports custom options)."
+        ),
+    )
+
+    precision_policy: str = Field(
+        default="auto",
+        description=(
+            "Precision policy mode. Options: 'auto' (probe and fall back only when "
+            "required), 'strict' (always enforce fallback for unsupported dtypes), "
+            "'off' (no precision hooks)."
+        ),
+    )
+
+    precision_fallback_dtype: str = Field(
+        default="auto",
+        description=(
+            "Fallback dtype used when an op is unsupported. "
+            "Options: 'auto', 'bfloat16', 'float16', 'float32'."
+        ),
+    )
+
+    precision_debug: bool = Field(
+        default=False,
+        description="Whether to emit precision policy debug logs.",
     )
 
     batch_size: int = Field(
@@ -166,6 +235,28 @@ class Settings(BaseSettings):
             return i
 
         raise ValueError("must be a boolean or a non-negative integer")
+
+    @field_validator("precision_policy", mode="before")
+    @classmethod
+    def _validate_precision_policy(cls, value: object) -> str:
+        allowed = {"auto", "strict", "off"}
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in allowed:
+                return v
+        raise ValueError("precision_policy must be one of: auto, strict, off")
+
+    @field_validator("precision_fallback_dtype", mode="before")
+    @classmethod
+    def _validate_precision_fallback_dtype(cls, value: object) -> str:
+        allowed = {"auto", "bfloat16", "float16", "float32"}
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in allowed:
+                return v
+        raise ValueError(
+            "precision_fallback_dtype must be one of: auto, bfloat16, float16, float32"
+        )
 
     row_normalization: RowNormalization = Field(
         default=RowNormalization.NONE,

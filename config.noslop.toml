@@ -2,6 +2,17 @@
 
 max_response_length = 300
 
+# Precision policy mode.
+# Options: "auto", "strict", "off"
+precision_policy = "auto"
+
+# Fallback dtype for unsupported ops.
+# Options: "auto", "bfloat16", "float16", "float32"
+precision_fallback_dtype = "auto"
+
+# Whether to emit precision policy debug logs.
+precision_debug = false
+
 residual_plot_title = "PaCMAP Projection of Residuals for Slop-Suppressing/Inducing Prompts"
 
 refusal_markers = [

@@ -33,7 +33,7 @@ dependencies = [
     "pydantic-settings>=2.10.1",
     "questionary>=2.1.1",
     "rich>=14.1.0",
-    "transformers>=4.57.3",
+    "transformers",
 ]
 
 [project.optional-dependencies]
@@ -68,3 +68,6 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "heretic"
+
+[tool.uv.sources]
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "8c403da7ae37d20314d00d940d96c4a27fc98a29" }

@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
 
+import json
 import math
+import os
 from contextlib import suppress
 from dataclasses import dataclass
+from hashlib import sha1
 from typing import Any, Type, cast
 
 import bitsandbytes as bnb
@@ -11,7 +14,6 @@ import torch
 import torch.linalg as LA
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
-from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
 from transformers import (
@@ -30,6 +32,13 @@ from transformers.generation import (
 )
 
 from .config import QuantizationMethod, RowNormalization, Settings
+from .mock_models import (
+    TinyMiniMaxM2Spec,
+    looks_like_minimax_m2_source_dir,
+    materialize_tiny_minimax_m2_repo,
+)
+from .runtime.precision import PrecisionApplier, PrecisionPolicy
+from .runtime.quantization import QuantizationInfo, QuantizationRequest, resolve_quantization
 from .utils import Prompt, batchify, empty_cache, print
 
 
@@ -60,15 +69,20 @@ class Model:
         self.settings = settings
         self.response_prefix = ""
         self.needs_reload = False
+        self.quant: QuantizationInfo | None = None
+        self.compute_dtype: torch.dtype | None = None
         self.lora_rank: int = None
+        self.precision_policy = PrecisionPolicy.from_settings(settings)
 
         print()
-        print(f"Loading model [bold]{settings.model}[/]...")
+        self._maybe_materialize_tiny_checkpoint()
+        print(f"Loading model [bold]{self.settings.model}[/]...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            settings.model,
+            self.settings.model,
             trust_remote_code=settings.trust_remote_code,
         )
+        self._ensure_chat_template()
 
         # Fallback for tokenizers that don't declare a special pad token.
         if self.tokenizer.pad_token is None:
@@ -85,49 +99,76 @@ class Model:
             if settings.max_memory
             else None
         )
-        self.trusted_models = {settings.model: settings.trust_remote_code}
+        self.trusted_models = {self.settings.model: settings.trust_remote_code}
 
         if self.settings.evaluate_model is not None:
-            self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
+            self.trusted_models[self.settings.evaluate_model] = settings.trust_remote_code
 
-        for dtype in settings.dtypes:
+        # Detect the device we'll be using for runtime precision probing.
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        for dtype in self.settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
             try:
-                quantization_config = self._get_quantization_config(dtype)
+                # Resolve quantization + compute dtype consistently.
+                quant_req = QuantizationRequest(
+                    method=getattr(self.settings.quantization, "value", str(self.settings.quantization)),
+                    requested_dtype=dtype,
+                    config_type=getattr(self.settings, "quantization_config_type", None),
+                    config_kwargs=getattr(self.settings, "quantization_kwargs", None),
+                )
+                self.quant = resolve_quantization(
+                    model_id_or_path=self.settings.model,
+                    request=quant_req,
+                    precision_fallback_dtype=getattr(
+                        self.settings, "precision_fallback_dtype", "auto"
+                    ),
+                )
 
                 # Build kwargs, only include quantization_config if it's not None
                 # (some models like gpt-oss have issues with explicit None)
                 extra_kwargs = {}
-                if quantization_config is not None:
-                    extra_kwargs["quantization_config"] = quantization_config
+                if self.quant.load_quantization_config is not None:
+                    extra_kwargs["quantization_config"] = self.quant.load_quantization_config
 
-                self.model = get_model_class(settings.model).from_pretrained(
-                    settings.model,
-                    dtype=dtype,
-                    device_map=settings.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
+                load_kwargs = {
+                    "torch_dtype": self.precision_policy.resolve_model_dtype(dtype),
+                    "device_map": self.settings.device_map,
+                    "max_memory": self.max_memory,
+                    "trust_remote_code": self.trusted_models.get(self.settings.model),
                     **extra_kwargs,
+                }
+
+                self.model = get_model_class(self.settings.model).from_pretrained(
+                    self.settings.model,
+                    **load_kwargs,
                 )
 
                 # If we reach this point and the model requires trust_remote_code,
                 # either the user accepted, or settings.trust_remote_code is True.
-                if self.trusted_models.get(settings.model) is None:
-                    self.trusted_models[settings.model] = True
+                if self.trusted_models.get(self.settings.model) is None:
+                    self.trusted_models[self.settings.model] = True
 
-                # A test run can reveal dtype-related problems such as the infamous
-                # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
-                # (https://github.com/meta-llama/llama/issues/380).
-                self.generate(
-                    [
-                        Prompt(
-                            system=settings.system_prompt,
-                            user="What is 1+1?",
-                        )
-                    ],
-                    max_new_tokens=1,
-                )
+                # For non-quantized models, compute should match the model's actual dtype.
+                # For quantized models, compute comes from quantization resolution (bf16/fp16).
+                model_dtype = getattr(self.model, "dtype", None)
+                if self.quant is not None and not self.quant.is_quantized and isinstance(
+                    model_dtype, torch.dtype
+                ):
+                    self.compute_dtype = model_dtype
+                else:
+                    self.compute_dtype = self.quant.compute_dtype
+
+                if getattr(self.settings, "precision_debug", False):
+                    self.precision_policy.log_probe_matrix(print)
+
+                # Apply precision hooks to base model (covers FP8Linear, generic ops).
+                PrecisionApplier(
+                    self.precision_policy,
+                    print,
+                    compute_dtype=self.compute_dtype,
+                ).apply(self.model)
             except Exception as error:
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
@@ -135,17 +176,38 @@ class Model:
                 continue
 
             print("[green]Ok[/]")
-            if settings.quantization == QuantizationMethod.BNB_4BIT:
-                print("[bold green]Model loaded in 4-bit precision.[/]")
+            if self.quant and self.quant.is_quantized:
+                label = self._format_quantization_label()
+                print(f"[bold green]Model loaded with {label}.[/]")
             break
 
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
         self._apply_lora()
+        self._cast_lora_parameters_to_compute_dtype()
 
-        # LoRA B matrices are initialized to zero by default in PEFT,
-        # so we don't need to do anything manually.
+        # Re-apply precision hooks to cover LoRA wrappers (input casting) and any
+        # FP8Linear outputs inside wrapped layers.
+        PrecisionApplier(
+            self.precision_policy,
+            print,
+            compute_dtype=self.compute_dtype,
+        ).apply(self.model)
+
+        # Sanity test generation to catch dtype/kernel issues early.
+        try:
+            self.generate(
+                [
+                    Prompt(
+                        system=settings.system_prompt,
+                        user="What is 1+1?",
+                    )
+                ],
+                max_new_tokens=1,
+            )
+        except Exception as error:
+            print(f"[yellow]Sanity generate failed[/] ({error})")
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
         print("* Abliterable components:")
@@ -154,19 +216,92 @@ class Model:
                 f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
             )
 
+    def _format_quantization_label(self) -> str:
+        if not self.quant or not self.quant.is_quantized:
+            return "no quantization"
+        if self.quant.method:
+            return f"{self.quant.method} quantization"
+        return "quantization"
+
+    def _ensure_chat_template(self) -> None:
+        """
+        Ensure `tokenizer.apply_chat_template(...)` works for local model dirs that ship
+        `chat_template.jinja` as a separate file.
+        """
+        if getattr(self.tokenizer, "chat_template", None) is not None:
+            return
+        model_dir = self.settings.model
+        if not isinstance(model_dir, str) or not os.path.isdir(model_dir):
+            return
+        template_path = os.path.join(model_dir, "chat_template.jinja")
+        if not os.path.exists(template_path):
+            return
+        try:
+            with open(template_path, "r", encoding="utf-8") as f:
+                template = f.read()
+        except Exception:
+            return
+        if not template.strip():
+            return
+        try:
+            setattr(self.tokenizer, "chat_template", template)
+            print(f"* Loaded chat template from [bold]{template_path}[/]")
+        except Exception:
+            return
+
+    def _maybe_materialize_tiny_checkpoint(self) -> None:
+        """
+        If `mock_tiny_model` is enabled and `settings.model` points at a local MiniMax
+        M2.1 *code* directory without weights, materialize a tiny checkpoint directory
+        and switch `settings.model` to it.
+        """
+        if not getattr(self.settings, "mock_tiny_model", False):
+            return
+        source_dir = self.settings.model
+        if not looks_like_minimax_m2_source_dir(source_dir):
+            return
+
+        out_base = os.path.expanduser(
+            os.path.expandvars(getattr(self.settings, "mock_tiny_out_dir", "~/.cache/heretic/mock_models"))
+        )
+
+        spec = TinyMiniMaxM2Spec(
+            hidden_size=getattr(self.settings, "mock_tiny_hidden_size", 64),
+            intermediate_size=getattr(self.settings, "mock_tiny_intermediate_size", 256),
+            num_hidden_layers=getattr(self.settings, "mock_tiny_num_hidden_layers", 2),
+            num_attention_heads=getattr(self.settings, "mock_tiny_num_attention_heads", 4),
+            num_key_value_heads=getattr(self.settings, "mock_tiny_num_key_value_heads", 2),
+            max_position_embeddings=getattr(self.settings, "mock_tiny_max_position_embeddings", 2048),
+            sliding_window=getattr(self.settings, "mock_tiny_sliding_window", 256),
+            num_experts_per_tok=getattr(self.settings, "mock_tiny_num_experts_per_tok", 2),
+            num_local_experts=getattr(self.settings, "mock_tiny_num_local_experts", 2),
+            seed=getattr(self.settings, "mock_tiny_seed", 0),
+        )
+
+        key = json.dumps(
+            {"source_dir": os.path.abspath(source_dir), "spec": spec.__dict__},
+            sort_keys=True,
+        )
+        suffix = sha1(key.encode("utf-8")).hexdigest()[:10]
+        out_dir = os.path.join(out_base, f"minimax_m2_tiny-{suffix}")
+
+        # If the user didn't specify trust_remote_code, force it on for this local remote-code repo.
+        if self.settings.trust_remote_code is None:
+            self.settings.trust_remote_code = True
+
+        self.settings.model = materialize_tiny_minimax_m2_repo(
+            source_dir=source_dir,
+            out_dir=out_dir,
+            spec=spec,
+            logger=print,
+        )
+
     def _apply_lora(self):
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PreTrainedModel)
 
-        # Always use LoRA adapters for abliteration (faster reload, no weight modification)
-        # We use the leaf names (e.g. "o_proj") as target modules.
-        # This may cause LoRA adapters to be attached to unrelated modules (e.g. "conv.o_proj"),
-        # but this is harmless as we only abliterate the modules we target in `abliterate()`,
-        # leaving the others at their default (identity) state.
-        # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
-        target_modules = [
-            comp.split(".")[-1] for comp in self.get_abliterable_components()
-        ]
+        # Always use LoRA adapters for abliteration.
+        target_modules = self._resolve_lora_target_module_names()
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -197,37 +332,51 @@ class Model:
             f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
         )
 
-    def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _resolve_lora_target_module_names(self) -> list[str]:
         """
-        Creates quantization config based on settings.
+        Resolve PEFT `target_modules` from the *actual modules* selected by `get_layer_modules(0)`.
 
-        Args:
-            dtype: The dtype string (e.g., "auto", "bfloat16")
-
-        Returns:
-            BitsAndBytesConfig or None
+        This avoids mismatches between the component label (e.g. \"mlp.down_proj\") and the
+        model's real attribute name (e.g. MiniMax/Phi-style `w2`).
         """
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
-            # BitsAndBytesConfig expects a torch.dtype, not a string.
-            if dtype == "auto":
-                compute_dtype = torch.bfloat16
-            else:
-                compute_dtype = getattr(torch, dtype)
+        assert isinstance(self.model, PreTrainedModel)
+        selected = self.get_layer_modules(0)
+        selected_ids = {id(m) for ms in selected.values() for m in ms}
 
-            return BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-        return None
+        leaf_names: set[str] = set()
+        for name, module in self.model.named_modules():
+            if id(module) not in selected_ids:
+                continue
+            leaf_names.add(name.split(".")[-1])
+
+        if leaf_names:
+            return sorted(leaf_names)
+
+        # Fallback: original behavior (component label suffix).
+        return [comp.split(".")[-1] for comp in self.get_abliterable_components()]
+
+    def _cast_lora_parameters_to_compute_dtype(self) -> None:
+        """
+        Ensure all LoRA adapter parameters live in compute dtype.
+
+        Base weights may be quantized; LoRA should run in compute dtype for stability and
+        to avoid FP8/unsupported dtype failures in adapter matmuls.
+        """
+        if self.compute_dtype is None:
+            return
+        for name, param in self.model.named_parameters():
+            if "lora_" not in name:
+                continue
+            if param.dtype == self.compute_dtype:
+                continue
+            param.data = param.data.to(self.compute_dtype)
 
     def get_merged_model(self) -> PreTrainedModel:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
         # Check if we need special handling for quantized models
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
+        if self.quant is not None and self.quant.is_quantized:
             # Quantized models need special handling - we must reload the base model
             # in full precision to merge the LoRA adapters
 
@@ -302,23 +451,45 @@ class Model:
         self.model = None  # ty:ignore[invalid-assignment]
         empty_cache()
 
-        quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
+        dtype_name = str(dtype).split(".")[-1]
+        quant_req = QuantizationRequest(
+            method=getattr(self.settings.quantization, "value", str(self.settings.quantization)),
+            requested_dtype=dtype_name,
+            config_type=getattr(self.settings, "quantization_config_type", None),
+            config_kwargs=getattr(self.settings, "quantization_kwargs", None),
+        )
+        self.quant = resolve_quantization(
+            model_id_or_path=self.settings.model,
+            request=quant_req,
+            precision_fallback_dtype=getattr(self.settings, "precision_fallback_dtype", "auto"),
+        )
+        self.compute_dtype = self.quant.compute_dtype
 
         # Build kwargs, only include quantization_config if it's not None
         extra_kwargs = {}
-        if quantization_config is not None:
-            extra_kwargs["quantization_config"] = quantization_config
+        if self.quant.load_quantization_config is not None:
+            extra_kwargs["quantization_config"] = self.quant.load_quantization_config
 
+        load_kwargs = {
+            "torch_dtype": self.precision_policy.resolve_model_dtype(dtype_name),
+            "device_map": self.settings.device_map,
+            "max_memory": self.max_memory,
+            "trust_remote_code": self.trusted_models.get(self.settings.model),
+            **extra_kwargs,
+        }
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
-            dtype=dtype,
-            device_map=self.settings.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
-            **extra_kwargs,
+            **load_kwargs,
         )
 
         self._apply_lora()
+        self._cast_lora_parameters_to_compute_dtype()
+
+        PrecisionApplier(
+            self.precision_policy,
+            print,
+            compute_dtype=self.compute_dtype,
+        ).apply(self.model)
 
         self.needs_reload = False
 
@@ -438,14 +609,7 @@ class Model:
                     layer_refusal_direction = refusal_direction
 
                 for module in modules:
-                    # FIXME: This cast is potentially invalid, because the program logic
-                    #        does not guarantee that the module is of type Linear, and in fact
-                    #        the retrieved modules might not conform to the interface assumed
-                    #        below (though they do in practice). However, this is difficult
-                    #        to fix cleanly, because get_layer_modules is called twice on
-                    #        different model configurations, and PEFT employs different
-                    #        module types depending on the chosen quantization.
-                    module = cast(Linear, module)
+                    module_any = cast(Any, module)
 
                     # LoRA abliteration: delta W = -lambda * v * (v^T W)
                     # lora_B = -lambda * v
@@ -453,14 +617,14 @@ class Model:
 
                     # Use the FP32 refusal direction directly (no downcast/upcast)
                     # and move to the correct device.
-                    v = layer_refusal_direction.to(module.weight.device)
+                    v = layer_refusal_direction.to(module_any.weight.device)
 
                     # Get W (dequantize if necessary).
                     #
                     # FIXME: This cast is valid only under the assumption that the original
                     #        module wrapped by the LoRA adapter has a weight attribute.
                     #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
+                    base_weight = cast(Tensor, module_any.base_layer.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
                     if quant_state is None:
@@ -527,8 +691,8 @@ class Model:
                     # Assign to adapters. The adapter name is "default", because that's
                     # what PEFT uses when no name is explicitly specified, as above.
                     # These casts are therefore valid.
-                    weight_A = cast(Tensor, module.lora_A["default"].weight)
-                    weight_B = cast(Tensor, module.lora_B["default"].weight)
+                    weight_A = cast(Tensor, module_any.lora_A["default"].weight)
+                    weight_B = cast(Tensor, module_any.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
 

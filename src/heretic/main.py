@@ -36,9 +36,10 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod, Settings
+from .config import Settings
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
+from .runtime.transformers_compat import ensure_transformers_compat
 from .utils import (
     empty_cache,
     format_duration,
@@ -53,7 +54,7 @@ from .utils import (
 )
 
 
-def obtain_merge_strategy(settings: Settings) -> str | None:
+def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
     """
     Prompts the user for how to proceed with saving the model.
     Provides info to the user if the model is quantized on memory use.
@@ -61,7 +62,7 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
     """
 
     # Prompt for all PEFT models to ensure user is aware of merge implications
-    if settings.quantization == QuantizationMethod.BNB_4BIT:
+    if bool(getattr(model, "quant", None) and model.quant.is_quantized):
         # Quantized models need special handling - we must reload the base model
         # in full precision to merge the LoRA adapters
         print()
@@ -110,7 +111,7 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
                 title="Merge full model"
                 + (
                     ""
-                    if settings.quantization == QuantizationMethod.NONE
+                    if not (getattr(model, "quant", None) and model.quant.is_quantized)
                     else " (reload base model on CPU - requires high RAM)"
                 ),
                 value="merge",
@@ -132,7 +133,7 @@ def save_model(
 ) -> None:
     print("Saving model...")
     if strategy is None:
-        strategy = obtain_merge_strategy(settings)
+        strategy = obtain_merge_strategy(settings, model)
         if strategy is None:
             print("[yellow]Action cancelled.[/]")
             return
@@ -193,13 +194,6 @@ def run():
         )
         return
 
-    # Apply filesystem/cache settings early (before downloading/loading anything).
-    os.makedirs(settings.tmpdir, exist_ok=True)
-    os.environ["TMPDIR"] = settings.tmpdir
-
-    os.makedirs(settings.hf_home, exist_ok=True)
-    os.environ["HF_HOME"] = settings.hf_home
-
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
         count = torch.cuda.device_count()
@@ -247,6 +241,10 @@ def run():
     # Silence warning spam from Transformers.
     # In my entire career I've never seen a useful warning from that library.
     transformers.logging.set_verbosity_error()
+
+    # Preflight: ensure transformers decorators behave correctly BEFORE any remote
+    # model code is imported (e.g. MiniMax relies on @check_model_inputs).
+    ensure_transformers_compat(print)
 
     # We do our own trial logging, so we don't need the INFO messages
     # about parameters and results.
@@ -968,7 +966,7 @@ def run():
                             )
                             private = visibility == "Private"
 
-                            strategy = obtain_merge_strategy(settings)
+                            strategy = obtain_merge_strategy(settings, model)
                             if strategy is None:
                                 print("[yellow]Action cancelled.[/]")
                                 continue
