@@ -34,8 +34,11 @@ from transformers.generation import (
 
 from .config import QuantizationMethod, RowNormalization, Settings
 from .mock_models import (
+    TinyKimiK25Spec,
     TinyMiniMaxM2Spec,
+    looks_like_kimi_k25_source_dir,
     looks_like_minimax_m2_source_dir,
+    materialize_tiny_kimi_k25_repo,
     materialize_tiny_minimax_m2_repo,
 )
 from .runtime.precision import PrecisionApplier, PrecisionPolicy
@@ -47,9 +50,17 @@ from .utils import Prompt, batchify, empty_cache, print
 def get_model_class(
     model: str,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
-    configs = PretrainedConfig.get_config_dict(model)
+    config_dict, _ = PretrainedConfig.get_config_dict(model)
 
-    if any(["vision_config" in x for x in configs]):
+    # If the config provides an `auto_map`, we must use an auto class that honors it.
+    # `AutoModelForImageTextToText` does not accept unknown remote-code config classes.
+    auto_map = config_dict.get("auto_map") if isinstance(config_dict, dict) else None
+    if isinstance(auto_map, dict) and (
+        "AutoModelForCausalLM" in auto_map or "AutoModel" in auto_map
+    ):
+        return AutoModelForCausalLM
+
+    if "vision_config" in config_dict:
         return AutoModelForImageTextToText
     else:
         return AutoModelForCausalLM
@@ -283,43 +294,84 @@ class Model:
         if not getattr(self.settings, "mock_tiny_model", False):
             return
         source_dir = self.settings.model
-        if not looks_like_minimax_m2_source_dir(source_dir):
+        if not looks_like_minimax_m2_source_dir(source_dir) and not looks_like_kimi_k25_source_dir(
+            source_dir
+        ):
             return
 
         out_base = os.path.expanduser(
             os.path.expandvars(getattr(self.settings, "mock_tiny_out_dir", "~/.cache/heretic/mock_models"))
         )
 
-        spec = TinyMiniMaxM2Spec(
-            hidden_size=getattr(self.settings, "mock_tiny_hidden_size", 64),
-            intermediate_size=getattr(self.settings, "mock_tiny_intermediate_size", 256),
-            num_hidden_layers=getattr(self.settings, "mock_tiny_num_hidden_layers", 2),
-            num_attention_heads=getattr(self.settings, "mock_tiny_num_attention_heads", 4),
-            num_key_value_heads=getattr(self.settings, "mock_tiny_num_key_value_heads", 2),
-            max_position_embeddings=getattr(self.settings, "mock_tiny_max_position_embeddings", 2048),
-            sliding_window=getattr(self.settings, "mock_tiny_sliding_window", 256),
-            num_experts_per_tok=getattr(self.settings, "mock_tiny_num_experts_per_tok", 2),
-            num_local_experts=getattr(self.settings, "mock_tiny_num_local_experts", 2),
-            seed=getattr(self.settings, "mock_tiny_seed", 0),
-        )
+        if looks_like_minimax_m2_source_dir(source_dir):
+            spec = TinyMiniMaxM2Spec(
+                hidden_size=getattr(self.settings, "mock_tiny_hidden_size", 64),
+                intermediate_size=getattr(self.settings, "mock_tiny_intermediate_size", 256),
+                num_hidden_layers=getattr(self.settings, "mock_tiny_num_hidden_layers", 2),
+                num_attention_heads=getattr(self.settings, "mock_tiny_num_attention_heads", 4),
+                num_key_value_heads=getattr(self.settings, "mock_tiny_num_key_value_heads", 2),
+                max_position_embeddings=getattr(self.settings, "mock_tiny_max_position_embeddings", 2048),
+                sliding_window=getattr(self.settings, "mock_tiny_sliding_window", 256),
+                num_experts_per_tok=getattr(self.settings, "mock_tiny_num_experts_per_tok", 2),
+                num_local_experts=getattr(self.settings, "mock_tiny_num_local_experts", 2),
+                seed=getattr(self.settings, "mock_tiny_seed", 0),
+            )
+            model_family = "minimax_m2"
+        else:
+            # Kimi K2.5 uses very large special token ids, so vocab size stays large even
+            # for the tiny checkpoint; the model stays small due to tiny hidden/layer sizes.
+            hidden_size = int(getattr(self.settings, "mock_tiny_hidden_size", 64))
+            num_heads = int(getattr(self.settings, "mock_tiny_num_attention_heads", 4))
+            head_dim = max(1, hidden_size // max(1, num_heads))
+            spec = TinyKimiK25Spec(
+                hidden_size=hidden_size,
+                intermediate_size=int(getattr(self.settings, "mock_tiny_intermediate_size", 256)),
+                moe_intermediate_size=max(
+                    1, int(getattr(self.settings, "mock_tiny_intermediate_size", 256)) // 4
+                ),
+                num_hidden_layers=int(getattr(self.settings, "mock_tiny_num_hidden_layers", 2)),
+                num_attention_heads=num_heads,
+                num_key_value_heads=int(getattr(self.settings, "mock_tiny_num_key_value_heads", 4)),
+                max_position_embeddings=int(
+                    getattr(self.settings, "mock_tiny_max_position_embeddings", 512)
+                ),
+                n_routed_experts=max(1, int(getattr(self.settings, "mock_tiny_num_local_experts", 2))),
+                n_shared_experts=1,
+                num_experts_per_tok=max(
+                    1, int(getattr(self.settings, "mock_tiny_num_experts_per_tok", 1))
+                ),
+                qk_rope_head_dim=max(1, head_dim // 2),
+                qk_nope_head_dim=max(1, head_dim - max(1, head_dim // 2)),
+                v_head_dim=head_dim,
+                seed=int(getattr(self.settings, "mock_tiny_seed", 0)),
+            )
+            model_family = "kimi_k25"
 
         key = json.dumps(
             {"source_dir": os.path.abspath(source_dir), "spec": spec.__dict__},
             sort_keys=True,
         )
         suffix = sha1(key.encode("utf-8")).hexdigest()[:10]
-        out_dir = os.path.join(out_base, f"minimax_m2_tiny-{suffix}")
+        out_dir = os.path.join(out_base, f"{model_family}_tiny-{suffix}")
 
         # If the user didn't specify trust_remote_code, force it on for this local remote-code repo.
         if self.settings.trust_remote_code is None:
             self.settings.trust_remote_code = True
 
-        self.settings.model = materialize_tiny_minimax_m2_repo(
-            source_dir=source_dir,
-            out_dir=out_dir,
-            spec=spec,
-            logger=print,
-        )
+        if looks_like_minimax_m2_source_dir(source_dir):
+            self.settings.model = materialize_tiny_minimax_m2_repo(
+                source_dir=source_dir,
+                out_dir=out_dir,
+                spec=cast(TinyMiniMaxM2Spec, spec),
+                logger=print,
+            )
+        else:
+            self.settings.model = materialize_tiny_kimi_k25_repo(
+                source_dir=source_dir,
+                out_dir=out_dir,
+                spec=cast(TinyKimiK25Spec, spec),
+                logger=print,
+            )
 
     def _apply_lora(self):
         # Guard against calling this method at the wrong time.
@@ -385,7 +437,12 @@ class Model:
         """
         try:
             device = getattr(peft_model, "device", None) or torch.device("cpu")
-            inputs = tokenizer("hello", return_tensors="pt")
+            inputs = tokenizer(
+                "hello",
+                return_tensors="pt",
+                return_token_type_ids=False,
+                add_special_tokens=False,
+            )
             inputs = {k: v.to(device) for k, v in inputs.items()}
             with torch.no_grad():
                 out_before = peft_model(**inputs).logits  # type: ignore[attr-defined]
@@ -797,6 +854,11 @@ class Model:
         if isinstance(model, PeftModel):
             model = model.base_model.model
 
+        # Kimi K2.5-style composite wrappers.
+        with suppress(Exception):
+            language_model = getattr(model, "language_model")
+            return language_model.model.layers
+
         # Most multimodal models.
         with suppress(Exception):
             return model.model.language_model.layers
@@ -1025,6 +1087,9 @@ class Model:
             return_tensors="pt",
             padding=True,
             return_token_type_ids=False,
+            # `apply_chat_template(tokenize=False)` already emits any required special tokens.
+            # Avoid double-inserting BOS/EOS (and some remote-code tokenizers mis-handle it).
+            add_special_tokens=False,
         ).to(self.model.device)
 
         # FIXME: The type checker has been disabled here because of the extremely complex
@@ -1168,6 +1233,7 @@ class Model:
             chat_prompt,
             return_tensors="pt",
             return_token_type_ids=False,
+            add_special_tokens=False,
         ).to(self.model.device)
 
         streamer = TextStreamer(

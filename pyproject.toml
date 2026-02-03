@@ -24,15 +24,18 @@ classifiers = [
 dependencies = [
     "accelerate>=1.10.0",
     "bitsandbytes>=0.45.0",
+    "compressed-tensors",
     "datasets>=4.0.0",
     "hf-transfer>=0.1.9",
     "huggingface-hub>=0.34.4",
     "kernels>=0.11.7",
+    "numpy>=2.2.6",
     "optuna>=4.5.0",
     "peft>=0.14.0",
     "pydantic-settings>=2.10.1",
     "questionary>=2.1.1",
     "rich>=14.1.0",
+    "tiktoken",
     "transformers",
 ]
 
@@ -41,7 +44,6 @@ research = [
     "geom-median>=0.1.0",
     "imageio>=2.37.2",
     "matplotlib>=3.10.7",
-    "numpy>=2.2.6",
     "pacmap>=0.8.0",
     "scikit-learn>=1.7.2",
 ]
@@ -70,4 +72,4 @@ build-backend = "uv_build"
 module-name = "heretic"
 
 [tool.uv.sources]
-transformers = { git = "https://github.com/huggingface/transformers.git", rev = "8c403da7ae37d20314d00d940d96c4a27fc98a29" }
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "aefa23ad1c52de9c115f3d762fe1a1eda643275a" }
