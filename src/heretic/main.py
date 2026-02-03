@@ -39,7 +39,10 @@ from .analyzer import Analyzer
 from .config import Settings
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
-from .runtime.transformers_compat import ensure_transformers_compat
+from .runtime.transformers_compat import (
+    ensure_compressed_tensors_fast_load,
+    ensure_transformers_compat,
+)
 from .utils import (
     empty_cache,
     format_duration,
@@ -60,6 +63,15 @@ def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
     Provides info to the user if the model is quantized on memory use.
     Returns "merge", "adapter", or None (if cancelled/invalid).
     """
+
+    # Compressed-tensors models (native INT quantization) are generally not practical to merge+export
+    # from Heretic (and some backends do not support saving once loaded). Prefer adapter-only.
+    if getattr(getattr(model, "quant", None), "method", None) == "compressed-tensors":
+        print(
+            "[yellow]Model uses compressed-tensors quantization. "
+            "Defaulting to adapter-only export (full merge/export is not practical here).[/]"
+        )
+        return "adapter"
 
     # Prompt for all PEFT models to ensure user is aware of merge implications.
     if bool(getattr(model, "quant", None) and model.quant.is_quantized):
@@ -247,6 +259,9 @@ def run():
     # Preflight: ensure transformers decorators behave correctly BEFORE any remote
     # model code is imported (e.g. MiniMax relies on @check_model_inputs).
     ensure_transformers_compat(print)
+
+    # Optional preflight: speed up loading of pre-compressed compressed-tensors checkpoints.
+    ensure_compressed_tensors_fast_load(print, enabled=bool(getattr(settings, "ct_fast_load", False)))
 
     # We do our own trial logging, so we don't need the INFO messages
     # about parameters and results.

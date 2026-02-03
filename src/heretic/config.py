@@ -162,6 +162,24 @@ class Settings(BaseSettings):
         ),
     )
 
+    ct_fast_load: bool = Field(
+        default=False,
+        description=(
+            "Experimental: speed up loading for pre-compressed `compressed-tensors` checkpoints by "
+            "skipping the expensive in-memory `compress_model()` sweep when `run_compressed=True` "
+            "and the checkpoint is already stored compressed on disk (e.g. Kimi K2.5). "
+            "Gate via HERETIC_CT_FAST_LOAD=1."
+        ),
+    )
+
+    ct_loading_info: bool = Field(
+        default=False,
+        description=(
+            "If true, enable Transformers `output_loading_info=True` during model load and print "
+            "missing/unexpected key counts. Useful for validating experimental load shims."
+        ),
+    )
+
     precision_policy: str = Field(
         default="auto",
         description=(
@@ -197,6 +215,15 @@ class Settings(BaseSettings):
     max_response_length: int = Field(
         default=100,
         description="Maximum number of tokens to generate for each response.",
+    )
+
+    max_moe_experts_per_layer: int = Field(
+        default=0,
+        description=(
+            "Limit how many MoE experts per layer are considered abliterable when enumerating "
+            "`layer.mlp.experts`. 0 means no limit (enumerate all). "
+            "Useful for huge MoE models (e.g. Kimi K2.5 has 384 experts/layer)."
+        ),
     )
 
     orthogonalize_direction: bool | int = Field(

@@ -18,6 +18,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoTokenizer,
@@ -43,8 +44,39 @@ from .mock_models import (
 )
 from .runtime.precision import PrecisionApplier, PrecisionPolicy
 from .runtime.quantization import QuantizationInfo, QuantizationRequest, resolve_quantization
+from .runtime.transformers_compat import ensure_compressed_tensors_fast_load
 from .runtime.weight_access import WeightAccess, WeightAccessError
 from .utils import Prompt, batchify, empty_cache, print
+
+
+def _patch_kimi_remote_code_in_memory(*, model_id: str) -> None:
+    """
+    Minimal empirical shims for Kimi K2.5 remote code.
+
+    Kimi's model class always instantiates the vision tower during __init__ (even for text-only use),
+    so we patch remote-code init bugs to allow loading.
+    """
+
+    if not isinstance(model_id, str) or "Kimi-K2.5" not in model_id:
+        return
+
+    try:
+        # IMPORTANT: use transformers' dynamic module loader so it sets
+        # `__transformers_module_hash__`. Otherwise, `from_config()` will reload the module
+        # and wipe our in-memory patch.
+        from transformers.dynamic_module_utils import get_cached_module_file, get_class_in_module
+
+        module_path = get_cached_module_file(
+            model_id,
+            "modeling_kimi_k25.py",
+            revision=None,
+        )
+        MoonViT3dEncoder = get_class_in_module("MoonViT3dEncoder", module_path)
+        if not hasattr(MoonViT3dEncoder, "use_deterministic_attn"):
+            setattr(MoonViT3dEncoder, "use_deterministic_attn", False)
+            print("* Patched Kimi remote-code: MoonViT3dEncoder.use_deterministic_attn=False")
+    except Exception as exc:
+        print(f"[yellow]Kimi remote-code patch skipped[/] ({exc})")
 
 
 def get_model_class(
@@ -91,6 +123,14 @@ class Model:
         self._maybe_materialize_tiny_checkpoint()
         print(f"Loading model [bold]{self.settings.model}[/]...")
 
+        # Optional: speed up loading of pre-compressed compressed-tensors checkpoints.
+        ensure_compressed_tensors_fast_load(
+            print, enabled=bool(getattr(self.settings, "ct_fast_load", False))
+        )
+
+        # Empirical shims for Kimi remote code (text-only still instantiates vision tower).
+        _patch_kimi_remote_code_in_memory(model_id=self.settings.model)
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.settings.model,
             trust_remote_code=settings.trust_remote_code,
@@ -119,6 +159,31 @@ class Model:
 
         # Detect the device we'll be using for runtime precision probing.
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._print_loading_info = bool(
+            getattr(self.settings, "ct_loading_info", False)
+            or getattr(self.settings, "ct_fast_load", False)
+        )
+
+        # Empirical fix for first observed Kimi failure:
+        # the vision tower defaults to FlashAttention2, but flash_attn may not be installed.
+        # If flash_attn is unavailable, force eager attention via an explicit config.
+        self._load_config: PretrainedConfig | None = None
+        if isinstance(self.settings.model, str) and "Kimi-K2.5" in self.settings.model:
+            try:
+                from transformers.utils import is_flash_attn_2_available
+
+                if not is_flash_attn_2_available():
+                    cfg = AutoConfig.from_pretrained(
+                        self.settings.model,
+                        trust_remote_code=self.trusted_models.get(self.settings.model),
+                    )
+                    vc = getattr(cfg, "vision_config", None)
+                    if vc is not None and hasattr(vc, "_attn_implementation"):
+                        setattr(vc, "_attn_implementation", "eager")
+                    self._load_config = cfg
+                    print("* flash_attn not available; forcing eager attention for Kimi K2.5 vision tower")
+            except Exception as exc:
+                print(f"[yellow]Kimi config override failed[/] ({exc})")
 
         for dtype in self.settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
@@ -152,6 +217,10 @@ class Model:
                     "trust_remote_code": self.trusted_models.get(self.settings.model),
                     **extra_kwargs,
                 }
+                if self._load_config is not None:
+                    load_kwargs["config"] = self._load_config
+                if self._print_loading_info:
+                    load_kwargs["output_loading_info"] = True
 
                 # FP8 models can produce NaNs in batched generation when sequences have different
                 # prompt lengths (mixed padding/attention lengths). This can manifest as repeated
@@ -165,10 +234,15 @@ class Model:
                 ):
                     load_kwargs["attn_implementation"] = "eager"
 
-                self.model = get_model_class(self.settings.model).from_pretrained(
+                loaded = get_model_class(self.settings.model).from_pretrained(
                     self.settings.model,
                     **load_kwargs,
                 )
+                if self._print_loading_info and isinstance(loaded, tuple) and len(loaded) == 2:
+                    self.model, loading_info = loaded
+                    self._log_loading_info(loading_info)
+                else:
+                    self.model = loaded
 
                 # If we reach this point and the model requires trust_remote_code,
                 # either the user accepted, or settings.trust_remote_code is True.
@@ -251,6 +325,50 @@ class Model:
             print(
                 f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
             )
+
+    def _log_loading_info(self, loading_info: Any) -> None:
+        """
+        Print a compact summary of Transformers loading info (missing/unexpected keys).
+        """
+        if not isinstance(loading_info, dict):
+            return
+        missing = loading_info.get("missing_keys")
+        unexpected = loading_info.get("unexpected_keys")
+        errors = loading_info.get("error_msgs")
+
+        def _count(x: Any) -> int:
+            return len(x) if isinstance(x, list) else 0
+
+        mc = _count(missing)
+        uc = _count(unexpected)
+        ec = _count(errors)
+        if mc == 0 and uc == 0 and ec == 0:
+            print("* loading_info: missing_keys=0 unexpected_keys=0 error_msgs=0")
+            return
+
+        def _examples(x: Any) -> list[str]:
+            if not isinstance(x, list):
+                return []
+            out: list[str] = []
+            for item in x[:5]:
+                try:
+                    out.append(str(item))
+                except Exception:
+                    continue
+            return out
+
+        print(
+            "* loading_info:"
+            f" missing_keys={mc}"
+            f" unexpected_keys={uc}"
+            f" error_msgs={ec}"
+        )
+        ex_m = _examples(missing)
+        ex_u = _examples(unexpected)
+        if ex_m:
+            print(f"  - missing_examples={ex_m}")
+        if ex_u:
+            print(f"  - unexpected_examples={ex_u}")
 
     def _format_quantization_label(self) -> str:
         if not self.quant or not self.quant.is_quantized:
@@ -515,8 +633,13 @@ class Model:
         if base_layer is None:
             missing.append("base_layer")
         else:
-            if getattr(base_layer, "weight", None) is None:
-                missing.append("base_layer.weight")
+            w = getattr(base_layer, "weight", None)
+            if w is None:
+                # compressed-tensors (e.g. CompressedLinear) deletes `.weight` and exposes a compressor.
+                compressor = getattr(base_layer, "compressor", None)
+                decompress = getattr(compressor, "decompress_module", None)
+                if not callable(decompress):
+                    missing.append("base_layer.weight")
 
         def _get_default_adapter(container: Any) -> Any | None:
             # PEFT uses different container types across versions (dict, ModuleDict, etc).
@@ -814,16 +937,23 @@ class Model:
             "trust_remote_code": self.trusted_models.get(self.settings.model),
             **extra_kwargs,
         }
+        if self._print_loading_info:
+            load_kwargs["output_loading_info"] = True
         if (
             self.quant is not None
             and self.quant.is_quantized
             and (self.quant.method or "") in {"fp8", "finegrained_fp8", "fine-grained-fp8"}
         ):
             load_kwargs["attn_implementation"] = "eager"
-        self.model = get_model_class(self.settings.model).from_pretrained(
+        loaded = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
             **load_kwargs,
         )
+        if self._print_loading_info and isinstance(loaded, tuple) and len(loaded) == 2:
+            self.model, loading_info = loaded
+            self._log_loading_info(loading_info)
+        else:
+            self.model = loaded
 
         self._apply_lora()
         self._validate_lora_wrapper_contract()
@@ -893,7 +1023,11 @@ class Model:
 
         # Some MoE models (e.g. Qwen3).
         with suppress(Exception):
-            for expert in layer.mlp.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
+            experts = layer.mlp.experts  # ty:ignore[possibly-missing-attribute]
+            limit = int(getattr(self.settings, "max_moe_experts_per_layer", 0) or 0)
+            if limit > 0:
+                experts = list(experts)[:limit]  # type: ignore[arg-type]
+            for expert in experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Phi-3.5-MoE (and possibly others).

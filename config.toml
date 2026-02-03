@@ -20,6 +20,8 @@ dtypes = [
 # Device map to pass to Accelerate when loading the model.
 device_map = "auto"
 
+trust_remote_code = true
+
 # Quantization method to use when loading the model.
 # Options:
 #   "none"  - no quantization
