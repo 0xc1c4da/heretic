@@ -52,7 +52,7 @@ orthogonalize_direction = 20
 # 'pre' (compute LoRA adapter relative to row-normalized weights),
 # 'full' (like 'pre', but re-normalizes to preserve original row magnitudes).
 # Note: Row magnitude preservation is approximate due to non-linear effects.
-row_normalization = "full"
+row_normalization = "pre"
 
 # Whether to print prompt/response pairs when counting refusals.
 print_responses = true

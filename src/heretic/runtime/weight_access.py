@@ -41,15 +41,44 @@ class WeightAccess:
         """
         w = getattr(base_layer, "weight", None)
         if not isinstance(w, Tensor):
-            raise WeightAccessError(
-                "Unsupported weight representation: base_layer.weight is not a Tensor.",
-                {
-                    "layer": layer_index,
-                    "component": component,
-                    "base_layer_class": type(base_layer).__name__,
-                    "weight_type": type(w).__name__,
-                },
-            )
+            # compressed-tensors (e.g. CompressedLinear) may delete `.weight` until first forward
+            # and expose a compressor to materialize dense weights on demand.
+            compressor = getattr(base_layer, "compressor", None)
+            decompress = getattr(compressor, "decompress_module", None)
+            if callable(decompress):
+                try:
+                    w2 = decompress(base_layer)
+                except Exception as exc:
+                    raise WeightAccessError(
+                        "Failed to decompress compressed-tensors weight for abliteration.",
+                        {
+                            "layer": layer_index,
+                            "component": component,
+                            "base_layer_class": type(base_layer).__name__,
+                            "compressor_class": type(compressor).__name__,
+                        },
+                    ) from exc
+                if not isinstance(w2, Tensor):
+                    raise WeightAccessError(
+                        "Compressed-tensors decompression returned non-Tensor weight.",
+                        {
+                            "layer": layer_index,
+                            "component": component,
+                            "base_layer_class": type(base_layer).__name__,
+                            "decompressed_type": type(w2).__name__,
+                        },
+                    )
+                w = w2
+            else:
+                raise WeightAccessError(
+                    "Unsupported weight representation: base_layer.weight is not a Tensor.",
+                    {
+                        "layer": layer_index,
+                        "component": component,
+                        "base_layer_class": type(base_layer).__name__,
+                        "weight_type": type(w).__name__,
+                    },
+                )
 
         quant_state = getattr(w, "quant_state", None)
         if quant_state is not None:

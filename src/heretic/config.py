@@ -217,12 +217,30 @@ class Settings(BaseSettings):
         description="Maximum number of tokens to generate for each response.",
     )
 
-    max_moe_experts_per_layer: int = Field(
-        default=0,
+    moe_profile_enabled: bool = Field(
+        default=True,
         description=(
-            "Limit how many MoE experts per layer are considered abliterable when enumerating "
-            "`layer.mlp.experts`. 0 means no limit (enumerate all). "
-            "Useful for huge MoE models (e.g. Kimi K2.5 has 384 experts/layer)."
+            "If true, attempt to profile MoE routing on a small prompt batch and select a "
+            "small subset of routed experts to target with LoRA. If profiling fails, fall back "
+            "to dense-only targeting."
+        ),
+    )
+
+    moe_profile_prompts: int = Field(
+        default=32,
+        description="Number of prompts used to profile MoE expert usage (0 disables profiling).",
+    )
+
+    moe_expert_top_k: int = Field(
+        default=8,
+        description="How many routed experts per profiled layer to target with LoRA.",
+    )
+
+    moe_target_last_n_layers: int = Field(
+        default=32,
+        description=(
+            "Only profile/target routed experts in the last N transformer layers (0 means all). "
+            "This keeps MoE targeting tractable on huge models."
         ),
     )
 

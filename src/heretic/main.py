@@ -343,6 +343,15 @@ def run():
     bad_prompts = load_prompts(settings, settings.bad_prompts)
     print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
 
+    # Optional: profile MoE routing and select a small expert subset before LoRA injection.
+    try:
+        model.profile_moe_experts(good_prompts[:50] + bad_prompts[:50])
+    except Exception as error:
+        print(f"[yellow]MoE profiling skipped[/] ({error})")
+
+    # Initialize LoRA after (optional) expert selection.
+    model.initialize_lora_for_abliteration()
+
     if settings.batch_size == 0:
         print()
         print("Determining optimal batch size...")

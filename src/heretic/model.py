@@ -44,7 +44,7 @@ from .mock_models import (
 )
 from .runtime.precision import PrecisionApplier, PrecisionPolicy
 from .runtime.quantization import QuantizationInfo, QuantizationRequest, resolve_quantization
-from .runtime.transformers_compat import ensure_compressed_tensors_fast_load
+from .runtime.transformers_compat import ensure_compressed_tensors_fast_load, ensure_peft_compat
 from .runtime.weight_access import WeightAccess, WeightAccessError
 from .utils import Prompt, batchify, empty_cache, print
 
@@ -283,6 +283,47 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
+        # For composite multimodal wrappers (e.g. Kimi K2.5), Heretic operates on the
+        # language model subtree only (text tasks + abliteration).
+        self._unwrap_to_language_model_if_present()
+
+        # LoRA is initialized later (after optional MoE expert selection). This keeps the
+        # expensive adapter injection out of the critical path and allows us to target only
+        # selected routed experts for huge MoE models.
+        self._lora_initialized = False
+        self._experts_to_target_by_layer: dict[int, set[int]] = {}
+
+    def _unwrap_to_language_model_if_present(self) -> None:
+        """
+        If the loaded model is a composite wrapper exposing `.language_model`, unwrap to
+        the language model only.
+
+        This reduces PEFT traversal cost and keeps vision/projector modules inert.
+        """
+        try:
+            m = self.model
+            if isinstance(m, PeftModel):
+                m = m.base_model.model  # type: ignore[assignment]
+            language_model = getattr(m, "language_model", None)
+            if language_model is None:
+                return
+            if isinstance(language_model, PreTrainedModel):
+                self._mm_wrapper = self.model
+                self.model = language_model
+                print("* Using language_model subtree only (text-only mode)")
+        except Exception:
+            return
+
+    def initialize_lora_for_abliteration(self, *, verbose: bool = True) -> None:
+        """
+        Initialize LoRA adapters and validate the runtime contract required by `abliterate()`.
+
+        This is separated from `__init__` so we can optionally profile MoE routing and
+        only target a subset of experts before injecting adapters.
+        """
+        if self._lora_initialized:
+            return
+
         self._apply_lora()
         self._validate_lora_wrapper_contract()
         self._cast_lora_parameters_to_compute_dtype()
@@ -305,26 +346,29 @@ class Model:
             compute_dtype=self.compute_dtype,
         ).apply(self.model)
 
-        # Sanity test generation to catch dtype/kernel issues early.
-        try:
-            self.generate(
-                [
-                    Prompt(
-                        system=settings.system_prompt,
-                        user="What is 1+1?",
-                    )
-                ],
-                max_new_tokens=1,
-            )
-        except Exception as error:
-            print(f"[yellow]Sanity generate failed[/] ({error})")
+        if verbose:
+            # Sanity test generation to catch dtype/kernel issues early.
+            try:
+                self.generate(
+                    [
+                        Prompt(
+                            system=self.settings.system_prompt,
+                            user="What is 1+1?",
+                        )
+                    ],
+                    max_new_tokens=1,
+                )
+            except Exception as error:
+                print(f"[yellow]Sanity generate failed[/] ({error})")
 
-        print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
-        print("* Abliterable components:")
-        for component, modules in self.get_layer_modules(0).items():
-            print(
-                f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
-            )
+            print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
+            print("* Abliterable components:")
+            for component, modules in self.get_layer_modules(0).items():
+                print(
+                    f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
+                )
+
+        self._lora_initialized = True
 
     def _log_loading_info(self, loading_info: Any) -> None:
         """
@@ -495,12 +539,18 @@ class Model:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PreTrainedModel)
 
+        # PEFT compatibility: some quantization backends (e.g. compressed-tensors)
+        # remove `.weight` from Linear modules until first forward.
+        ensure_peft_compat(print)
+
         # Always use LoRA adapters for abliteration.
-        target_modules = self._resolve_lora_target_module_names()
-        # Save for diagnostics / strict contract errors.
-        self._lora_target_modules = list(target_modules)
+        # Note: `target_modules` can be a list of module-name suffixes OR a regex string (advanced).
+        target_modules = self._resolve_peft_target_modules()
+        # Save for diagnostics / strict contract errors (and merge plans).
+        self._peft_target_modules = target_modules
+        self._lora_target_modules = self._resolve_lora_target_module_names()
         self._lora_plan = {
-            "targets": list(target_modules),
+            "targets": list(self._lora_target_modules),
             "created_from_layer_index": 0,
         }
 
@@ -529,9 +579,12 @@ class Model:
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, peft_config))
 
-        print(
-            f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
-        )
+        if isinstance(target_modules, str):
+            print(f"[green]LoRA adapters initialized (targets: regex)[/]")
+        else:
+            print(
+                f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
+            )
 
     def _lora_targets_for_merge(self) -> list[str]:
         plan = getattr(self, "_lora_plan", None)
@@ -580,7 +633,13 @@ class Model:
         """
         try:
             n_layers = len(self.get_layers())
-            for layer_index in range(n_layers):
+            # Avoid expensive full sweeps for huge models (especially compressed-tensors).
+            # We only check a small sample of layers to validate the wrapper contract.
+            layers_to_check = [0]
+            if n_layers > 1:
+                layers_to_check.append(n_layers - 1)
+
+            for layer_index in layers_to_check:
                 layer_modules = self.get_layer_modules(layer_index)
                 for component, modules in layer_modules.items():
                     if not modules:
@@ -601,6 +660,12 @@ class Model:
                                 ]
                             ),
                         )
+                    # Fast accept: compressed-tensors exposes a compressor for on-demand decompression.
+                    compressor = getattr(base_layer, "compressor", None)
+                    decompress = getattr(compressor, "decompress_module", None)
+                    if callable(decompress):
+                        continue
+                    # Otherwise, try to materialize W once (may dequantize for supported backends).
                     _ = WeightAccess.materialize_W_float32(
                         base_layer=base_layer, component=component, layer_index=layer_index
                     )
@@ -717,17 +782,153 @@ class Model:
         selected = self.get_layer_modules(0)
         selected_ids = {id(m) for ms in selected.values() for m in ms}
 
+        # Avoid scanning the entire model (can be huge for MoE). We only need leaf names,
+        # and module naming is typically consistent across layers.
         leaf_names: set[str] = set()
-        for name, module in self.model.named_modules():
-            if id(module) not in selected_ids:
-                continue
-            leaf_names.add(name.split(".")[-1])
+        try:
+            layer0 = self.get_layers()[0]
+            for name, module in layer0.named_modules():
+                if id(module) not in selected_ids:
+                    continue
+                leaf_names.add(name.split(".")[-1])
+        except Exception:
+            leaf_names = set()
 
         if leaf_names:
             return sorted(leaf_names)
 
         # Fallback: original behavior (component label suffix).
         return [comp.split(".")[-1] for comp in self.get_abliterable_components()]
+
+    def _resolve_peft_target_modules(self) -> list[str] | str:
+        """
+        Resolve PEFT `target_modules`.
+
+        Default: return a list of leaf-name suffixes (PEFT matches by `key.endswith(f".{suffix}")`).
+
+        If we have a routed-expert selection map (`self._experts_to_target_by_layer`), return a
+        single regex string to precisely target:
+        - attention out proj across all layers
+        - dense MLP down_proj (for non-MoE layers)
+        - shared_experts down_proj (DeepSeek-V3 style)
+        - selected routed experts' down_proj in selected layers
+
+        This avoids attaching LoRA to *all* experts, which is infeasible for huge MoE models.
+        """
+        selected = getattr(self, "_experts_to_target_by_layer", None)
+        if not isinstance(selected, dict) or not selected:
+            return self._resolve_lora_target_module_names()
+
+        alts: list[str] = [
+            r".*\.self_attn\.o_proj$",
+            r".*\.mlp\.down_proj$",
+            r".*\.mlp\.shared_experts\.down_proj$",
+        ]
+        for layer_idx, expert_ids in sorted(selected.items()):
+            if not expert_ids:
+                continue
+            idx_alt = "|".join(str(i) for i in sorted(expert_ids))
+            # Match any prefix, but require exact layer index and expert index.
+            alts.append(
+                rf".*\.layers\.{layer_idx}\.mlp\.experts\.(?:{idx_alt})\.down_proj$"
+            )
+
+        if not alts:
+            return self._resolve_lora_target_module_names()
+
+        return rf"(?:{'|'.join(alts)})"
+
+    def profile_moe_experts(self, prompts: list[Prompt]) -> None:
+        """
+        Profile MoE routing on a small prompt batch and select a small subset of routed
+        experts per layer to target with LoRA.
+
+        This is best-effort: if we cannot discover a supported MoE gate, we fall back
+        to dense-only targeting (no routed experts).
+        """
+        if not getattr(self.settings, "moe_profile_enabled", True):
+            return
+        n_prompts = int(getattr(self.settings, "moe_profile_prompts", 32) or 0)
+        if n_prompts <= 0:
+            return
+        top_k = int(getattr(self.settings, "moe_expert_top_k", 8) or 0)
+        if top_k <= 0:
+            return
+
+        layers = self.get_layers()
+        n_layers = len(layers)
+        last_n = int(getattr(self.settings, "moe_target_last_n_layers", 32) or 0)
+        start_layer = 0 if last_n <= 0 else max(0, n_layers - last_n)
+
+        discoveries: list[tuple[int, Any, int]] = []
+        for layer_idx in range(start_layer, n_layers):
+            layer = layers[layer_idx]
+            mlp = getattr(layer, "mlp", None)
+            gate = getattr(mlp, "gate", None)
+            experts = getattr(mlp, "experts", None)
+            if gate is None or experts is None:
+                continue
+            try:
+                n_experts = len(experts)
+            except Exception:
+                continue
+            # Heuristic: gate forward returns (topk_idx, topk_weight).
+            if callable(getattr(gate, "forward", None)) and n_experts > 0:
+                discoveries.append((layer_idx, gate, int(n_experts)))
+
+        if not discoveries:
+            return
+
+        # Counts per (layer, expert_id) on CPU.
+        counts: dict[int, torch.Tensor] = {
+            layer_idx: torch.zeros(n_experts, dtype=torch.int64)
+            for (layer_idx, _gate, n_experts) in discoveries
+        }
+
+        handles = []
+        try:
+            for layer_idx, gate, n_experts in discoveries:
+                def _hook(module, inputs, output, *, _layer=layer_idx, _n=n_experts):  # noqa: ANN001
+                    try:
+                        if not (isinstance(output, tuple) and len(output) >= 1):
+                            return
+                        topk_idx = output[0]
+                        if not isinstance(topk_idx, torch.Tensor):
+                            return
+                        flat = topk_idx.reshape(-1).to("cpu", non_blocking=False)
+                        # bincount requires non-negative ints; topk_idx is expected int64.
+                        bc = torch.bincount(flat, minlength=_n)
+                        counts[_layer] += bc.to(counts[_layer].dtype)
+                    except Exception:
+                        return
+
+                handles.append(gate.register_forward_hook(_hook))
+
+            sample = prompts[: min(n_prompts, len(prompts))]
+            # Run a tiny generation to exercise gating.
+            for batch in batchify(sample, 4):
+                self.generate(batch, max_new_tokens=1)
+
+        finally:
+            for h in handles:
+                with suppress(Exception):
+                    h.remove()
+
+        selected: dict[int, set[int]] = {}
+        for layer_idx, c in counts.items():
+            if c.numel() == 0:
+                continue
+            k = min(top_k, int(c.numel()))
+            # Prefer non-zero experts; if all are zero, still pick top-k to be deterministic.
+            top = torch.topk(c, k=k).indices.tolist()
+            selected[layer_idx] = {int(i) for i in top}
+
+        if selected:
+            self._experts_to_target_by_layer = selected
+            print(
+                f"* MoE profiling selected routed experts in [bold]{len(selected)}[/] layer(s) "
+                f"(top_k={top_k}, last_n_layers={last_n if last_n>0 else 'all'})."
+            )
 
     def _cast_lora_parameters_to_compute_dtype(self) -> None:
         """
@@ -899,7 +1100,9 @@ class Model:
         """
         current_model = getattr(self.model.config, "name_or_path", None)
         if current_model == self.settings.model and not self.needs_reload:
-            # Reset LoRA adapters to zero (identity transformation)
+            # Fast path: reset LoRA adapters to zero (identity transformation).
+            if not isinstance(self.model, PeftModel):
+                return
             for name, module in self.model.named_modules():
                 if "lora_B" in name and hasattr(module, "weight"):
                     torch.nn.init.zeros_(module.weight)
@@ -955,25 +1158,10 @@ class Model:
         else:
             self.model = loaded
 
-        self._apply_lora()
-        self._validate_lora_wrapper_contract()
-        self._cast_lora_parameters_to_compute_dtype()
-        ok, reason = self._can_abliterate_with_current_weights()
-        if not ok:
-            raise RuntimeError(
-                "Abliteration requires access to effective float weights (W) for v^T W.\n"
-                f"- model={self.settings.model}\n"
-                f"- quant_method={getattr(self.quant, 'method', None) if self.quant else None}\n"
-                f"- details:\n{reason}\n"
-                "Remediation: use a quantization method that supports dequantize-on-load for float merge/abliteration, "
-                "or export adapter-only."
-            )
-
-        PrecisionApplier(
-            self.precision_policy,
-            print,
-            compute_dtype=self.compute_dtype,
-        ).apply(self.model)
+        # Operate on language model subtree only (if present) and re-initialize LoRA.
+        self._unwrap_to_language_model_if_present()
+        self._lora_initialized = False
+        self.initialize_lora_for_abliteration(verbose=False)
 
         self.needs_reload = False
 
@@ -1024,11 +1212,18 @@ class Model:
         # Some MoE models (e.g. Qwen3).
         with suppress(Exception):
             experts = layer.mlp.experts  # ty:ignore[possibly-missing-attribute]
-            limit = int(getattr(self.settings, "max_moe_experts_per_layer", 0) or 0)
-            if limit > 0:
-                experts = list(experts)[:limit]  # type: ignore[arg-type]
-            for expert in experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
+            selected = getattr(self, "_experts_to_target_by_layer", None)
+            if isinstance(selected, dict) and layer_index in selected:
+                for idx in sorted(selected[layer_index]):
+                    expert = experts[idx]  # type: ignore[index]
+                    if expert is None:
+                        continue
+                    try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # DeepSeek-V3-style shared experts (dense-ish path alongside routed experts).
+        with suppress(Exception):
+            shared = layer.mlp.shared_experts  # ty:ignore[possibly-missing-attribute]
+            try_add("mlp.down_proj", shared.down_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):
@@ -1113,49 +1308,87 @@ class Model:
                     # lora_B = -lambda * v
                     # lora_A = v^T W
 
-                    # Use the FP32 refusal direction directly (no downcast/upcast)
-                    # and move to the correct device.
-                    v = layer_refusal_direction.to(module_any.weight.device)
-
-                    # Get W (dequantize if necessary).
                     base_layer = module_any.base_layer
-                    try:
-                        W = WeightAccess.materialize_W_float32(
-                            base_layer=base_layer,
-                            component=component,
-                            layer_index=layer_index,
-                        )
-                    except WeightAccessError as exc:
-                        raise RuntimeError(
-                            "Unsupported quantization backend for abliteration weight access.\n"
-                            f"- model={self.settings.model}\n"
-                            f"- quant_method={getattr(self.quant, 'method', None) if self.quant else None}\n"
-                            f"{exc}\n"
-                            "Remediation: use a float model, a quantization backend that supports dequantize-on-load, "
-                            "or export adapter-only."
-                        ) from exc
 
-                    if self.settings.row_normalization != RowNormalization.NONE:
-                        # Keep a reference to the original weight matrix so we can subtract it later.
-                        W_org = W
-                        # Get the row norms (cast to work around untyped LA).
-                        W_row_norms = cast(
-                            Tensor, LA.vector_norm(W, dim=1, keepdim=True)
-                        )
-                        # Normalize the weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
+                    # Choose a device for computations without assuming `.weight` exists.
+                    device = None
+                    w0 = getattr(base_layer, "weight", None)
+                    b0 = getattr(base_layer, "bias", None)
+                    if isinstance(w0, Tensor):
+                        device = w0.device
+                    elif isinstance(b0, Tensor):
+                        device = b0.device
+                    else:
+                        with suppress(Exception):
+                            device = next(base_layer.parameters()).device
+                    if device is None:
+                        device = torch.device("cpu")
 
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
+                    # Use the FP32 refusal direction directly (no downcast/upcast) and move to device.
+                    v = layer_refusal_direction.to(device)
 
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
+                    # Optional v^T W caching (correct for row_normalization in {none, pre} when v is stable).
+                    use_vtw_cache = (
+                        direction_index is None
+                        and self.settings.row_normalization in {RowNormalization.NONE, RowNormalization.PRE}
+                    )
+                    cache_key = (
+                        id(refusal_directions),
+                        layer_index,
+                        component,
+                        id(base_layer),
+                        str(self.settings.row_normalization),
+                    )
+                    cache = getattr(self, "_vtw_cache", None)
+                    if use_vtw_cache and isinstance(cache, dict) and cache_key in cache:
+                        entry = cache[cache_key]
+                        lora_A = cast(Tensor, entry["A"]).to(device=device).view(1, -1)
+                        W_row_norms = cast(Tensor, entry.get("row_norms")).to(device=device) if entry.get("row_norms") is not None else None
+                    else:
+                        # Get W (dequantize/decompress if necessary).
+                        try:
+                            W = WeightAccess.materialize_W_float32(
+                                base_layer=base_layer,
+                                component=component,
+                                layer_index=layer_index,
+                            ).to(device)
+                        except WeightAccessError as exc:
+                            raise RuntimeError(
+                                "Unsupported quantization backend for abliteration weight access.\n"
+                                f"- model={self.settings.model}\n"
+                                f"- quant_method={getattr(self.quant, 'method', None) if self.quant else None}\n"
+                                f"{exc}\n"
+                                "Remediation: use a float model, a quantization backend that supports dequantize-on-load, "
+                                "or export adapter-only."
+                            ) from exc
+
+                        W_row_norms = None
+                        if self.settings.row_normalization != RowNormalization.NONE:
+                            # Keep a reference to the original weight matrix so we can subtract it later.
+                            W_org = W
+                            # Get the row norms (cast to work around untyped LA).
+                            W_row_norms = cast(Tensor, LA.vector_norm(W, dim=1, keepdim=True))
+                            # Normalize the weight matrix along the rows.
+                            W = F.normalize(W, p=2, dim=1)
+
+                        # Calculate lora_A = v^T W
+                        lora_A = (v @ W).view(1, -1)
+
+                        # Populate cache lazily (store on CPU to keep GPU memory low).
+                        if use_vtw_cache:
+                            if not hasattr(self, "_vtw_cache") or not isinstance(getattr(self, "_vtw_cache", None), dict):
+                                self._vtw_cache = {}
+                            entry = {"A": lora_A.detach().cpu()}
+                            if W_row_norms is not None:
+                                entry["row_norms"] = W_row_norms.detach().cpu()
+                            self._vtw_cache[cache_key] = entry
+
+                        # Calculate lora_B = -weight * v
                     lora_B = (-weight * v).view(-1, 1)
 
                     if self.settings.row_normalization == RowNormalization.PRE:
                         # Make the LoRA adapter apply to the original weight matrix.
+                        assert W_row_norms is not None
                         lora_B = W_row_norms * lora_B
                     elif self.settings.row_normalization == RowNormalization.FULL:
                         # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
