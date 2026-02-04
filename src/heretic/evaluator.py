@@ -110,7 +110,13 @@ class Evaluator:
         kl_divergence_scale = self.settings.kl_divergence_scale
         kl_divergence_target = self.settings.kl_divergence_target
 
-        refusals_score = refusals / self.base_refusals
+        # Some models (especially tiny toy checkpoints) may yield 0 baseline refusals on the
+        # evaluation set, which would make a relative ratio undefined. Fall back to a safe
+        # denominator to keep optimization well-defined.
+        denom = int(self.base_refusals)
+        if denom <= 0:
+            denom = 1
+        refusals_score = refusals / denom
 
         if kl_divergence >= kl_divergence_target:
             kld_score = kl_divergence / kl_divergence_scale

@@ -41,6 +41,7 @@ from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .runtime.transformers_compat import (
     ensure_compressed_tensors_fast_load,
+    ensure_remote_code_generation_mixin,
     ensure_transformers_compat,
 )
 from .utils import (
@@ -259,6 +260,9 @@ def run():
     # Preflight: ensure transformers decorators behave correctly BEFORE any remote
     # model code is imported (e.g. MiniMax relies on @check_model_inputs).
     ensure_transformers_compat(print)
+    # Preflight: ensure remote-code models that implement `prepare_inputs_for_generation`
+    # also inherit GenerationMixin under Transformers >=4.50 (enables generation_config loading).
+    ensure_remote_code_generation_mixin(print)
 
     # Optional preflight: speed up loading of pre-compressed compressed-tensors checkpoints.
     ensure_compressed_tensors_fast_load(print, enabled=bool(getattr(settings, "ct_fast_load", False)))
@@ -581,10 +585,15 @@ def run():
                 0.0,
                 1.0,
             )
+            # Some toy checkpoints can have very few layers (e.g. 2). In that case
+            # `0.6 * last_layer_index` can fall below 1.0, which would violate
+            # Optuna's `low <= high` requirement. Clamp to keep the parameter valid
+            # while preserving the intended range for real models.
+            min_weight_distance_high = max(1.0, 0.6 * last_layer_index)
             min_weight_distance = trial.suggest_float(
                 f"{component}.min_weight_distance",
                 1.0,
-                0.6 * last_layer_index,
+                min_weight_distance_high,
             )
 
             parameters[component] = AbliterationParameters(
@@ -884,6 +893,15 @@ def run():
                 "[yellow]Note that KL divergence values above 1 usually indicate significant damage to the original model's capabilities.[/]"
             )
         )
+
+        # Tiny mock-model smoke tests are often run non-interactively (e.g. in logs/CI).
+        # For real runs, keep the interactive post-optimization menu behavior unchanged.
+        if getattr(settings, "mock_tiny_model", False) and not sys.stdin.isatty():
+            print()
+            print(
+                "[yellow]Non-interactive session detected (mock_tiny_model); exiting after optimization.[/]"
+            )
+            return
 
         while True:
             print()

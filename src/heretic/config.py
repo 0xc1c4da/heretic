@@ -88,6 +88,44 @@ class Settings(BaseSettings):
         description="List of PyTorch dtypes to try when loading model tensors. If loading with a dtype fails, the next dtype in the list will be tried.",
     )
 
+    @field_validator("dtypes", mode="before")
+    @classmethod
+    def _validate_dtypes(cls, value: object) -> list[str]:
+        """
+        Normalize dtype strings coming from CLI/env/TOML.
+
+        Pydantic's CLI parsing expects JSON-ish input, but users often pass Python-literal lists
+        like `['float32']` (single quotes). That can result in values like `\"'float32'\"`, which
+        later breaks dtype resolution (e.g. `torch.'float32'`).
+        """
+        if value is None:
+            return []
+
+        # If it's already a list, normalize elements.
+        if isinstance(value, list):
+            out: list[str] = []
+            for item in value:
+                if not isinstance(item, str):
+                    raise ValueError("dtypes must be a list of strings")
+                v = item.strip()
+                # Strip one layer of surrounding quotes.
+                if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
+                    v = v[1:-1].strip()
+                if v:
+                    out.append(v)
+            return out
+
+        # Accept a single dtype string as convenience.
+        if isinstance(value, str):
+            v = value.strip()
+            if not v:
+                return []
+            if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
+                v = v[1:-1].strip()
+            return [v] if v else []
+
+        raise ValueError("dtypes must be a list[str] or a string")
+
     device_map: str | Dict[str, int | str] = Field(
         default="auto",
         description="Device map to pass to Accelerate when loading the model.",

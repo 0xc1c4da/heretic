@@ -20,6 +20,7 @@ from __future__ import annotations
 from contextlib import suppress
 from functools import wraps
 import os
+import sys
 from types import SimpleNamespace
 from typing import Any, Callable
 from pathlib import Path
@@ -31,6 +32,116 @@ from .ct_checkpoint_inspector import (
     load_weight_map_keys,
     should_scope_to_language_model,
 )
+
+def ensure_remote_code_generation_mixin(logger: Callable[[str], None]) -> None:
+    """
+    Make remote-code generative models compatible with Transformers >=4.50.
+
+    In Transformers 4.57.6, `PreTrainedModel.__init__` populates `generation_config` only if
+    `cls.can_generate()` is True, which now requires *explicit* inheritance from `GenerationMixin`.
+
+    Some remote-code models (e.g. Kimi/DeepSeek) implement `prepare_inputs_for_generation` but
+    do not inherit `GenerationMixin`, so `generation_config` becomes None and `.generate()` fails.
+
+    This shim patches `transformers.dynamic_module_utils.get_class_from_dynamic_module()` so that
+    eligible remote-code `PreTrainedModel` classes are wrapped to inherit `GenerationMixin` at
+    import time, *before* model instantiation.
+    """
+    try:
+        import transformers.dynamic_module_utils as dmu  # type: ignore
+        from transformers.generation.utils import GenerationMixin
+        from transformers.modeling_utils import PreTrainedModel
+    except Exception:
+        return
+
+    current = getattr(dmu, "get_class_from_dynamic_module", None)
+    if current is None:
+        return
+    if getattr(current, "_heretic_patched", False):
+        return
+
+    # Best-effort: identify HF's dynamic remote-code cache root so we only patch those modules.
+    hf_modules_cache = None
+    with suppress(Exception):
+        import transformers.utils as tutils  # type: ignore
+
+        hf_modules_cache = getattr(tutils, "HF_MODULES_CACHE", None)
+        if isinstance(hf_modules_cache, str) and hf_modules_cache:
+            hf_modules_cache = os.path.abspath(hf_modules_cache)
+        else:
+            hf_modules_cache = None
+
+    original = current
+
+    def _is_hf_dynamic_remote_module(cls: type) -> bool:
+        """
+        True iff the class comes from HF's dynamic module cache.
+        """
+        try:
+            mod = sys.modules.get(getattr(cls, "__module__", ""), None)
+            mod_file = getattr(mod, "__file__", None)
+            if not isinstance(mod_file, str) or not mod_file:
+                return False
+            mod_file = os.path.abspath(mod_file)
+            if isinstance(hf_modules_cache, str) and hf_modules_cache:
+                return mod_file.startswith(hf_modules_cache + os.sep) or mod_file == hf_modules_cache
+        except Exception:
+            return False
+        return False
+
+    def _maybe_wrap_generation_mixin(cls: type) -> type:
+        # Cache on the original class to keep identity stable across calls.
+        cached = getattr(cls, "_heretic_generation_mixin_wrapped_cls", None)
+        if isinstance(cached, type):
+            return cached
+
+        # Only wrap HF remote-code models.
+        if not _is_hf_dynamic_remote_module(cls):
+            return cls
+
+        # Only wrap actual models, and only those that look generative but are missing GenerationMixin.
+        if not issubclass(cls, PreTrainedModel):
+            return cls
+        if GenerationMixin in getattr(cls, "__mro__", ()):
+            return cls
+        if not callable(getattr(cls, "prepare_inputs_for_generation", None)):
+            return cls
+
+        try:
+            Patched = type(
+                f"{cls.__name__}WithGenerationMixin",
+                (cls, GenerationMixin),
+                {
+                    "__module__": getattr(cls, "__module__", cls.__module__),
+                    "_heretic_generation_mixin_patched": True,
+                },
+            )
+            setattr(cls, "_heretic_generation_mixin_wrapped_cls", Patched)
+            return Patched
+        except Exception:
+            return cls
+
+    def _patched(
+        class_reference: str,
+        pretrained_model_name_or_path: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> type:
+        cls = original(class_reference, pretrained_model_name_or_path, *args, **kwargs)
+        wrapped = _maybe_wrap_generation_mixin(cls)
+        # Log only when we actually change the class.
+        if wrapped is not cls and not getattr(cls, "_heretic_generation_mixin_logged", False):
+            with suppress(Exception):
+                setattr(cls, "_heretic_generation_mixin_logged", True)
+            logger(
+                f"* remote-code: patched `{getattr(cls, '__name__', cls)}` to inherit GenerationMixin "
+                "(enables generation_config loading)"
+            )
+        return wrapped
+
+    setattr(_patched, "_heretic_patched", True)
+    setattr(_patched, "_heretic_original", original)
+    dmu.get_class_from_dynamic_module = _patched  # type: ignore[assignment]
 
 
 def _fixed_check_model_inputs(original: Any):
