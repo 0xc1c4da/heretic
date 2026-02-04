@@ -172,6 +172,8 @@ def run():
         "PYTORCH_ALLOC_CONF" not in os.environ
         and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
     ):
+        # Prefer CUDA-specific knob when available; also set the generic alias for compatibility.
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
     # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/

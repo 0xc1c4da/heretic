@@ -31,8 +31,21 @@ trust_remote_code = true
 #   "custom" - use quantization_config_type + quantization_kwargs
 quantization = "auto"
 
-# Memory limits to impose. 0 is usually your first graphics card.
-# max_memory = {0 = "16GB", "cpu" = "64GB"}
+# Memory limits to impose (used by `device_map="auto"`).
+#
+# Why this matters for Kimi K2.5:
+# - The checkpoint is stored pre-compressed (pack-quantized), but `CompressedLinear` will *decompress*
+#   expert weights to dense tensors the first time each expert is used, then keep them resident.
+# - If `device_map="auto"` is computed with no VRAM headroom, generation/routing can gradually inflate
+#   enough experts to OOM.
+#
+# Setting a per-GPU max_memory cap leaves decompression headroom and can also encourage Accelerate to
+# place non-language components (vision tower / projector) on CPU when GPU budgets are tight.
+#
+# Adjust the GPU keys/count for your machine.
+#
+# 5×B200 example:
+max_memory = {0 = "140GB", 1 = "140GB", 2 = "140GB", 3 = "140GB", 4 = "140GB", cpu = "1200GB"}
 
 # Number of input sequences to process in parallel (0 = auto).
 batch_size = 128  # auto
