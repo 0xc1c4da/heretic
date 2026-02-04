@@ -21,6 +21,7 @@ from contextlib import suppress
 from functools import wraps
 from types import SimpleNamespace
 from typing import Any, Callable
+import os
 
 
 def _fixed_check_model_inputs(original: Any):
@@ -273,8 +274,14 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
     original = current
 
     # Heuristic: presence of any of these parameter suffixes strongly indicates that the checkpoint
-    # already contains compressed-tensors artifacts, and does *not* require an in-memory compression pass.
-    # (We intentionally include both quantization and sparsity-related names.)
+    # already contains compressed-tensors artifacts (qparams and/or packed weights).
+    # If present, we should never run the expensive in-memory `compress_model()` sweep.
+    #
+    # Notes:
+    # - Quantization params may be stored as <base>_{scale,zero_point,g_idx} where base is one of:
+    #   {weight,input,output}.
+    # - Some compressors store packed weights as `weight_packed` plus auxiliary metadata.
+    # - Sparse formats store `compressed/bitmask/...` style tensors.
     compressed_suffixes = {
         ".weight_scale",
         ".weight_zero_point",
@@ -282,6 +289,12 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
         ".weight_packed",
         ".weight_shape",
         ".weight_global_scale",
+        ".input_scale",
+        ".input_zero_point",
+        ".input_g_idx",
+        ".output_scale",
+        ".output_zero_point",
+        ".output_g_idx",
         ".scale_packed",
         ".meta",
         ".compressed",
@@ -299,13 +312,14 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
         else:
             return False
 
-        # Sample a few shards only; keys are global enough and this keeps overhead low.
-        sample = []
-        for f in files:
-            if isinstance(f, str) and f.endswith(".safetensors"):
-                sample.append(f)
-            if len(sample) >= 3:
-                break
+        # Sample a few *smallest* shards; quantization params are often stored in small files.
+        sample: list[str] = []
+        safetensors_files = [f for f in files if isinstance(f, str) and f.endswith(".safetensors")]
+        if not safetensors_files:
+            return False
+        with suppress(Exception):
+            safetensors_files.sort(key=lambda p: os.path.getsize(p))  # type: ignore[name-defined]
+        sample = safetensors_files[:8]
         if not sample:
             return False
 
@@ -324,6 +338,46 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
                 continue
         return False
 
+    def _checkpoint_looks_dense_only(checkpoint_files: object) -> bool:
+        """
+        Best-effort detection that the checkpoint does *not* contain compressed artifacts.
+
+        If true, we can avoid `compress_model()` by forcing `run_compressed=False` so weights
+        load into standard dense `nn.Linear.weight` parameters.
+        """
+        if checkpoint_files is None:
+            return False
+        if isinstance(checkpoint_files, (str, bytes)):
+            files = [checkpoint_files]
+        elif isinstance(checkpoint_files, (list, tuple)):
+            files = list(checkpoint_files)
+        else:
+            return False
+
+        safetensors_files = [f for f in files if isinstance(f, str) and f.endswith(".safetensors")]
+        if not safetensors_files:
+            return False
+        with suppress(Exception):
+            safetensors_files.sort(key=lambda p: os.path.getsize(p))  # type: ignore[name-defined]
+
+        try:
+            from safetensors import safe_open  # type: ignore
+        except Exception:
+            return False
+
+        saw_dense_weight = False
+        for path in safetensors_files[:6]:
+            try:
+                with safe_open(path, framework="pt", device="cpu") as sf:
+                    for k in sf.keys():
+                        if any(k.endswith(sfx) for sfx in compressed_suffixes):
+                            return False
+                        if k.endswith(".weight"):
+                            saw_dense_weight = True
+            except Exception:
+                continue
+        return saw_dense_weight
+
     def _targets_reference_language_model(ct_cfg: object) -> bool:
         # If targets explicitly include "language_model", applying to the subtree would drop the prefix
         # and potentially fail to match. In that case, don't subtree-restrict.
@@ -339,7 +393,7 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
         return False
 
     def _patched(self, model: Any, **kwargs: Any):  # noqa: ANN001
-        # Keep behavior identical to upstream, except for skipping recompress when safe.
+        # Keep behavior identical to upstream, except for skipping the expensive recompress sweep.
         from compressed_tensors.quantization import apply_quantization_config  # type: ignore
 
         ct_quantization_config = self.compressor.quantization_config
@@ -351,26 +405,50 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
             if lm is not None and not _targets_reference_language_model(ct_quantization_config):
                 target_model = lm
 
-        apply_quantization_config(target_model, ct_quantization_config, self.run_compressed)
-
-        needs_compress = bool(
-            getattr(self.quantization_config, "is_quantization_compressed", False)
-            or getattr(self.quantization_config, "is_sparsification_compressed", False)
-        )
-        if not needs_compress:
-            return
-
         checkpoint_files = kwargs.get("checkpoint_files")
+        # Case 1: checkpoint already contains compressed artifacts -> run compressed wrappers, skip recompress.
         if _checkpoint_looks_precompressed(checkpoint_files):
+            self.run_compressed = True
+            with suppress(Exception):
+                if hasattr(self.quantization_config, "run_compressed"):
+                    self.quantization_config.run_compressed = True
+            apply_quantization_config(target_model, ct_quantization_config, self.run_compressed)
             logger("* compressed-tensors: checkpoint appears pre-compressed; skipping `compress_model()`.")
             return
 
-        # Fall back to upstream behavior (may be slow, but required for dense checkpoints).
-        logger("* compressed-tensors: checkpoint not detected as pre-compressed; running `compress_model()`.")
+        # Case 2: checkpoint looks dense-only -> force dense execution to avoid recompress.
+        if _checkpoint_looks_dense_only(checkpoint_files):
+            self.run_compressed = False
+            with suppress(Exception):
+                if hasattr(self.quantization_config, "run_compressed"):
+                    self.quantization_config.run_compressed = False
+            setattr(self, "_heretic_force_dense", True)
+            apply_quantization_config(target_model, ct_quantization_config, self.run_compressed)
+            logger("* compressed-tensors: checkpoint looks dense; forcing run_compressed=False and skipping `compress_model()`.")
+            return
+
+        # Unknown: default to upstream behavior (may be slow, but safest).
+        apply_quantization_config(target_model, ct_quantization_config, self.run_compressed)
+        logger("* compressed-tensors: checkpoint format uncertain; falling back to `compress_model()`.")
         self.compressor.compress_model(model=target_model)
 
     setattr(_patched, "_heretic_patched", True)
     setattr(_patched, "_heretic_original", original)
     CompressedTensorsHfQuantizer._process_model_before_weight_loading = _patched  # type: ignore[assignment]
     logger("Enabled compressed-tensors skip-recompress shim (auto-detect).")
+
+    # Also prevent a costly/incorrect decompress sweep if we forced dense loading.
+    after = getattr(CompressedTensorsHfQuantizer, "_process_model_after_weight_loading", None)
+    if callable(after) and not getattr(after, "_heretic_patched", False):
+        original_after = after
+
+        def _patched_after(self, model: Any, **kwargs: Any):  # noqa: ANN001
+            if getattr(self, "_heretic_force_dense", False):
+                logger("* compressed-tensors: forced dense mode; skipping `decompress_model()` post-load.")
+                return
+            return original_after(self, model, **kwargs)
+
+        setattr(_patched_after, "_heretic_patched", True)
+        setattr(_patched_after, "_heretic_original", original_after)
+        CompressedTensorsHfQuantizer._process_model_after_weight_loading = _patched_after  # type: ignore[assignment]
 
