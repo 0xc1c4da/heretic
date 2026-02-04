@@ -22,10 +22,12 @@ from functools import wraps
 import os
 from types import SimpleNamespace
 from typing import Any, Callable
+from pathlib import Path
 
 from .ct_checkpoint_inspector import (
     CheckpointKind,
     inspect_checkpoint,
+    infer_checkpoint_kind,
     load_weight_map_keys,
     should_scope_to_language_model,
 )
@@ -304,15 +306,8 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
         from compressed_tensors.quantization import apply_quantization_config  # type: ignore
 
         checkpoint_files = kwargs.get("checkpoint_files")
-        if not isinstance(checkpoint_files, (list, tuple)) or not all(
-            isinstance(x, str) for x in checkpoint_files
-        ):
-            raise RuntimeError(
-                "compressed-tensors: expected `checkpoint_files` list[str] in quantizer preprocess hook; "
-                f"got {type(checkpoint_files).__name__}."
-            )
 
-        # Best-effort extraction of format.
+        # Best-effort extraction of format (prefer nested compressed-tensors config object).
         expected_format = None
         with suppress(Exception):
             inner = getattr(self.quantization_config, "quantization_config", None)
@@ -326,23 +321,95 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
             or getattr(self.quantization_config, "is_sparsification_compressed", False)
         )
 
-        inspected = inspect_checkpoint(
-            checkpoint_files=checkpoint_files,
-            expected_format=expected_format,
-            expect_precompressed=expect_precompressed,
-        )
+        inspected = None
+        index_path = None
+        # Preferred path: shard files provided.
+        if isinstance(checkpoint_files, (list, tuple)) and all(
+            isinstance(x, str) for x in checkpoint_files
+        ):
+            inspected = inspect_checkpoint(
+                checkpoint_files=checkpoint_files,  # type: ignore[arg-type]
+                expected_format=expected_format,
+                expect_precompressed=expect_precompressed,
+            )
+            index_path = inspected.index_path
+        # Fallback: some Transformers builds pass `checkpoint_files=None` for sharded checkpoints,
+        # and download/load happens later. We can still resolve the index deterministically.
+        elif checkpoint_files is None:
+            model_id = None
+            with suppress(Exception):
+                cfg = getattr(model, "config", None)
+                model_id = getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None)
+            if not isinstance(model_id, str) or not model_id:
+                raise RuntimeError(
+                    "compressed-tensors: `checkpoint_files` was None and model config did not provide `name_or_path`; "
+                    "cannot resolve safetensors index."
+                )
 
-        if inspected.index_path is None:
+            # Resolve index path either from local dir or HF cache.
+            if os.path.isdir(model_id):
+                candidate = os.path.join(model_id, "model.safetensors.index.json")
+                index_path = candidate if os.path.exists(candidate) else None
+            if index_path is None:
+                try:
+                    from transformers.utils.hub import cached_file  # type: ignore
+
+                    index_path = cached_file(
+                        model_id,
+                        "model.safetensors.index.json",
+                        _raise_exceptions_for_missing_entries=True,
+                        _raise_exceptions_for_gated_repo=True,
+                        _raise_exceptions_for_connection_errors=True,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "compressed-tensors: `checkpoint_files` was None and safetensors index could not be resolved.\n"
+                        f"- model_id={model_id}\n"
+                        f"- expected_format={expected_format}\n"
+                        f"- error={exc}\n"
+                        "Remediation: ensure model weights and `model.safetensors.index.json` are accessible/cached."
+                    ) from exc
+
+            if not isinstance(index_path, str) or not index_path:
+                raise RuntimeError(
+                    "compressed-tensors: failed to resolve `model.safetensors.index.json` path."
+                )
+
+            index_path = Path(index_path)
+            index_keys = load_weight_map_keys(index_path)
+            inferred = infer_checkpoint_kind(
+                keys=index_keys,
+                expected_format=expected_format,
+                expect_precompressed=expect_precompressed,
+            )
+            inspected = inferred
+            inspected = type(inferred)(
+                kind=inferred.kind,
+                index_path=index_path,
+                expected_format=inferred.expected_format,
+                n_total_keys=inferred.n_total_keys,
+                n_dense_weight=inferred.n_dense_weight,
+                n_expected_artifacts=inferred.n_expected_artifacts,
+                artifacts_suffixes=inferred.artifacts_suffixes,
+                dense_suffix=inferred.dense_suffix,
+            )
+        else:
+            raise RuntimeError(
+                "compressed-tensors: expected `checkpoint_files` list[str] or None in quantizer preprocess hook; "
+                f"got {type(checkpoint_files).__name__}."
+            )
+
+        if inspected is None or index_path is None:
             raise RuntimeError(
                 "compressed-tensors: could not locate a `*.safetensors.index.json` next to shard files; "
                 "refusing to run expensive `compress_model()` fallback.\n"
-                f"- first_shard={checkpoint_files[0] if checkpoint_files else None}\n"
+                f"- first_shard={checkpoint_files[0] if isinstance(checkpoint_files, (list, tuple)) and checkpoint_files else None}\n"
                 f"- expected_format={expected_format}\n"
                 "Remediation: ensure the sharded safetensors index file is present in the same directory as the shards."
             )
 
         # Decide whether we can scope to language_model subtree based on index keys.
-        index_keys = load_weight_map_keys(inspected.index_path)
+        index_keys = load_weight_map_keys(index_path)
         ct_quantization_config = self.compressor.quantization_config
         target_model = model
         with suppress(Exception):
@@ -364,7 +431,7 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
             logger(
                 "ct_loader: kind=PRECOMPRESSED "
                 f"format={inspected.expected_format} run_compressed=True recompress=skip "
-                f"index={inspected.index_path.name}"
+                f"index={index_path.name}"
             )
             return
 
@@ -378,7 +445,7 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
             logger(
                 "ct_loader: kind=DENSE "
                 f"format={inspected.expected_format} run_compressed=False recompress=skip "
-                f"index={inspected.index_path.name}"
+                f"index={index_path.name}"
             )
             return
 
@@ -387,7 +454,7 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
             "compressed-tensors: checkpoint format is inconsistent with configuration; refusing to run `compress_model()`.\n"
             f"- kind={inspected.kind}\n"
             f"- expected_format={inspected.expected_format}\n"
-            f"- index={inspected.index_path}\n"
+            f"- index={index_path}\n"
             f"- n_total_keys={inspected.n_total_keys}\n"
             f"- n_dense_weight_keys={inspected.n_dense_weight}\n"
             f"- n_expected_artifact_keys={inspected.n_expected_artifacts}\n"
