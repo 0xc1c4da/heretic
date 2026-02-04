@@ -100,6 +100,25 @@ After Heretic has finished decensoring a model, you are given the option to
 save the model, upload it to Hugging Face, chat with it to test how well it works,
 or any combination of those actions.
 
+### Merging a saved LoRA adapter into a merged safetensors checkpoint (streaming)
+
+If you exported **adapter-only** weights (PEFT LoRA) and later want a fully merged
+HF checkpoint *without instantiating the full model in memory*, you can use the
+included shard-wise merger:
+
+```
+uv run python stream_merge_lora_safetensors.py \
+  --base-dir /path/to/base_model_dir \
+  --adapter-dir /path/to/adapter_dir \
+  --out-dir /path/to/merged_out_dir
+```
+
+Notes:
+- The base model must be stored as **safetensors** (sharded or single-file).
+- The adapter must be **vanilla PEFT LoRA** saved with `safe_serialization=True`.
+- The merger preserves the base shard layout and writes a new
+  `model.safetensors.index.json` in the output directory.
+
 
 ## Research features
 
