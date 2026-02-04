@@ -15,6 +15,7 @@ Scope (v1):
 from __future__ import annotations
 
 import argparse
+import errno
 import gc
 import json
 import math
@@ -416,6 +417,75 @@ def _parse_dtype(s: str) -> torch.dtype:
     _die(f"Unsupported dtype: {s}")
 
 
+def _is_subpath(child: Path, parent: Path) -> bool:
+    """Return True if child is inside parent (or equal) after resolving."""
+    c = child.resolve()
+    p = parent.resolve()
+    try:
+        common = Path(os.path.commonpath([c.as_posix(), p.as_posix()]))
+    except Exception:
+        return False
+    return common == p
+
+
+def _prepare_out_dir(out_dir: Path, *, overwrite: bool) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        return
+    # Refuse non-empty output dir to avoid mixed linked/rewritten shards on rerun.
+    if any(out_dir.iterdir()):
+        _die(
+            f"Refusing to write into non-empty out_dir={out_dir} without --overwrite. "
+            "Delete the directory or pass --overwrite."
+        )
+
+
+def _link_unchanged_shard(
+    *,
+    src: Path,
+    dst: Path,
+    mode: str,
+    overwrite: bool,
+) -> None:
+    """
+    Link src -> dst without duplicating blocks where possible.
+
+    mode:
+      - auto: hardlink then symlink
+      - hardlink: hardlink only
+      - symlink: symlink only
+      - off: do not link (caller should rewrite/copy)
+    """
+    if mode == "off":
+        _die("Internal error: _link_unchanged_shard called with mode=off.")
+
+    if dst.exists() or dst.is_symlink():
+        if not overwrite:
+            _die(f"Destination already exists: {dst}")
+        dst.unlink()
+
+    if mode in {"auto", "hardlink"}:
+        try:
+            os.link(src.as_posix(), dst.as_posix())
+            return
+        except OSError as e:
+            if mode == "hardlink":
+                _die(f"Hardlink failed for {src} -> {dst}: {e}")
+            # auto: fall through to symlink on common hardlink failures.
+            if e.errno not in {errno.EXDEV, errno.EPERM, errno.EACCES, errno.EMLINK, errno.ENOENT}:
+                pass
+
+    if mode in {"auto", "symlink"}:
+        rel = os.path.relpath(src.as_posix(), start=dst.parent.as_posix())
+        try:
+            os.symlink(rel, dst.as_posix())
+            return
+        except OSError as e:
+            _die(f"Symlink failed for {src} -> {dst}: {e}")
+
+    _die(f"Unsupported link mode: {mode}")
+
+
 def _chunk_rows_for_delta(
     *,
     in_features: int,
@@ -538,6 +608,9 @@ def merge_lora_streaming(
     compute_dtype: torch.dtype,
     chunk_mib: float,
     verify: bool,
+    link_unchanged: str = "auto",
+    extras_mode: str = "extra_shard",
+    overwrite: bool = False,
 ) -> None:
     adapter_spec = _parse_adapter_spec(adapter_dir)
     base_layout = _detect_base_layout(base_dir)
@@ -564,7 +637,16 @@ def merge_lora_streaming(
             + "\n".join(f"- {k}" for k in ex)
         )
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if link_unchanged != "off":
+        if _is_subpath(out_dir, base_dir) or _is_subpath(base_dir, out_dir):
+            if out_dir.resolve() == base_dir.resolve():
+                _die("out_dir must differ from base_dir when linking unchanged shards (use in-place mode separately).")
+            _die(
+                "Refusing to link into a directory that is the same as or nested within the base directory. "
+                f"base_dir={base_dir} out_dir={out_dir}"
+            )
+
+    _prepare_out_dir(out_dir, overwrite=overwrite)
 
     adapter_weights_path = _adapter_weights_path(adapter_dir)
     # Keep adapter weights open across shards for faster access.
@@ -572,22 +654,59 @@ def merge_lora_streaming(
 
     try:
         # We preserve base shard layout. If the adapter contains additional tensors not present in base (e.g.
-        # modules_to_save), we attach them to the final shard and extend the index weight_map accordingly.
+        # modules_to_save), we can write them to a dedicated extras shard and extend the index weight_map accordingly.
         weight_map_out = dict(base_layout.weight_map)
         extras_to_write: dict[str, torch.Tensor] = {}
+        extras_shard_name: Optional[str] = None
         if extra_override_keys:
-            last_shard_name = base_layout.shard_files[-1].name
-            print(f"[merge] attaching {len(extra_override_keys)} extra adapter tensor(s) to {last_shard_name}")
-            for base_k in extra_override_keys:
-                src_k = overrides[base_k]
-                t = adapter_f.get_tensor(src_k)
-                extras_to_write[base_k] = t.to(device="cpu").contiguous()
-                weight_map_out[base_k] = last_shard_name
+            if extras_mode not in {"extra_shard", "attach_last_shard"}:
+                _die(f"Unsupported extras_mode: {extras_mode}")
+            if extras_mode == "extra_shard":
+                extras_shard_name = "model-extras.safetensors"
+                for base_k in extra_override_keys:
+                    src_k = overrides[base_k]
+                    t = adapter_f.get_tensor(src_k)
+                    extras_to_write[base_k] = t.to(device="cpu").contiguous()
+                    weight_map_out[base_k] = extras_shard_name
+            else:
+                last_shard_name = base_layout.shard_files[-1].name
+                print(f"[merge] attaching {len(extra_override_keys)} extra adapter tensor(s) to {last_shard_name}")
+                for base_k in extra_override_keys:
+                    src_k = overrides[base_k]
+                    t = adapter_f.get_tensor(src_k)
+                    extras_to_write[base_k] = t.to(device="cpu").contiguous()
+                    weight_map_out[base_k] = last_shard_name
+
+        if link_unchanged not in {"auto", "hardlink", "symlink", "off"}:
+            _die(f"Unsupported link_unchanged mode: {link_unchanged}")
+
+        base_override_keys = set(overrides.keys()) & base_keys
+        affected_keys = (set(lora_by_base_weight.keys()) | base_override_keys | set(bias_updates.keys())) & base_keys
+        changed_shards = {base_layout.weight_map[k] for k in affected_keys}
+        if extras_mode == "attach_last_shard" and extras_to_write:
+            changed_shards.add(base_layout.shard_files[-1].name)
+
+        print(
+            f"[merge] shards_total={len(base_layout.shard_files)} "
+            f"shards_changed={len(changed_shards)} "
+            f"shards_linked={len(base_layout.shard_files) - len(changed_shards)} "
+            f"link_mode={link_unchanged} extras_mode={extras_mode}"
+        )
 
         for shard_path in base_layout.shard_files:
             shard_name = shard_path.name
             out_shard_path = out_dir / shard_name
-            print(f"[merge] shard {shard_name} -> {out_shard_path}")
+            if link_unchanged != "off" and shard_name not in changed_shards:
+                _link_unchanged_shard(
+                    src=shard_path,
+                    dst=out_shard_path,
+                    mode=link_unchanged,
+                    overwrite=overwrite,
+                )
+                print(f"[merge] shard {shard_name} -> {out_shard_path} (linked)")
+                continue
+
+            print(f"[merge] shard {shard_name} -> {out_shard_path} (rewritten)")
 
             with safe_open(shard_path.as_posix(), framework="pt", device="cpu") as base_f:
                 out_tensors: dict[str, torch.Tensor] = {}
@@ -642,8 +761,8 @@ def merge_lora_streaming(
                     # Default: clone so we don’t keep references to mmap-backed buffers past file close.
                     out_tensors[k] = W.clone().contiguous()
 
-                # If this is the final shard, inject any extra tensors we need to add.
-                if extras_to_write and shard_name == base_layout.shard_files[-1].name:
+                # If using attach_last_shard mode, inject any extra tensors into the final shard.
+                if extras_mode == "attach_last_shard" and extras_to_write and shard_name == base_layout.shard_files[-1].name:
                     for k_extra, t_extra in extras_to_write.items():
                         if k_extra in out_tensors:
                             # Should not happen (extras are defined as missing from base), but avoid silent overwrite.
@@ -658,6 +777,17 @@ def merge_lora_streaming(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        # If using extra_shard mode, write it now (small) and avoid rewriting any base shard purely for extras.
+        if extras_mode == "extra_shard" and extras_to_write:
+            assert extras_shard_name is not None
+            extras_path = out_dir / extras_shard_name
+            print(f"[merge] writing extras shard -> {extras_path}")
+            if (extras_path.exists() or extras_path.is_symlink()) and not overwrite:
+                _die(f"Extras shard already exists: {extras_path}")
+            if extras_path.exists() or extras_path.is_symlink():
+                extras_path.unlink()
+            save_file(extras_to_write, extras_path.as_posix(), metadata={"format": "pt"})
 
         # Index json
         if base_layout.index_json is not None:
@@ -713,15 +843,18 @@ def _self_test() -> None:
         base_dir = td / "base"
         adapter_dir = td / "adapter"
         out_dir = td / "merged"
+        out_dir_linked = td / "merged_linked"
         base_dir.mkdir()
         adapter_dir.mkdir()
 
-        base.save_pretrained(base_dir.as_posix(), safe_serialization=True)
+        # Force *many* shards so the linking path is guaranteed to be exercised.
+        base.save_pretrained(base_dir.as_posix(), safe_serialization=True, max_shard_size="10KB")
 
         lcfg = LoraConfig(
             r=4,
             lora_alpha=4,
-            target_modules=["c_attn", "c_proj"],
+            # Keep targets narrow so not all shards are affected.
+            target_modules=["c_attn"],
             lora_dropout=0.0,
             bias="none",
             task_type="CAUSAL_LM",
@@ -732,6 +865,14 @@ def _self_test() -> None:
             if "lora_" in n:
                 torch.nn.init.normal_(p, mean=0.0, std=0.02)
         peft_model.save_pretrained(adapter_dir.as_posix(), safe_serialization=True)
+
+        # Add an extra tensor to exercise extras_shard handling.
+        from safetensors.torch import load_file as safe_load_file
+
+        adapter_path = adapter_dir / "adapter_model.safetensors"
+        st = dict(safe_load_file(adapter_path.as_posix()))
+        st["extra.test_tensor"] = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        save_file(st, adapter_path.as_posix(), metadata={"format": "pt"})
 
         # Expected: PEFT merge (canonical path)
         exp_base = GPT2LMHeadModel.from_pretrained(base_dir.as_posix())
@@ -749,6 +890,9 @@ def _self_test() -> None:
             compute_dtype=torch.float32,
             chunk_mib=8.0,
             verify=True,
+            link_unchanged="off",
+            extras_mode="extra_shard",
+            overwrite=False,
         )
         got = GPT2LMHeadModel.from_pretrained(out_dir.as_posix())
         got_sd = got.state_dict()
@@ -762,6 +906,38 @@ def _self_test() -> None:
             err = (a - b).abs().max().item()
             if err > 5e-2:
                 _die(f"self-test mismatch key={k} max_abs_err={err}")
+
+        # Confirm extras shard exists and index references it.
+        idx = _load_json(out_dir / "model.safetensors.index.json")
+        if idx["weight_map"].get("extra.test_tensor") != "model-extras.safetensors":
+            _die("self-test expected extra.test_tensor to be mapped to model-extras.safetensors")
+        if not (out_dir / "model-extras.safetensors").exists():
+            _die("self-test expected model-extras.safetensors to exist")
+
+        # Second run: linking enabled, ensure at least one shard is hardlinked.
+        merge_lora_streaming(
+            base_dir=base_dir,
+            adapter_dir=adapter_dir,
+            out_dir=out_dir_linked,
+            adapter_name="default",
+            device=torch.device("cpu"),
+            compute_dtype=torch.float32,
+            chunk_mib=8.0,
+            verify=False,
+            link_unchanged="auto",
+            extras_mode="extra_shard",
+            overwrite=False,
+        )
+        linked = 0
+        for p in out_dir_linked.glob("*.safetensors"):
+            if p.name == "model-extras.safetensors":
+                continue
+            st_out = os.stat(p.as_posix())
+            if st_out.st_nlink >= 2:
+                linked += 1
+        if linked == 0:
+            _die("self-test expected at least one hardlinked shard in linked merge output")
+
         print("[self-test] ok")
 
 
@@ -775,6 +951,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p.add_argument("--compute-dtype", type=str, default="float32", help="float32|bfloat16|float16")
     p.add_argument("--chunk-mib", type=float, default=128.0, help="Delta chunk size in MiB (per update block)")
     p.add_argument("--verify", action="store_true", help="Spot-verify a few merges with full matmul slices")
+    p.add_argument(
+        "--link-unchanged",
+        type=str,
+        default="auto",
+        help="How to handle unchanged shards: auto|hardlink|symlink|off (default: auto)",
+    )
+    p.add_argument(
+        "--extras-mode",
+        type=str,
+        default="extra_shard",
+        help="Where to write adapter extra tensors: extra_shard|attach_last_shard (default: extra_shard)",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow writing into a non-empty output directory (dangerous).",
+    )
     p.add_argument("--self-test", action="store_true", help="Run offline self-test and exit")
     args = p.parse_args(list(argv) if argv is not None else None)
 
@@ -795,6 +988,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         compute_dtype=_parse_dtype(args.compute_dtype),
         chunk_mib=float(args.chunk_mib),
         verify=bool(args.verify),
+        link_unchanged=str(args.link_unchanged),
+        extras_mode=str(args.extras_mode),
+        overwrite=bool(args.overwrite),
     )
 
 

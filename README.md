@@ -118,6 +118,12 @@ Notes:
 - The adapter must be **vanilla PEFT LoRA** saved with `safe_serialization=True`.
 - The merger preserves the base shard layout and writes a new
   `model.safetensors.index.json` in the output directory.
+- By default it will **hardlink unchanged shards** (falling back to symlinks) and
+  only rewrite shards that actually change. This dramatically reduces disk/quota
+  usage for huge models when the adapter touches a small subset of weights.
+- If your workflow involves uploading the merged directory, be aware that symlinks
+  may need to be dereferenced (depending on your tooling). Use `--link-unchanged off`
+  to force rewriting all shards.
 
 
 ## Research features
