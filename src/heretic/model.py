@@ -55,6 +55,7 @@ from .runtime.precision import PrecisionApplier, PrecisionPolicy
 from .runtime.quantization import QuantizationInfo, QuantizationRequest, resolve_quantization
 from .runtime.transformers_compat import (
     ensure_compressed_tensors_fast_load,
+    ensure_compressed_tensors_skip_recompress,
     ensure_generation_compat,
     ensure_peft_compat,
 )
@@ -135,6 +136,9 @@ class Model:
         print()
         self._maybe_materialize_tiny_checkpoint()
         print(f"Loading model [bold]{self.settings.model}[/]...")
+
+        # Always: avoid unnecessary compressed-tensors in-memory recompression on load.
+        ensure_compressed_tensors_skip_recompress(print)
 
         # Optional: speed up loading of pre-compressed compressed-tensors checkpoints.
         ensure_compressed_tensors_fast_load(

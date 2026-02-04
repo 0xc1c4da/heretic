@@ -17,6 +17,7 @@ This patch is intentionally:
 
 from __future__ import annotations
 
+from contextlib import suppress
 from functools import wraps
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -240,4 +241,136 @@ def ensure_compressed_tensors_fast_load(
     setattr(_apply_quantization_config_fast, "_heretic_original", original)
     apply_mod.apply_quantization_config = _apply_quantization_config_fast  # type: ignore[assignment]
     logger("Enabled compressed-tensors fast-load shim (experimental).")
+
+
+def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> None:
+    """
+    Avoid unnecessary `compressed-tensors` in-memory recompression during model load.
+
+    Transformers' `CompressedTensorsHfQuantizer` calls:
+      1) apply_quantization_config(model, ...)
+      2) compressor.compress_model(model)  # emits `Compressing model: ...`
+
+    On large pre-compressed checkpoints (e.g. Kimi K2.5), step (2) can be extremely slow and
+    redundant if the checkpoint already stores compressed parameters.
+
+    This shim monkey-patches the quantizer to *auto-detect* a pre-compressed checkpoint from
+    `checkpoint_files` and skip `compress_model()` when safe.
+    """
+    try:
+        from transformers.quantizers.quantizer_compressed_tensors import (  # type: ignore
+            CompressedTensorsHfQuantizer,
+        )
+    except Exception:
+        return
+
+    current = getattr(CompressedTensorsHfQuantizer, "_process_model_before_weight_loading", None)
+    if current is None:
+        return
+    if getattr(current, "_heretic_patched", False):
+        return
+
+    original = current
+
+    # Heuristic: presence of any of these parameter suffixes strongly indicates that the checkpoint
+    # already contains compressed-tensors artifacts, and does *not* require an in-memory compression pass.
+    # (We intentionally include both quantization and sparsity-related names.)
+    compressed_suffixes = {
+        ".weight_scale",
+        ".weight_zero_point",
+        ".weight_g_idx",
+        ".weight_packed",
+        ".weight_shape",
+        ".weight_global_scale",
+        ".scale_packed",
+        ".meta",
+        ".compressed",
+        ".bitmask",
+        ".row_offsets",
+    }
+
+    def _checkpoint_looks_precompressed(checkpoint_files: object) -> bool:
+        if checkpoint_files is None:
+            return False
+        if isinstance(checkpoint_files, (str, bytes)):
+            files = [checkpoint_files]
+        elif isinstance(checkpoint_files, (list, tuple)):
+            files = list(checkpoint_files)
+        else:
+            return False
+
+        # Sample a few shards only; keys are global enough and this keeps overhead low.
+        sample = []
+        for f in files:
+            if isinstance(f, str) and f.endswith(".safetensors"):
+                sample.append(f)
+            if len(sample) >= 3:
+                break
+        if not sample:
+            return False
+
+        try:
+            from safetensors import safe_open  # type: ignore
+        except Exception:
+            return False
+
+        for path in sample:
+            try:
+                with safe_open(path, framework="pt", device="cpu") as sf:
+                    for k in sf.keys():
+                        if any(k.endswith(sfx) for sfx in compressed_suffixes):
+                            return True
+            except Exception:
+                continue
+        return False
+
+    def _targets_reference_language_model(ct_cfg: object) -> bool:
+        # If targets explicitly include "language_model", applying to the subtree would drop the prefix
+        # and potentially fail to match. In that case, don't subtree-restrict.
+        with suppress(Exception):
+            config_groups = getattr(ct_cfg, "config_groups", None)
+            if isinstance(config_groups, dict):
+                for scheme in config_groups.values():
+                    targets = getattr(scheme, "targets", None)
+                    if isinstance(targets, list) and any(
+                        isinstance(t, str) and "language_model" in t for t in targets
+                    ):
+                        return True
+        return False
+
+    def _patched(self, model: Any, **kwargs: Any):  # noqa: ANN001
+        # Keep behavior identical to upstream, except for skipping recompress when safe.
+        from compressed_tensors.quantization import apply_quantization_config  # type: ignore
+
+        ct_quantization_config = self.compressor.quantization_config
+
+        # Auto-restrict to language model subtree for composite multimodal wrappers when safe.
+        target_model = model
+        with suppress(Exception):
+            lm = getattr(model, "language_model", None)
+            if lm is not None and not _targets_reference_language_model(ct_quantization_config):
+                target_model = lm
+
+        apply_quantization_config(target_model, ct_quantization_config, self.run_compressed)
+
+        needs_compress = bool(
+            getattr(self.quantization_config, "is_quantization_compressed", False)
+            or getattr(self.quantization_config, "is_sparsification_compressed", False)
+        )
+        if not needs_compress:
+            return
+
+        checkpoint_files = kwargs.get("checkpoint_files")
+        if _checkpoint_looks_precompressed(checkpoint_files):
+            logger("* compressed-tensors: checkpoint appears pre-compressed; skipping `compress_model()`.")
+            return
+
+        # Fall back to upstream behavior (may be slow, but required for dense checkpoints).
+        logger("* compressed-tensors: checkpoint not detected as pre-compressed; running `compress_model()`.")
+        self.compressor.compress_model(model=target_model)
+
+    setattr(_patched, "_heretic_patched", True)
+    setattr(_patched, "_heretic_original", original)
+    CompressedTensorsHfQuantizer._process_model_before_weight_loading = _patched  # type: ignore[assignment]
+    logger("Enabled compressed-tensors skip-recompress shim (auto-detect).")
 
