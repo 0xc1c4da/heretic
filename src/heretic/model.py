@@ -42,6 +42,15 @@ from .mock_models import (
     materialize_tiny_kimi_k25_repo,
     materialize_tiny_minimax_m2_repo,
 )
+from .runtime.auto_targeting import (
+    build_balanced_prompt_batch,
+    compute_expert_scores,
+    discover_deepseek_v3_moe_gates,
+    downselect_experts_by_vtw,
+    profile_routing_counts,
+    select_experts_adaptive_k,
+    select_layers_by_energy_coverage,
+)
 from .runtime.precision import PrecisionApplier, PrecisionPolicy
 from .runtime.quantization import QuantizationInfo, QuantizationRequest, resolve_quantization
 from .runtime.transformers_compat import ensure_compressed_tensors_fast_load, ensure_peft_compat
@@ -815,16 +824,36 @@ class Model:
 
         This avoids attaching LoRA to *all* experts, which is infeasible for huge MoE models.
         """
-        selected = getattr(self, "_experts_to_target_by_layer", None)
-        if not isinstance(selected, dict) or not selected:
+        selected_experts = getattr(self, "_experts_to_target_by_layer", None)
+        selected_layers = getattr(self, "_auto_target_layers", None)
+        if not isinstance(selected_layers, list) or not selected_layers:
+            selected_layers = None
+
+        # If no expert selection exists, fall back to leaf-name suffix targeting.
+        if not isinstance(selected_experts, dict) or not selected_experts:
             return self._resolve_lora_target_module_names()
 
-        alts: list[str] = [
-            r".*\.self_attn\.o_proj$",
-            r".*\.mlp\.down_proj$",
-            r".*\.mlp\.shared_experts\.down_proj$",
-        ]
-        for layer_idx, expert_ids in sorted(selected.items()):
+        layer_alt = "|".join(str(i) for i in sorted(set(selected_layers or [])))
+
+        alts: list[str] = []
+        if layer_alt:
+            alts.extend(
+                [
+                    rf".*\.layers\.(?:{layer_alt})\.self_attn\.o_proj$",
+                    rf".*\.layers\.(?:{layer_alt})\.mlp\.down_proj$",
+                    rf".*\.layers\.(?:{layer_alt})\.mlp\.shared_experts\.down_proj$",
+                ]
+            )
+        else:
+            alts.extend(
+                [
+                    r".*\.self_attn\.o_proj$",
+                    r".*\.mlp\.down_proj$",
+                    r".*\.mlp\.shared_experts\.down_proj$",
+                ]
+            )
+
+        for layer_idx, expert_ids in sorted(selected_experts.items()):
             if not expert_ids:
                 continue
             idx_alt = "|".join(str(i) for i in sorted(expert_ids))
@@ -838,97 +867,111 @@ class Model:
 
         return rf"(?:{'|'.join(alts)})"
 
-    def profile_moe_experts(self, prompts: list[Prompt]) -> None:
+    def auto_target_modules(
+        self,
+        *,
+        good_prompts: list[Prompt],
+        bad_prompts: list[Prompt],
+        harmless_means: torch.Tensor,
+        harmful_means: torch.Tensor,
+        refusal_directions: torch.Tensor,
+    ) -> None:
         """
-        Profile MoE routing on a small prompt batch and select a small subset of routed
-        experts per layer to target with LoRA.
+        Adaptive auto-targeting for LoRA/abliteration.
 
-        This is best-effort: if we cannot discover a supported MoE gate, we fall back
-        to dense-only targeting (no routed experts).
+        Produces:
+        - `self._auto_target_layers`: list[int] of selected layers
+        - `self._experts_to_target_by_layer`: dict[layer -> set(expert_ids)] for MoE layers
+
+        This is designed to reduce search space while preserving coverage:
+        1) select layers by separation energy S_l = ||mu_bad - mu_good||^2
+        2) within selected MoE layers, select experts by differential routing (good vs bad) with adaptive K
+        3) optional: downselect experts by ||v^T W|| when row_normalization in {none, pre}
         """
-        if not getattr(self.settings, "moe_profile_enabled", True):
-            return
-        n_prompts = int(getattr(self.settings, "moe_profile_prompts", 32) or 0)
-        if n_prompts <= 0:
-            return
-        top_k = int(getattr(self.settings, "moe_expert_top_k", 8) or 0)
-        if top_k <= 0:
+        if not bool(getattr(self.settings, "auto_targeting", True)):
+            self._auto_target_layers = None
+            self._experts_to_target_by_layer = {}
             return
 
-        layers = self.get_layers()
-        n_layers = len(layers)
-        last_n = int(getattr(self.settings, "moe_target_last_n_layers", 32) or 0)
-        start_layer = 0 if last_n <= 0 else max(0, n_layers - last_n)
+        coverage = float(getattr(self.settings, "auto_targeting_coverage", 0.9) or 0.9)
+        budget_prompts = int(getattr(self.settings, "auto_targeting_budget_prompts", 128) or 128)
+        budget_modules = int(getattr(self.settings, "auto_targeting_budget_modules", 1024) or 1024)
 
-        discoveries: list[tuple[int, Any, int]] = []
-        for layer_idx in range(start_layer, n_layers):
-            layer = layers[layer_idx]
-            mlp = getattr(layer, "mlp", None)
-            gate = getattr(mlp, "gate", None)
-            experts = getattr(mlp, "experts", None)
-            if gate is None or experts is None:
-                continue
+        layers, S = select_layers_by_energy_coverage(
+            harmless_means=harmless_means,
+            harmful_means=harmful_means,
+            coverage=coverage,
+            min_layers=8,
+            max_layers=64,
+        )
+        self._auto_target_layers = layers
+        print(
+            f"* Auto-targeting selected [bold]{len(layers)}[/] layer(s) by separation energy (coverage={coverage})."
+        )
+
+        # Balanced good/bad profiling batch.
+        good_batch, bad_batch = build_balanced_prompt_batch(
+            tokenizer=self.tokenizer,
+            good_prompts=good_prompts,
+            bad_prompts=bad_prompts,
+            model_id=str(getattr(self.settings, "model", "")),
+            total_budget=budget_prompts,
+            logger=print,
+        )
+
+        # Discover MoE gates and restrict to selected layers.
+        moe_layers = [ref for ref in discover_deepseek_v3_moe_gates(self.model) if ref.layer_index in set(layers)]
+        if not moe_layers:
+            self._experts_to_target_by_layer = {}
+            print("* Auto-targeting: no supported MoE gates discovered; using dense-only targeting.")
+            return
+
+        def _gen(batch: list[Prompt]) -> None:
+            self.generate(batch, max_new_tokens=1)
+
+        good_counts, bad_counts = profile_routing_counts(
+            model_generate=_gen,
+            moe_layers=moe_layers,
+            good_batch=good_batch,
+            bad_batch=bad_batch,
+        )
+
+        expert_scores = compute_expert_scores(
+            good_counts=good_counts,
+            bad_counts=bad_counts,
+            alpha=0.1,
+        )
+
+        experts_by_layer = select_experts_adaptive_k(
+            expert_scores=expert_scores,
+            good_counts=good_counts,
+            bad_counts=bad_counts,
+            coverage=coverage,
+            min_support_abs=32,
+            min_support_rel=1e-3,
+            budget_modules_total=budget_modules,
+        )
+
+        # Optional vTW-based downselection (only meaningful for none/pre + per-layer directions).
+        if self.settings.row_normalization in {RowNormalization.NONE, RowNormalization.PRE}:
             try:
-                n_experts = len(experts)
+                experts_by_layer = downselect_experts_by_vtw(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    selected_layers=layers,
+                    experts_by_layer=experts_by_layer,
+                    refusal_directions=refusal_directions,
+                    weight_access_fn=WeightAccess.materialize_W_float32,
+                    budget_modules_total=budget_modules,
+                )
             except Exception:
-                continue
-            # Heuristic: gate forward returns (topk_idx, topk_weight).
-            if callable(getattr(gate, "forward", None)) and n_experts > 0:
-                discoveries.append((layer_idx, gate, int(n_experts)))
+                pass
 
-        if not discoveries:
-            return
-
-        # Counts per (layer, expert_id) on CPU.
-        counts: dict[int, torch.Tensor] = {
-            layer_idx: torch.zeros(n_experts, dtype=torch.int64)
-            for (layer_idx, _gate, n_experts) in discoveries
-        }
-
-        handles = []
-        try:
-            for layer_idx, gate, n_experts in discoveries:
-                def _hook(module, inputs, output, *, _layer=layer_idx, _n=n_experts):  # noqa: ANN001
-                    try:
-                        if not (isinstance(output, tuple) and len(output) >= 1):
-                            return
-                        topk_idx = output[0]
-                        if not isinstance(topk_idx, torch.Tensor):
-                            return
-                        flat = topk_idx.reshape(-1).to("cpu", non_blocking=False)
-                        # bincount requires non-negative ints; topk_idx is expected int64.
-                        bc = torch.bincount(flat, minlength=_n)
-                        counts[_layer] += bc.to(counts[_layer].dtype)
-                    except Exception:
-                        return
-
-                handles.append(gate.register_forward_hook(_hook))
-
-            sample = prompts[: min(n_prompts, len(prompts))]
-            # Run a tiny generation to exercise gating.
-            for batch in batchify(sample, 4):
-                self.generate(batch, max_new_tokens=1)
-
-        finally:
-            for h in handles:
-                with suppress(Exception):
-                    h.remove()
-
-        selected: dict[int, set[int]] = {}
-        for layer_idx, c in counts.items():
-            if c.numel() == 0:
-                continue
-            k = min(top_k, int(c.numel()))
-            # Prefer non-zero experts; if all are zero, still pick top-k to be deterministic.
-            top = torch.topk(c, k=k).indices.tolist()
-            selected[layer_idx] = {int(i) for i in top}
-
-        if selected:
-            self._experts_to_target_by_layer = selected
-            print(
-                f"* MoE profiling selected routed experts in [bold]{len(selected)}[/] layer(s) "
-                f"(top_k={top_k}, last_n_layers={last_n if last_n>0 else 'all'})."
-            )
+        self._experts_to_target_by_layer = experts_by_layer
+        total_experts = sum(len(v) for v in experts_by_layer.values())
+        print(
+            f"* Auto-targeting selected routed experts: [bold]{total_experts}[/] across [bold]{len(experts_by_layer)}[/] layer(s)."
+        )
 
     def _cast_lora_parameters_to_compute_dtype(self) -> None:
         """
@@ -1246,6 +1289,9 @@ class Model:
         return modules
 
     def get_abliterable_components(self) -> list[str]:
+        selected_layers = getattr(self, "_auto_target_layers", None)
+        if isinstance(selected_layers, list) and selected_layers:
+            return list(self.get_layer_modules(selected_layers[0]).keys())
         return list(self.get_layer_modules(0).keys())
 
     def abliterate(
@@ -1271,7 +1317,13 @@ class Model:
 
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
-        for layer_index in range(len(self.get_layers())):
+        selected_layers = getattr(self, "_auto_target_layers", None)
+        if isinstance(selected_layers, list) and selected_layers:
+            layer_iter = selected_layers
+        else:
+            layer_iter = list(range(len(self.get_layers())))
+
+        for layer_index in layer_iter:
             for component, modules in self.get_layer_modules(layer_index).items():
                 params = parameters[component]
 

@@ -343,15 +343,6 @@ def run():
     bad_prompts = load_prompts(settings, settings.bad_prompts)
     print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
 
-    # Optional: profile MoE routing and select a small expert subset before LoRA injection.
-    try:
-        model.profile_moe_experts(good_prompts[:50] + bad_prompts[:50])
-    except Exception as error:
-        print(f"[yellow]MoE profiling skipped[/] ({error})")
-
-    # Initialize LoRA after (optional) expert selection.
-    model.initialize_lora_for_abliteration()
-
     if settings.batch_size == 0:
         print()
         print("Determining optimal batch size...")
@@ -486,6 +477,21 @@ def run():
     # We don't need the residuals after computing refusal directions.
     del good_residuals, bad_residuals, analyzer
     empty_cache()
+
+    # Adaptive auto-targeting (layers/modules/experts) before LoRA injection.
+    try:
+        model.auto_target_modules(
+            good_prompts=good_prompts,
+            bad_prompts=bad_prompts,
+            harmless_means=harmless_means,
+            harmful_means=harmful_means,
+            refusal_directions=refusal_directions,
+        )
+    except Exception as error:
+        print(f"[yellow]Auto-targeting skipped[/] ({error})")
+
+    # Initialize LoRA after auto-targeting selection.
+    model.initialize_lora_for_abliteration()
 
     trial_index = 0
     start_index = 0

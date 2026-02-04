@@ -217,30 +217,35 @@ class Settings(BaseSettings):
         description="Maximum number of tokens to generate for each response.",
     )
 
-    moe_profile_enabled: bool = Field(
+    auto_targeting: bool = Field(
         default=True,
         description=(
-            "If true, attempt to profile MoE routing on a small prompt batch and select a "
-            "small subset of routed experts to target with LoRA. If profiling fails, fall back "
-            "to dense-only targeting."
+            "If true, automatically select a subset of layers/modules (including MoE experts where applicable) "
+            "to target with LoRA based on good/bad prompt statistics, before running Optuna."
         ),
     )
 
-    moe_profile_prompts: int = Field(
-        default=32,
-        description="Number of prompts used to profile MoE expert usage (0 disables profiling).",
-    )
-
-    moe_expert_top_k: int = Field(
-        default=8,
-        description="How many routed experts per profiled layer to target with LoRA.",
-    )
-
-    moe_target_last_n_layers: int = Field(
-        default=32,
+    auto_targeting_budget_prompts: int = Field(
+        default=128,
         description=(
-            "Only profile/target routed experts in the last N transformer layers (0 means all). "
-            "This keeps MoE targeting tractable on huge models."
+            "Total prompt budget for auto-targeting analysis (split evenly between good/bad). "
+            "Used for balanced router profiling and optional module scoring."
+        ),
+    )
+
+    auto_targeting_budget_modules: int = Field(
+        default=1024,
+        description=(
+            "Maximum number of routed expert modules to include in LoRA targeting after auto-targeting. "
+            "Dense modules (e.g. attention o_proj) are always included for the selected layers."
+        ),
+    )
+
+    auto_targeting_coverage: float = Field(
+        default=0.9,
+        description=(
+            "Coverage fraction used by auto-targeting for selecting layers (separation energy) and "
+            "experts/modules (cumulative score)."
         ),
     )
 
