@@ -171,13 +171,23 @@ def ensure_generation_compat(logger: Callable[[str], None], model: Any) -> Any:
     except Exception:
         return model
 
+    def _ensure_generation_config(obj: Any) -> None:
+        # Transformers generation assumes `generation_config` is a GenerationConfig instance,
+        # not `None`. Some remote-code models (or wrapper unwrapping) can leave it unset/None.
+        if obj is None or not hasattr(obj, "config"):
+            return
+        if getattr(obj, "generation_config", None) is not None:
+            return
+        try:
+            obj.generation_config = GenerationConfig.from_model_config(obj.config)
+        except Exception:
+            # Fall back to a default config. This avoids crashes in `generate()` when
+            # downstream assumes `generation_config` is always an object.
+            with suppress(Exception):
+                obj.generation_config = GenerationConfig()
+
     if model is None or hasattr(model, "generate"):
-        # Still ensure generation_config exists (some remote-code models rely on it).
-        if model is not None and not hasattr(model, "generation_config") and hasattr(model, "config"):
-            try:
-                model.generation_config = GenerationConfig.from_model_config(model.config)
-            except Exception:
-                pass
+        _ensure_generation_config(model)
         return model
 
     if not hasattr(model, "prepare_inputs_for_generation"):
@@ -191,11 +201,7 @@ def ensure_generation_compat(logger: Callable[[str], None], model: Any) -> Any:
     try:
         Patched = type(f"{cls.__name__}WithGenerationMixin", (cls, GenerationMixin), {})
         model.__class__ = Patched
-        if not hasattr(model, "generation_config") and hasattr(model, "config"):
-            try:
-                model.generation_config = GenerationConfig.from_model_config(model.config)
-            except Exception:
-                pass
+        _ensure_generation_config(model)
         logger("[yellow]Patched[/] model class to include GenerationMixin (restore .generate).")
     except Exception as exc:
         logger(f"[yellow]GenerationMixin patch skipped[/] ({exc})")

@@ -330,6 +330,14 @@ class Model:
             if language_model is None:
                 return
             if isinstance(language_model, PreTrainedModel):
+                # Preserve generation config from the wrapper when present. The wrapper
+                # loaded via `from_pretrained()` may have `generation_config` set even
+                # if the `language_model` subtree does not.
+                with suppress(Exception):
+                    wrapper_gc = getattr(self.model, "generation_config", None)
+                    if wrapper_gc is not None and getattr(language_model, "generation_config", None) is None:
+                        language_model.generation_config = wrapper_gc
+
                 self._mm_wrapper = self.model
                 self.model = language_model
                 print("* Using language_model subtree only (text-only mode)")
