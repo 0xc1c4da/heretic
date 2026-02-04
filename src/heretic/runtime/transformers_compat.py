@@ -302,41 +302,65 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
         ".row_offsets",
     }
 
-    def _checkpoint_looks_precompressed(checkpoint_files: object) -> bool:
+    def _collect_checkpoint_keys(checkpoint_files: object, *, max_shards: int = 8) -> list[str]:
+        """
+        Collect checkpoint parameter names cheaply.
+
+        Preference order:
+        1) Read `*.safetensors.index.json` next to the shard files (fast, complete, no tensor IO)
+        2) Fallback: open a few smallest shards and list keys (fast, partial)
+        """
         if checkpoint_files is None:
-            return False
+            return []
         if isinstance(checkpoint_files, (str, bytes)):
             files = [checkpoint_files]
         elif isinstance(checkpoint_files, (list, tuple)):
             files = list(checkpoint_files)
         else:
-            return False
+            return []
 
-        # Sample a few *smallest* shards; quantization params are often stored in small files.
-        sample: list[str] = []
         safetensors_files = [f for f in files if isinstance(f, str) and f.endswith(".safetensors")]
         if not safetensors_files:
-            return False
-        with suppress(Exception):
-            safetensors_files.sort(key=lambda p: os.path.getsize(p))  # type: ignore[name-defined]
-        sample = safetensors_files[:8]
-        if not sample:
-            return False
+            return []
 
+        # 1) Index-based (best).
+        with suppress(Exception):
+            d = os.path.dirname(safetensors_files[0])
+            for name in os.listdir(d):
+                if name.endswith(".safetensors.index.json"):
+                    import json
+
+                    idx = os.path.join(d, name)
+                    data = json.loads(open(idx, "r", encoding="utf-8").read())
+                    wm = data.get("weight_map")
+                    if isinstance(wm, dict):
+                        keys = [k for k in wm.keys() if isinstance(k, str)]
+                        if keys:
+                            return keys
+
+        # 2) Fallback: shard sampling.
         try:
             from safetensors import safe_open  # type: ignore
         except Exception:
-            return False
+            return []
 
-        for path in sample:
+        with suppress(Exception):
+            safetensors_files.sort(key=lambda p: os.path.getsize(p))
+
+        keys: list[str] = []
+        for path in safetensors_files[: max(1, int(max_shards))]:
             try:
                 with safe_open(path, framework="pt", device="cpu") as sf:
                     for k in sf.keys():
-                        if any(k.endswith(sfx) for sfx in compressed_suffixes):
-                            return True
+                        if isinstance(k, str):
+                            keys.append(k)
             except Exception:
                 continue
-        return False
+        return keys
+
+    def _checkpoint_looks_precompressed(checkpoint_files: object) -> bool:
+        keys = _collect_checkpoint_keys(checkpoint_files)
+        return any(isinstance(k, str) and any(k.endswith(sfx) for sfx in compressed_suffixes) for k in keys)
 
     def _checkpoint_looks_dense_only(checkpoint_files: object) -> bool:
         """
@@ -345,38 +369,12 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
         If true, we can avoid `compress_model()` by forcing `run_compressed=False` so weights
         load into standard dense `nn.Linear.weight` parameters.
         """
-        if checkpoint_files is None:
+        keys = _collect_checkpoint_keys(checkpoint_files)
+        if not keys:
             return False
-        if isinstance(checkpoint_files, (str, bytes)):
-            files = [checkpoint_files]
-        elif isinstance(checkpoint_files, (list, tuple)):
-            files = list(checkpoint_files)
-        else:
+        if any(isinstance(k, str) and any(k.endswith(sfx) for sfx in compressed_suffixes) for k in keys):
             return False
-
-        safetensors_files = [f for f in files if isinstance(f, str) and f.endswith(".safetensors")]
-        if not safetensors_files:
-            return False
-        with suppress(Exception):
-            safetensors_files.sort(key=lambda p: os.path.getsize(p))  # type: ignore[name-defined]
-
-        try:
-            from safetensors import safe_open  # type: ignore
-        except Exception:
-            return False
-
-        saw_dense_weight = False
-        for path in safetensors_files[:6]:
-            try:
-                with safe_open(path, framework="pt", device="cpu") as sf:
-                    for k in sf.keys():
-                        if any(k.endswith(sfx) for sfx in compressed_suffixes):
-                            return False
-                        if k.endswith(".weight"):
-                            saw_dense_weight = True
-            except Exception:
-                continue
-        return saw_dense_weight
+        return any(isinstance(k, str) and k.endswith(".weight") for k in keys)
 
     def _targets_reference_language_model(ct_cfg: object) -> bool:
         # If targets explicitly include "language_model", applying to the subtree would drop the prefix
