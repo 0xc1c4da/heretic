@@ -72,4 +72,4 @@ build-backend = "uv_build"
 module-name = "heretic"
 
 [tool.uv.sources]
-transformers = { git = "https://github.com/huggingface/transformers.git", rev = "aefa23ad1c52de9c115f3d762fe1a1eda643275a" }
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "753d61104116eefc8ffc977327b441ee0c8d599f" }
