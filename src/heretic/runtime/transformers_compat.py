@@ -19,9 +19,16 @@ from __future__ import annotations
 
 from contextlib import suppress
 from functools import wraps
+import os
 from types import SimpleNamespace
 from typing import Any, Callable
-import os
+
+from .ct_checkpoint_inspector import (
+    CheckpointKind,
+    inspect_checkpoint,
+    load_weight_map_keys,
+    should_scope_to_language_model,
+)
 
 
 def _fixed_check_model_inputs(original: Any):
@@ -273,109 +280,6 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
 
     original = current
 
-    # Heuristic: presence of any of these parameter suffixes strongly indicates that the checkpoint
-    # already contains compressed-tensors artifacts (qparams and/or packed weights).
-    # If present, we should never run the expensive in-memory `compress_model()` sweep.
-    #
-    # Notes:
-    # - Quantization params may be stored as <base>_{scale,zero_point,g_idx} where base is one of:
-    #   {weight,input,output}.
-    # - Some compressors store packed weights as `weight_packed` plus auxiliary metadata.
-    # - Sparse formats store `compressed/bitmask/...` style tensors.
-    compressed_suffixes = {
-        ".weight_scale",
-        ".weight_zero_point",
-        ".weight_g_idx",
-        ".weight_packed",
-        ".weight_shape",
-        ".weight_global_scale",
-        ".input_scale",
-        ".input_zero_point",
-        ".input_g_idx",
-        ".output_scale",
-        ".output_zero_point",
-        ".output_g_idx",
-        ".scale_packed",
-        ".meta",
-        ".compressed",
-        ".bitmask",
-        ".row_offsets",
-    }
-
-    def _collect_checkpoint_keys(checkpoint_files: object, *, max_shards: int = 8) -> list[str]:
-        """
-        Collect checkpoint parameter names cheaply.
-
-        Preference order:
-        1) Read `*.safetensors.index.json` next to the shard files (fast, complete, no tensor IO)
-        2) Fallback: open a few smallest shards and list keys (fast, partial)
-        """
-        if checkpoint_files is None:
-            return []
-        if isinstance(checkpoint_files, (str, bytes)):
-            files = [checkpoint_files]
-        elif isinstance(checkpoint_files, (list, tuple)):
-            files = list(checkpoint_files)
-        else:
-            return []
-
-        safetensors_files = [f for f in files if isinstance(f, str) and f.endswith(".safetensors")]
-        if not safetensors_files:
-            return []
-
-        # 1) Index-based (best).
-        with suppress(Exception):
-            d = os.path.dirname(safetensors_files[0])
-            for name in os.listdir(d):
-                if name.endswith(".safetensors.index.json"):
-                    import json
-
-                    idx = os.path.join(d, name)
-                    data = json.loads(open(idx, "r", encoding="utf-8").read())
-                    wm = data.get("weight_map")
-                    if isinstance(wm, dict):
-                        keys = [k for k in wm.keys() if isinstance(k, str)]
-                        if keys:
-                            return keys
-
-        # 2) Fallback: shard sampling.
-        try:
-            from safetensors import safe_open  # type: ignore
-        except Exception:
-            return []
-
-        with suppress(Exception):
-            safetensors_files.sort(key=lambda p: os.path.getsize(p))
-
-        keys: list[str] = []
-        for path in safetensors_files[: max(1, int(max_shards))]:
-            try:
-                with safe_open(path, framework="pt", device="cpu") as sf:
-                    for k in sf.keys():
-                        if isinstance(k, str):
-                            keys.append(k)
-            except Exception:
-                continue
-        return keys
-
-    def _checkpoint_looks_precompressed(checkpoint_files: object) -> bool:
-        keys = _collect_checkpoint_keys(checkpoint_files)
-        return any(isinstance(k, str) and any(k.endswith(sfx) for sfx in compressed_suffixes) for k in keys)
-
-    def _checkpoint_looks_dense_only(checkpoint_files: object) -> bool:
-        """
-        Best-effort detection that the checkpoint does *not* contain compressed artifacts.
-
-        If true, we can avoid `compress_model()` by forcing `run_compressed=False` so weights
-        load into standard dense `nn.Linear.weight` parameters.
-        """
-        keys = _collect_checkpoint_keys(checkpoint_files)
-        if not keys:
-            return False
-        if any(isinstance(k, str) and any(k.endswith(sfx) for sfx in compressed_suffixes) for k in keys):
-            return False
-        return any(isinstance(k, str) and k.endswith(".weight") for k in keys)
-
     def _targets_reference_language_model(ct_cfg: object) -> bool:
         # If targets explicitly include "language_model", applying to the subtree would drop the prefix
         # and potentially fail to match. In that case, don't subtree-restrict.
@@ -391,49 +295,110 @@ def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> 
         return False
 
     def _patched(self, model: Any, **kwargs: Any):  # noqa: ANN001
-        # Keep behavior identical to upstream, except for skipping the expensive recompress sweep.
+        """
+        Principled loader:
+        - Inspect safetensors index to classify checkpoint deterministically.
+        - Apply structure initialization only.
+        - Never fall back to `compress_model()` for unknown/mismatched cases; fail loudly.
+        """
         from compressed_tensors.quantization import apply_quantization_config  # type: ignore
 
-        ct_quantization_config = self.compressor.quantization_config
+        checkpoint_files = kwargs.get("checkpoint_files")
+        if not isinstance(checkpoint_files, (list, tuple)) or not all(
+            isinstance(x, str) for x in checkpoint_files
+        ):
+            raise RuntimeError(
+                "compressed-tensors: expected `checkpoint_files` list[str] in quantizer preprocess hook; "
+                f"got {type(checkpoint_files).__name__}."
+            )
 
-        # Auto-restrict to language model subtree for composite multimodal wrappers when safe.
+        # Best-effort extraction of format.
+        expected_format = None
+        with suppress(Exception):
+            inner = getattr(self.quantization_config, "quantization_config", None)
+            expected_format = getattr(inner, "format", None)
+        if expected_format is None:
+            with suppress(Exception):
+                expected_format = getattr(self.quantization_config, "format", None)
+
+        expect_precompressed = bool(
+            getattr(self.quantization_config, "is_quantization_compressed", False)
+            or getattr(self.quantization_config, "is_sparsification_compressed", False)
+        )
+
+        inspected = inspect_checkpoint(
+            checkpoint_files=checkpoint_files,
+            expected_format=expected_format,
+            expect_precompressed=expect_precompressed,
+        )
+
+        if inspected.index_path is None:
+            raise RuntimeError(
+                "compressed-tensors: could not locate a `*.safetensors.index.json` next to shard files; "
+                "refusing to run expensive `compress_model()` fallback.\n"
+                f"- first_shard={checkpoint_files[0] if checkpoint_files else None}\n"
+                f"- expected_format={expected_format}\n"
+                "Remediation: ensure the sharded safetensors index file is present in the same directory as the shards."
+            )
+
+        # Decide whether we can scope to language_model subtree based on index keys.
+        index_keys = load_weight_map_keys(inspected.index_path)
+        ct_quantization_config = self.compressor.quantization_config
         target_model = model
         with suppress(Exception):
             lm = getattr(model, "language_model", None)
-            if lm is not None and not _targets_reference_language_model(ct_quantization_config):
-                target_model = lm
+            if lm is not None:
+                safe_scope = should_scope_to_language_model(
+                    index_keys=index_keys,
+                    artifact_suffixes=inspected.artifacts_suffixes,
+                )
+                if safe_scope and not _targets_reference_language_model(ct_quantization_config):
+                    target_model = lm
 
-        checkpoint_files = kwargs.get("checkpoint_files")
-        # Case 1: checkpoint already contains compressed artifacts -> run compressed wrappers, skip recompress.
-        if _checkpoint_looks_precompressed(checkpoint_files):
+        if inspected.kind == CheckpointKind.PRECOMPRESSED:
             self.run_compressed = True
             with suppress(Exception):
                 if hasattr(self.quantization_config, "run_compressed"):
                     self.quantization_config.run_compressed = True
-            apply_quantization_config(target_model, ct_quantization_config, self.run_compressed)
-            logger("* compressed-tensors: checkpoint appears pre-compressed; skipping `compress_model()`.")
+            apply_quantization_config(target_model, ct_quantization_config, run_compressed=True)
+            logger(
+                "ct_loader: kind=PRECOMPRESSED "
+                f"format={inspected.expected_format} run_compressed=True recompress=skip "
+                f"index={inspected.index_path.name}"
+            )
             return
 
-        # Case 2: checkpoint looks dense-only -> force dense execution to avoid recompress.
-        if _checkpoint_looks_dense_only(checkpoint_files):
+        if inspected.kind == CheckpointKind.DENSE:
             self.run_compressed = False
             with suppress(Exception):
                 if hasattr(self.quantization_config, "run_compressed"):
                     self.quantization_config.run_compressed = False
             setattr(self, "_heretic_force_dense", True)
-            apply_quantization_config(target_model, ct_quantization_config, self.run_compressed)
-            logger("* compressed-tensors: checkpoint looks dense; forcing run_compressed=False and skipping `compress_model()`.")
+            apply_quantization_config(target_model, ct_quantization_config, run_compressed=False)
+            logger(
+                "ct_loader: kind=DENSE "
+                f"format={inspected.expected_format} run_compressed=False recompress=skip "
+                f"index={inspected.index_path.name}"
+            )
             return
 
-        # Unknown: default to upstream behavior (may be slow, but safest).
-        apply_quantization_config(target_model, ct_quantization_config, self.run_compressed)
-        logger("* compressed-tensors: checkpoint format uncertain; falling back to `compress_model()`.")
-        self.compressor.compress_model(model=target_model)
+        # INCONSISTENT/UNKNOWN: fail fast with actionable context.
+        raise RuntimeError(
+            "compressed-tensors: checkpoint format is inconsistent with configuration; refusing to run `compress_model()`.\n"
+            f"- kind={inspected.kind}\n"
+            f"- expected_format={inspected.expected_format}\n"
+            f"- index={inspected.index_path}\n"
+            f"- n_total_keys={inspected.n_total_keys}\n"
+            f"- n_dense_weight_keys={inspected.n_dense_weight}\n"
+            f"- n_expected_artifact_keys={inspected.n_expected_artifacts}\n"
+            f"- expected_artifact_suffixes={list(inspected.artifacts_suffixes)}\n"
+            "Remediation: verify you are loading the correct revision and that the shard index matches the downloaded shards."
+        )
 
     setattr(_patched, "_heretic_patched", True)
     setattr(_patched, "_heretic_original", original)
     CompressedTensorsHfQuantizer._process_model_before_weight_loading = _patched  # type: ignore[assignment]
-    logger("Enabled compressed-tensors skip-recompress shim (auto-detect).")
+    logger("Enabled principled compressed-tensors loader shim (index-based).")
 
     # Also prevent a costly/incorrect decompress sweep if we forced dense loading.
     after = getattr(CompressedTensorsHfQuantizer, "_process_model_after_weight_loading", None)
