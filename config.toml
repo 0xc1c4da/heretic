@@ -47,6 +47,30 @@ max_response_length = 100
 # orthogonal to the harmless direction is subtracted during abliteration.
 orthogonalize_direction = 20
 
+# Auto-targeting (adaptive selection of layers/experts/modules)
+#
+# This stage runs after residual means/refusal directions are computed and *before* LoRA is injected.
+# It reduces the search space (especially for huge MoE models) while preserving coverage:
+# - Select layers by separation energy: S_l = ||mu_bad - mu_good||^2
+# - Profile MoE routing on a balanced good/bad batch and select experts by differential routing
+# - (Optional) further downselect by ||v^T W|| for row_normalization in {none, pre}
+#
+# Keep this enabled for large MoE models like Kimi K2.5.
+auto_targeting = true
+#
+# Total prompt budget used for auto-targeting analysis (split evenly between good/bad).
+# Higher increases stability but costs extra forward passes.
+auto_targeting_budget_prompts = 128
+#
+# Max number of routed expert modules to include in LoRA targeting after auto-targeting.
+# Dense modules (e.g. attention o_proj) are still targeted for the selected layers.
+auto_targeting_budget_modules = 1024
+#
+# Coverage fraction used for both:
+# - selecting layers by cumulative separation energy
+# - selecting experts/modules by cumulative score coverage
+auto_targeting_coverage = 0.9
+
 # How to apply row normalization of the weights. Options:
 # 'none' (no normalization),
 # 'pre' (compute LoRA adapter relative to row-normalized weights),

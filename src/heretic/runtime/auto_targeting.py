@@ -41,9 +41,17 @@ def select_layers_by_energy_coverage(
 
     Returns (selected_layer_indices, S_vector).
     """
-    # harmless_means/harmful_means are (layer, hidden)
-    d = (harmful_means - harmless_means).to(torch.float32)
-    S = (d * d).sum(dim=1)  # (layer,)
+    # harmless_means/harmful_means are (layer_plus_embeddings, hidden) where index 0 is embeddings.
+    # We select *transformer layers* only, i.e. indices 1.., and return indices in
+    # transformer-layer space (0..n_layers-1) to match `Model.get_layers()`.
+    if harmless_means.ndim != 2 or harmful_means.ndim != 2:
+        return [], torch.zeros(0, dtype=torch.float32)
+
+    if int(harmless_means.shape[0]) <= 1 or int(harmful_means.shape[0]) <= 1:
+        return [], torch.zeros(0, dtype=torch.float32)
+
+    d = (harmful_means[1:] - harmless_means[1:]).to(torch.float32)
+    S = (d * d).sum(dim=1)  # (transformer_layer,)
     n_layers = int(S.shape[0])
 
     if n_layers == 0:

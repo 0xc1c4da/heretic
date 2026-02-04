@@ -53,7 +53,11 @@ from .runtime.auto_targeting import (
 )
 from .runtime.precision import PrecisionApplier, PrecisionPolicy
 from .runtime.quantization import QuantizationInfo, QuantizationRequest, resolve_quantization
-from .runtime.transformers_compat import ensure_compressed_tensors_fast_load, ensure_peft_compat
+from .runtime.transformers_compat import (
+    ensure_compressed_tensors_fast_load,
+    ensure_generation_compat,
+    ensure_peft_compat,
+)
 from .runtime.weight_access import WeightAccess, WeightAccessError
 from .utils import Prompt, batchify, empty_cache, print
 
@@ -253,6 +257,9 @@ class Model:
                 else:
                     self.model = loaded
 
+                # Ensure `.generate` exists for remote-code models on newer Transformers.
+                self.model = ensure_generation_compat(print, self.model)
+
                 # If we reach this point and the model requires trust_remote_code,
                 # either the user accepted, or settings.trust_remote_code is True.
                 if self.trusted_models.get(self.settings.model) is None:
@@ -295,6 +302,8 @@ class Model:
         # For composite multimodal wrappers (e.g. Kimi K2.5), Heretic operates on the
         # language model subtree only (text tasks + abliteration).
         self._unwrap_to_language_model_if_present()
+        # If we unwrapped, ensure generation exists on the language model too.
+        self.model = ensure_generation_compat(print, self.model)
 
         # LoRA is initialized later (after optional MoE expert selection). This keeps the
         # expensive adapter injection out of the critical path and allows us to target only
@@ -1201,8 +1210,11 @@ class Model:
         else:
             self.model = loaded
 
+        self.model = ensure_generation_compat(print, self.model)
+
         # Operate on language model subtree only (if present) and re-initialize LoRA.
         self._unwrap_to_language_model_if_present()
+        self.model = ensure_generation_compat(print, self.model)
         self._lora_initialized = False
         self.initialize_lora_for_abliteration(verbose=False)
 
@@ -1513,12 +1525,28 @@ class Model:
 
         # FIXME: The type checker has been disabled here because of the extremely complex
         #        interplay between different generate() signatures and dynamic delegation.
-        outputs = self.model.generate(
-            **inputs,
-            **kwargs,
-            pad_token_id=self.tokenizer.pad_token_id,
-            do_sample=False,  # Use greedy decoding to ensure deterministic outputs.
-        )  # ty:ignore[call-non-callable]
+        try:
+            outputs = self.model.generate(
+                **inputs,
+                **kwargs,
+                pad_token_id=self.tokenizer.pad_token_id,
+                do_sample=False,  # Use greedy decoding to ensure deterministic outputs.
+            )  # ty:ignore[call-non-callable]
+        except AttributeError as exc:
+            # Some remote-code models expect an older cache API (e.g. `DynamicCache.get_max_length`).
+            # Retrying with `use_cache=False` avoids cache object usage inside generation loops.
+            msg = str(exc)
+            if "DynamicCache" in msg and "get_max_length" in msg:
+                print("* Generation cache API mismatch; retrying with use_cache=False.")
+                outputs = self.model.generate(
+                    **inputs,
+                    **kwargs,
+                    use_cache=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    do_sample=False,
+                )  # ty:ignore[call-non-callable]
+            else:
+                raise
 
         return inputs, outputs
 
@@ -1557,22 +1585,59 @@ class Model:
         return responses
 
     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
-        # We only generate one token, and we return the residual vectors
-        # at that token position, for each prompt and layer.
-        _, outputs = self.generate(
-            prompts,
-            max_new_tokens=1,
-            output_hidden_states=True,
-            return_dict_in_generate=True,
+        # We return the residual vectors at the end of each prompt, for each layer.
+        #
+        # Historically this used `generate(..., max_new_tokens=1, output_hidden_states=True)`,
+        # but some remote-code models no longer reliably return hidden states from `generate`
+        # on newer Transformers builds. A direct forward pass is both faster and more robust.
+        chats = [
+            [
+                {"role": "system", "content": prompt.system},
+                {"role": "user", "content": prompt.user},
+            ]
+            for prompt in prompts
+        ]
+        chat_prompts = cast(
+            list[str],
+            self.tokenizer.apply_chat_template(
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+            ),
         )
+        if self.response_prefix:
+            chat_prompts = [prompt + self.response_prefix for prompt in chat_prompts]
 
-        # This cast is valid because GenerateDecoderOnlyOutput is the return type
-        # of model.generate with return_dict_in_generate=True.
-        outputs = cast(GenerateDecoderOnlyOutput, outputs)
+        inputs = self.tokenizer(
+            chat_prompts,
+            return_tensors="pt",
+            padding=True,
+            return_token_type_ids=False,
+            add_special_tokens=False,
+        ).to(self.model.device)
 
-        # Hidden states for the first (only) generated token.
-        # This cast is valid because we passed output_hidden_states=True above.
-        hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
+        try:
+            outputs = self.model(
+                **inputs,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        except TypeError:
+            # Fall back to config-driven flags for remote-code models with non-standard signatures.
+            if hasattr(self.model, "config"):
+                try:
+                    self.model.config.output_hidden_states = True
+                    self.model.config.return_dict = True
+                except Exception:
+                    pass
+            outputs = self.model(**inputs, use_cache=False)
+
+        hidden_states = cast(tuple[FloatTensor], getattr(outputs, "hidden_states", None))
+        if hidden_states is None:
+            raise RuntimeError(
+                "Model forward pass did not return hidden_states (required for residual extraction)."
+            )
 
         # The returned tensor has shape (prompt, layer, component).
         residuals = torch.stack(
@@ -1608,22 +1673,36 @@ class Model:
     # We work with logprobs rather than probabilities for numerical stability
     # when computing the KL divergence.
     def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
-        # We only generate one token, and we return the (log) probability distributions
-        # over the vocabulary at that token position, for each prompt.
-        _, outputs = self.generate(
-            prompts,
-            max_new_tokens=1,
-            output_scores=True,
-            return_dict_in_generate=True,
+        # Return the (log) probability distributions over the next token for each prompt.
+        # Use a direct forward pass for robustness (see `get_residuals`).
+        chats = [
+            [
+                {"role": "system", "content": prompt.system},
+                {"role": "user", "content": prompt.user},
+            ]
+            for prompt in prompts
+        ]
+        chat_prompts = cast(
+            list[str],
+            self.tokenizer.apply_chat_template(
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+            ),
         )
+        if self.response_prefix:
+            chat_prompts = [prompt + self.response_prefix for prompt in chat_prompts]
 
-        # This cast is valid because GenerateDecoderOnlyOutput is the return type
-        # of model.generate with return_dict_in_generate=True.
-        outputs = cast(GenerateDecoderOnlyOutput, outputs)
+        inputs = self.tokenizer(
+            chat_prompts,
+            return_tensors="pt",
+            padding=True,
+            return_token_type_ids=False,
+            add_special_tokens=False,
+        ).to(self.model.device)
 
-        # Logits for the first (only) generated token.
-        # This cast is valid because we passed output_scores=True above.
-        logits = cast(tuple[FloatTensor], outputs.scores)[0]
+        outputs = self.model(**inputs, use_cache=False, return_dict=True)
+        logits = cast(FloatTensor, outputs.logits)[:, -1, :]
 
         # The returned tensor has shape (prompt, token).
         return F.log_softmax(logits, dim=-1)

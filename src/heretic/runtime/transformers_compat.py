@@ -145,6 +145,52 @@ def ensure_peft_compat(logger: Callable[[str], None]) -> None:
     logger("[yellow]Patched[/] PEFT `_get_in_out_features` for compressed Linear compatibility.")
 
 
+def ensure_generation_compat(logger: Callable[[str], None], model: Any) -> Any:
+    """
+    Some remote-code models define `prepare_inputs_for_generation` but do not inherit from
+    `GenerationMixin`, and some Transformers builds no longer provide `.generate` via
+    `PreTrainedModel`.
+
+    This shim adds `GenerationMixin` to the instance's class MRO dynamically when needed.
+    It is best-effort and only activates when `.generate` is missing.
+    """
+    try:
+        from transformers.generation.utils import GenerationMixin
+        from transformers.generation.configuration_utils import GenerationConfig
+    except Exception:
+        return model
+
+    if model is None or hasattr(model, "generate"):
+        # Still ensure generation_config exists (some remote-code models rely on it).
+        if model is not None and not hasattr(model, "generation_config") and hasattr(model, "config"):
+            try:
+                model.generation_config = GenerationConfig.from_model_config(model.config)
+            except Exception:
+                pass
+        return model
+
+    if not hasattr(model, "prepare_inputs_for_generation"):
+        return model
+
+    cls = model.__class__
+    # Avoid repeated patching.
+    if GenerationMixin in getattr(cls, "__mro__", ()):
+        return model
+
+    try:
+        Patched = type(f"{cls.__name__}WithGenerationMixin", (cls, GenerationMixin), {})
+        model.__class__ = Patched
+        if not hasattr(model, "generation_config") and hasattr(model, "config"):
+            try:
+                model.generation_config = GenerationConfig.from_model_config(model.config)
+            except Exception:
+                pass
+        logger("[yellow]Patched[/] model class to include GenerationMixin (restore .generate).")
+    except Exception as exc:
+        logger(f"[yellow]GenerationMixin patch skipped[/] ({exc})")
+    return model
+
+
 def ensure_compressed_tensors_fast_load(
     logger: Callable[[str], None], *, enabled: bool = False
 ) -> None:
