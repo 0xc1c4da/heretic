@@ -27,4 +27,5 @@ fi
 
 # mkdir -p "$TMPDIR" "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$HF_DATASETS_CACHE"
 
+# uv pip install flash-attn --no-build-isolation # for kimi k2.5
 uv run heretic "$1"

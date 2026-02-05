@@ -143,6 +143,10 @@ class Model:
         # this in preflight, but Model can also be used as a library.
         ensure_transformers_checkpoint_key_prefix_filter(print)
 
+        # Respect config/env control for compressed-tensors freeze behavior in library use.
+        if bool(getattr(self.settings, "ct_allow_freeze", False)) and "HERETIC_CT_ALLOW_FREEZE" not in os.environ:
+            os.environ["HERETIC_CT_ALLOW_FREEZE"] = "1"
+
         # Always: avoid unnecessary compressed-tensors in-memory recompression on load.
         ensure_compressed_tensors_skip_recompress(print)
 
@@ -372,6 +376,27 @@ class Model:
                 # If text-only load failed, fall back to wrapper load once.
                 if self._text_only_plan is not None:
                     self._text_only_plan = None
+                    # Wrapper fallback needs wrapper-specific shims and (when flash-attn is missing)
+                    # a config override to force eager attention for the vision tower. We normally
+                    # do this earlier, but we intentionally skipped it when text-only was enabled.
+                    with suppress(Exception):
+                        _patch_kimi_remote_code_in_memory(model_id=self.settings.model)
+                    with suppress(Exception):
+                        if isinstance(self.settings.model, str) and "Kimi-K2.5" in self.settings.model:
+                            from transformers.utils import is_flash_attn_2_available
+
+                            if not is_flash_attn_2_available():
+                                cfg = AutoConfig.from_pretrained(
+                                    self.settings.model,
+                                    trust_remote_code=self.trusted_models.get(self.settings.model),
+                                )
+                                vc = getattr(cfg, "vision_config", None)
+                                if vc is not None and hasattr(vc, "_attn_implementation"):
+                                    setattr(vc, "_attn_implementation", "eager")
+                                self._load_config = cfg
+                                print(
+                                    "* flash_attn not available; forcing eager attention for Kimi K2.5 vision tower"
+                                )
                     self.model = None  # ty:ignore[invalid-assignment]
                     empty_cache()
                     print(f"[yellow]text-only failed; falling back to wrapper[/] ({error})")
