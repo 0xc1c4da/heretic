@@ -43,6 +43,7 @@ from .runtime.transformers_compat import (
     ensure_compressed_tensors_ephemeral_decompression,
     ensure_compressed_tensors_fast_load,
     ensure_remote_code_generation_mixin,
+    ensure_transformers_checkpoint_key_prefix_filter,
     ensure_transformers_cache_api_compat,
     ensure_transformers_compat,
 )
@@ -269,6 +270,8 @@ def run():
     ensure_remote_code_generation_mixin(print)
     # Preflight: remote-code cache API compatibility (e.g. `Cache.get_max_length()` alias).
     ensure_transformers_cache_api_compat(print)
+    # Preflight: filter checkpoint keys by prefix for text-only wrapper loads.
+    ensure_transformers_checkpoint_key_prefix_filter(print)
 
     # Optional preflight: speed up loading of pre-compressed compressed-tensors checkpoints.
     ensure_compressed_tensors_fast_load(print, enabled=bool(getattr(settings, "ct_fast_load", False)))

@@ -8,6 +8,7 @@ import copy
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha1
+from pathlib import Path
 from typing import Any, Type, cast
 
 import bitsandbytes as bnb
@@ -58,6 +59,7 @@ from .runtime.transformers_compat import (
     ensure_compressed_tensors_skip_recompress,
     ensure_generation_compat,
     ensure_peft_compat,
+    ensure_transformers_checkpoint_key_prefix_filter,
 )
 from .runtime.weight_access import WeightAccess, WeightAccessError
 from .utils import Prompt, batchify, empty_cache, print
@@ -137,6 +139,10 @@ class Model:
         self._maybe_materialize_tiny_checkpoint()
         print(f"Loading model [bold]{self.settings.model}[/]...")
 
+        # Ensure our opt-in checkpoint key prefix filter shim is installed. Main installs
+        # this in preflight, but Model can also be used as a library.
+        ensure_transformers_checkpoint_key_prefix_filter(print)
+
         # Always: avoid unnecessary compressed-tensors in-memory recompression on load.
         ensure_compressed_tensors_skip_recompress(print)
 
@@ -145,8 +151,66 @@ class Model:
             print, enabled=bool(getattr(self.settings, "ct_fast_load", False))
         )
 
-        # Empirical shims for Kimi remote code (text-only still instantiates vision tower).
-        _patch_kimi_remote_code_in_memory(model_id=self.settings.model)
+        # Decide if we can load a wrapper model in *text-only* mode (LM backbone directly).
+        #
+        # Many multimodal wrappers store LM weights under `language_model.*` and provide a nested
+        # `text_config`. Loading the wrapper instantiates the vision tower even for text tasks.
+        #
+        # If we can load the LM directly, we:
+        # - avoid constructing wrapper/vision modules
+        # - strip the checkpoint prefix via Transformers' `key_mapping` regex
+        self._text_only_plan: tuple[PretrainedConfig, dict[str, str], str] | None = None
+        if (
+            isinstance(self.settings.model, str)
+            and os.environ.get("HERETIC_DISABLE_TEXT_ONLY_LOADER", "").strip() != "1"
+        ):
+            try:
+                wrapper_cfg = AutoConfig.from_pretrained(
+                    self.settings.model,
+                    trust_remote_code=settings.trust_remote_code,
+                )
+                text_cfg = getattr(wrapper_cfg, "text_config", None)
+                if isinstance(text_cfg, PretrainedConfig):
+                    prefix = "language_model."
+                    # Best-effort: if we can see a sharded safetensors index, require that most keys use the prefix.
+                    ok = True
+                    with suppress(Exception):
+                        from transformers.utils.hub import cached_file  # type: ignore
+
+                        idx_path = cached_file(
+                            self.settings.model,
+                            "model.safetensors.index.json",
+                            _raise_exceptions_for_missing_entries=False,
+                            _raise_exceptions_for_gated_repo=False,
+                            _raise_exceptions_for_connection_errors=False,
+                        )
+                        if isinstance(idx_path, str) and os.path.exists(idx_path):
+                            data = json.loads(Path(idx_path).read_text(encoding="utf-8"))
+                            wm = data.get("weight_map") if isinstance(data, dict) else None
+                            keys = [k for k in (wm or {}).keys() if isinstance(k, str)]
+                            if keys:
+                                frac = sum(1 for k in keys if k.startswith(prefix)) / max(1, len(keys))
+                                ok = frac >= 0.90
+
+                    if ok:
+                        # Make sure downstream shims (compressed-tensors loader) can resolve the model ID
+                        # even if `text_config._name_or_path` was empty in the wrapper config.
+                        with suppress(Exception):
+                            setattr(text_cfg, "name_or_path", self.settings.model)
+                        with suppress(Exception):
+                            setattr(text_cfg, "_name_or_path", self.settings.model)
+                        # Opt-in for loader shim: filter checkpoint metadata to keys under the prefix.
+                        with suppress(Exception):
+                            setattr(text_cfg, "_heretic_checkpoint_key_prefix", prefix)
+
+                        key_mapping = {r"^language_model\.": ""}
+                        self._text_only_plan = (text_cfg, key_mapping, prefix)
+            except Exception:
+                self._text_only_plan = None
+
+        # Wrapper-only shims (Kimi K2.5 vision tower init quirks) are only needed if we load the wrapper.
+        if self._text_only_plan is None:
+            _patch_kimi_remote_code_in_memory(model_id=self.settings.model)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.settings.model,
@@ -185,7 +249,11 @@ class Model:
         # the vision tower defaults to FlashAttention2, but flash_attn may not be installed.
         # If flash_attn is unavailable, force eager attention via an explicit config.
         self._load_config: PretrainedConfig | None = None
-        if isinstance(self.settings.model, str) and "Kimi-K2.5" in self.settings.model:
+        if (
+            self._text_only_plan is None
+            and isinstance(self.settings.model, str)
+            and "Kimi-K2.5" in self.settings.model
+        ):
             try:
                 from transformers.utils import is_flash_attn_2_available
 
@@ -251,10 +319,22 @@ class Model:
                 ):
                     load_kwargs["attn_implementation"] = "eager"
 
-                loaded = get_model_class(self.settings.model).from_pretrained(
-                    self.settings.model,
-                    **load_kwargs,
-                )
+                if self._text_only_plan is not None:
+                    text_cfg, key_mapping, prefix = self._text_only_plan
+                    # Ensure we don't accidentally reuse wrapper-specific config overrides.
+                    load_kwargs.pop("config", None)
+                    print(f"[cyan]text-only[/] (strip_prefix={prefix}) ", end="")
+                    loaded = AutoModelForCausalLM.from_pretrained(
+                        self.settings.model,
+                        config=text_cfg,
+                        key_mapping=key_mapping,
+                        **load_kwargs,
+                    )
+                else:
+                    loaded = get_model_class(self.settings.model).from_pretrained(
+                        self.settings.model,
+                        **load_kwargs,
+                    )
                 if self._print_loading_info and isinstance(loaded, tuple) and len(loaded) == 2:
                     self.model, loading_info = loaded
                     self._log_loading_info(loading_info)
@@ -289,6 +369,13 @@ class Model:
                     compute_dtype=self.compute_dtype,
                 ).apply(self.model)
             except Exception as error:
+                # If text-only load failed, fall back to wrapper load once.
+                if self._text_only_plan is not None:
+                    self._text_only_plan = None
+                    self.model = None  # ty:ignore[invalid-assignment]
+                    empty_cache()
+                    print(f"[yellow]text-only failed; falling back to wrapper[/] ({error})")
+                    continue
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
                 print(f"[red]Failed[/] ({error})")

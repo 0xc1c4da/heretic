@@ -453,6 +453,13 @@ def materialize_tiny_kimi_k25_repo(
             existing_vocab = existing_text_cfg.get(
                 "vocab_size", existing_cfg.get("vocab_size")
             )
+            # Ensure text_config has remote-code glue for AutoModelForCausalLM. If not,
+            # the text-only loader will incorrectly select the built-in DeepSeek model.
+            existing_text_auto_map = existing_text_cfg.get("auto_map", None) or {}
+            has_text_auto_causal = (
+                isinstance(existing_text_auto_map, dict)
+                and "AutoModelForCausalLM" in existing_text_auto_map
+            )
 
             # If we change the tiny-spec defaults, we should regenerate rather than
             # silently reusing stale weights/config.
@@ -465,6 +472,7 @@ def materialize_tiny_kimi_k25_repo(
                 int(existing_vocab) == int(expected_vocab)
                 and int(existing_n_group) == expected_n_group
                 and int(existing_topk_group) == expected_topk_group
+                and has_text_auto_causal
             ):
                 return out_dir
         except Exception:
@@ -536,6 +544,15 @@ def materialize_tiny_kimi_k25_repo(
         rope_scaling={"type": "linear", "factor": 1.0},
         _attn_implementation="eager",
     )
+    # Remote-code glue for the text backbone. Without this, AutoModel will pick the
+    # built-in `transformers.models.deepseek_v3.*` implementation, which does not match
+    # Kimi's vendored DeepSeek code.
+    text_config.architectures = ["DeepseekV3ForCausalLM"]
+    text_config.auto_map = {
+        "AutoConfig": "configuration_deepseek.DeepseekV3Config",
+        "AutoModel": "modeling_deepseek.DeepseekV3Model",
+        "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM",
+    }
 
     vision_config = {
         "patch_size": spec.patch_size,

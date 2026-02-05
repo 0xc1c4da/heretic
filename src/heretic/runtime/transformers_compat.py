@@ -33,6 +33,167 @@ from .ct_checkpoint_inspector import (
     should_scope_to_language_model,
 )
 
+
+def ensure_transformers_checkpoint_key_prefix_filter(logger: Callable[[str], None]) -> None:
+    """
+    Speed up and stabilize loading of *subtree* checkpoints with a key prefix.
+
+    Use case (text-only loading from multimodal repos):
+    - Some repos store LM weights under a prefix like `language_model.*` alongside large
+      non-LM weights (vision tower, projector, etc.).
+    - When we instantiate the LM backbone directly and use `key_mapping` to strip the
+      prefix, Transformers' loader may still:
+        1) spend time computing huge `unexpected_keys` lists, and
+        2) mis-detect the "task/base" prefix state because `base_model_prefix` (often
+           `"model"`) does not match keys like `language_model.model.*`, which can lead
+           to incorrect prefix injection (e.g. `model.model.*`).
+
+    This shim activates only when the model config sets:
+      - `config._heretic_checkpoint_key_prefix = "language_model."`  (example)
+
+    When active, it:
+    - filters checkpoint key metadata (sharded_metadata/state_dict) to only prefixed keys
+    - temporarily sets `model.base_model_prefix = ""` during load to disable the special
+      task/base prefix logic that would otherwise corrupt key names
+    """
+    try:
+        from transformers.modeling_utils import PreTrainedModel  # type: ignore
+    except Exception:
+        return
+
+    cm = PreTrainedModel.__dict__.get("_load_pretrained_model")
+    if not isinstance(cm, classmethod):
+        return
+    original = cm.__func__
+    if getattr(original, "_heretic_patched", False):
+        return
+
+    def _patched(  # noqa: PLR0913
+        cls,  # noqa: ANN001
+        model: Any,
+        state_dict: Any,  # noqa: ANN401
+        checkpoint_files: Any,  # noqa: ANN401
+        pretrained_model_name_or_path: Any,  # noqa: ANN401
+        ignore_mismatched_sizes: bool = False,
+        sharded_metadata: Any = None,  # noqa: ANN401
+        device_map: Any = None,  # noqa: ANN401
+        disk_offload_folder: Any = None,  # noqa: ANN401
+        dtype: Any = None,  # noqa: ANN401
+        hf_quantizer: Any = None,  # noqa: ANN401
+        keep_in_fp32_regex: Any = None,  # noqa: ANN401
+        device_mesh: Any = None,  # noqa: ANN401
+        key_mapping: Any = None,  # noqa: ANN401
+        weights_only: bool = True,
+    ):
+        cfg = getattr(model, "config", None)
+        prefix = getattr(cfg, "_heretic_checkpoint_key_prefix", None)
+        # Fallback: if the marker doesn't survive config deepcopy, infer from key_mapping.
+        if not isinstance(prefix, str) or not prefix:
+            try:
+                if isinstance(key_mapping, dict):
+                    for pat, repl in key_mapping.items():
+                        if not (isinstance(pat, str) and isinstance(repl, str)):
+                            continue
+                        # We only support the specific form we emit: strip `language_model.` at start.
+                        if repl == "" and pat in {r"^language_model\.", r"^language_model\\."}:
+                            prefix = "language_model."
+                            break
+            except Exception:
+                prefix = None
+
+        if not isinstance(prefix, str) or not prefix:
+            return original(
+                cls,
+                model,
+                state_dict,
+                checkpoint_files,
+                pretrained_model_name_or_path,
+                ignore_mismatched_sizes=ignore_mismatched_sizes,
+                sharded_metadata=sharded_metadata,
+                device_map=device_map,
+                disk_offload_folder=disk_offload_folder,
+                dtype=dtype,
+                hf_quantizer=hf_quantizer,
+                keep_in_fp32_regex=keep_in_fp32_regex,
+                device_mesh=device_mesh,
+                key_mapping=key_mapping,
+                weights_only=weights_only,
+            )
+
+        # Log once per process for observability.
+        if not getattr(_patched, "_heretic_logged_active", False):
+            try:
+                logger(f"* transformers: checkpoint key prefix filter active (prefix={prefix})")
+            except Exception:
+                pass
+            setattr(_patched, "_heretic_logged_active", True)
+
+        # Filter key metadata aggressively to avoid giant unexpected_keys costs.
+        try:
+            if isinstance(state_dict, dict):
+                state_dict = {
+                    k: v
+                    for k, v in state_dict.items()
+                    if isinstance(k, str) and k.startswith(prefix)
+                }
+        except Exception:
+            pass
+
+        try:
+            if isinstance(sharded_metadata, dict):
+                new_meta = dict(sharded_metadata)
+                all_keys = new_meta.get("all_checkpoint_keys", None)
+                filtered: list[str] | None = None
+                if isinstance(all_keys, list):
+                    filtered = [k for k in all_keys if isinstance(k, str) and k.startswith(prefix)]
+                    new_meta["all_checkpoint_keys"] = filtered
+                weight_map = new_meta.get("weight_map", None)
+                if isinstance(weight_map, dict) and filtered is not None:
+                    keep = set(filtered)
+                    new_meta["weight_map"] = {k: v for k, v in weight_map.items() if k in keep}
+                sharded_metadata = new_meta
+        except Exception:
+            pass
+
+        # Prevent Transformers' task/base prefix injection from corrupting keys like
+        # `language_model.model.*` when base_model_prefix is `model`.
+        had_instance_attr = "base_model_prefix" in getattr(model, "__dict__", {})
+        old_bmp = getattr(model, "base_model_prefix", None)
+        try:
+            setattr(model, "base_model_prefix", "")
+            return original(
+                cls,
+                model,
+                state_dict,
+                checkpoint_files,
+                pretrained_model_name_or_path,
+                ignore_mismatched_sizes=ignore_mismatched_sizes,
+                sharded_metadata=sharded_metadata,
+                device_map=device_map,
+                disk_offload_folder=disk_offload_folder,
+                dtype=dtype,
+                hf_quantizer=hf_quantizer,
+                keep_in_fp32_regex=keep_in_fp32_regex,
+                device_mesh=device_mesh,
+                key_mapping=key_mapping,
+                weights_only=weights_only,
+            )
+        finally:
+            try:
+                if had_instance_attr:
+                    setattr(model, "base_model_prefix", old_bmp)
+                else:
+                    # Restore class default lookup.
+                    if "base_model_prefix" in getattr(model, "__dict__", {}):
+                        delattr(model, "base_model_prefix")
+            except Exception:
+                pass
+
+    setattr(_patched, "_heretic_patched", True)
+    setattr(_patched, "_heretic_original", original)
+    PreTrainedModel._load_pretrained_model = classmethod(_patched)  # type: ignore[assignment]
+    logger("* transformers: enabled checkpoint key prefix filter shim")
+
 def ensure_transformers_cache_api_compat(logger: Callable[[str], None]) -> None:
     """
     Patch Transformers cache API drift for remote-code models.

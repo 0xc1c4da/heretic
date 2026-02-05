@@ -32,13 +32,22 @@ trust_remote_code = true
 quantization = "auto"
 
 # Memory limits to impose. 0 is usually your first graphics card.
-# max_memory = {0 = "16GB", "cpu" = "64GB"}
+# Units are parsed by Accelerate and support both:
+# - binary: "GiB"/"MiB"/"KiB"
+# - decimal: "GB"/"MB"/"KB"
+#
+# 8x H200 SXM: gpustat reports 143771 MiB (~140.4 GiB) per GPU.
+# Keep ~30 GiB headroom => cap at ~110 GiB per GPU.
+max_memory = {0="110GiB", 1="110GiB", 2="110GiB", 3="110GiB", 4="110GiB", 5="110GiB", 6="110GiB", 7="110GiB", cpu="1200GiB"}
+
+ct_fast_load = true
+ct_allow_freeze = true
 
 # Number of input sequences to process in parallel (0 = auto).
-batch_size = auto
+batch_size = 0
 
 # Maximum batch size to try when automatically determining the optimal batch size.
-max_batch_size = 128
+max_batch_size = 32
 
 # Maximum number of tokens to generate for each response.
 max_response_length = 100
