@@ -574,7 +574,8 @@ def ensure_compressed_tensors_fast_load(
 
 def ensure_compressed_tensors_ephemeral_decompression(logger: Callable[[str], None]) -> None:
     """
-    Prevent `compressed-tensors` from "freezing" dense expert weights into VRAM.
+    Prevent `compressed-tensors` from "freezing" dense expert weights into VRAM, while
+    opportunistically caching a bounded working-set to improve throughput.
 
     Why this is needed:
     - `compressed_tensors.linear.CompressedLinear.forward()` currently decompresses a compressed
@@ -584,9 +585,12 @@ def ensure_compressed_tensors_ephemeral_decompression(logger: Callable[[str], No
       each visited expert permanently materializes multiple large dense matrices.
 
     What we do:
-    - Monkey-patch `CompressedLinear.forward` to keep decompression *ephemeral*:
-      decompress -> run `F.linear` -> drop the temporary tensor.
-    - This trades throughput for bounded VRAM.
+    - Monkey-patch `CompressedLinear.forward` to *never* register a persistent `weight`
+      parameter (no `FROZEN`), avoiding monotonic VRAM growth.
+    - Use a per-device byte-budgeted LRU cache for the decompressed dense weights:
+      decompress -> (optional cache insert) -> `F.linear`.
+    - Cache admission is safety-checked against a headroom margin, so caching cannot be the
+      reason we OOM; it gracefully degrades to ephemeral behavior.
 
     Opt-out:
     - Set `HERETIC_CT_ALLOW_FREEZE=1` to keep upstream freezing behavior.
@@ -601,6 +605,7 @@ def ensure_compressed_tensors_ephemeral_decompression(logger: Callable[[str], No
             CompressedLinear,
         )
         from compressed_tensors.quantization import QuantizationStatus  # type: ignore
+        from .ct_decompress_cache import GLOBAL_CT_CACHE
     except Exception:
         return
 
@@ -615,12 +620,31 @@ def ensure_compressed_tensors_ephemeral_decompression(logger: Callable[[str], No
         # register it as a persistent parameter (which would "freeze" it into VRAM).
         try:
             if getattr(self, "quantization_status", None) == QuantizationStatus.COMPRESSED:
+                dev = getattr(input, "device", None)
+                if dev is None or getattr(dev, "type", None) != "cuda":
+                    w = self.compressor.decompress_module(self)
+                    if w is None:
+                        return _linear(input, self.weight, self.bias)
+                    if getattr(w, "device", None) != dev:
+                        w = w.to(dev)
+                    return _linear(input, w, self.bias)
+
+                device_index = int(getattr(dev, "index", 0) or 0)
+                key = (device_index, id(self))
+                cached = GLOBAL_CT_CACHE.get(device_index=device_index, key=key)
+                if cached is not None:
+                    GLOBAL_CT_CACHE.maybe_log(logger, device_index=device_index)
+                    return _linear(input, cached, self.bias)
+
                 w = self.compressor.decompress_module(self)
                 if w is None:
                     # Best-effort fallback if compressor refuses to decompress.
                     return _linear(input, self.weight, self.bias)
-                if getattr(w, "device", None) != getattr(input, "device", None):
-                    w = w.to(input.device)
+                if getattr(w, "device", None) != dev:
+                    w = w.to(dev)
+
+                GLOBAL_CT_CACHE.maybe_put(device_index=device_index, key=key, tensor=w)
+                GLOBAL_CT_CACHE.maybe_log(logger, device_index=device_index)
                 return _linear(input, w, self.bias)
         except Exception:
             # Fall back to the original implementation if anything unexpected happens.

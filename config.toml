@@ -41,7 +41,9 @@ quantization = "auto"
 max_memory = {0="110GiB", 1="110GiB", 2="110GiB", 3="110GiB", 4="110GiB", 5="110GiB", 6="110GiB", 7="110GiB", cpu="1200GiB"}
 
 ct_fast_load = true
-ct_allow_freeze = true
+# For Kimi K2.5 (MoE), allowing freeze can cause monotonic VRAM growth and OOM.
+# Keep this false to bound VRAM; decompression will be ephemeral.
+ct_allow_freeze = false
 
 # Number of input sequences to process in parallel (0 = auto).
 batch_size = 0

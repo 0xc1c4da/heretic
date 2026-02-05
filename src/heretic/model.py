@@ -61,6 +61,7 @@ from .runtime.transformers_compat import (
     ensure_peft_compat,
     ensure_transformers_checkpoint_key_prefix_filter,
 )
+from .runtime.ct_decompress_cache import GLOBAL_CT_CACHE
 from .runtime.weight_access import WeightAccess, WeightAccessError
 from .utils import Prompt, batchify, empty_cache, print
 
@@ -372,6 +373,11 @@ class Model:
                     print,
                     compute_dtype=self.compute_dtype,
                 ).apply(self.model)
+
+                # Configure compressed-tensors decompression cache budgets (per-device) after load.
+                # This is a no-op if max_memory is not configured or CUDA is unavailable.
+                with suppress(Exception):
+                    GLOBAL_CT_CACHE.configure_from_max_memory(print, max_memory=self.max_memory)
             except Exception as error:
                 # If text-only load failed, fall back to wrapper load once.
                 if self._text_only_plan is not None:
@@ -1126,6 +1132,11 @@ class Model:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
+        # Merge/export changes the module graph. Drop any cached decompressed weights to avoid
+        # retaining stale tensors keyed by module identity.
+        with suppress(Exception):
+            GLOBAL_CT_CACHE.clear_all()
+
         is_quantized = bool(self.quant is not None and self.quant.is_quantized)
 
         # Prefer preserving quantization when possible and correct.
@@ -1285,6 +1296,10 @@ class Model:
             return
 
         dtype = self.model.dtype
+
+        # Full reload path: drop any cached decompressed weights from the previous model instance.
+        with suppress(Exception):
+            GLOBAL_CT_CACHE.clear_all()
 
         # Purge existing model object from memory to make space.
         self.model = None  # ty:ignore[invalid-assignment]
