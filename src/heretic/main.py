@@ -40,8 +40,10 @@ from .config import Settings
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .runtime.transformers_compat import (
+    ensure_compressed_tensors_ephemeral_decompression,
     ensure_compressed_tensors_fast_load,
     ensure_remote_code_generation_mixin,
+    ensure_transformers_cache_api_compat,
     ensure_transformers_compat,
 )
 from .utils import (
@@ -265,9 +267,13 @@ def run():
     # Preflight: ensure remote-code models that implement `prepare_inputs_for_generation`
     # also inherit GenerationMixin under Transformers >=4.50 (enables generation_config loading).
     ensure_remote_code_generation_mixin(print)
+    # Preflight: remote-code cache API compatibility (e.g. `Cache.get_max_length()` alias).
+    ensure_transformers_cache_api_compat(print)
 
     # Optional preflight: speed up loading of pre-compressed compressed-tensors checkpoints.
     ensure_compressed_tensors_fast_load(print, enabled=bool(getattr(settings, "ct_fast_load", False)))
+    # Preflight: avoid permanent dense weight materialization ("freeze") for compressed-tensors Linear.
+    ensure_compressed_tensors_ephemeral_decompression(print)
 
     # We do our own trial logging, so we don't need the INFO messages
     # about parameters and results.

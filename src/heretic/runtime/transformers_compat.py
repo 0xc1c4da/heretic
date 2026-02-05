@@ -33,6 +33,47 @@ from .ct_checkpoint_inspector import (
     should_scope_to_language_model,
 )
 
+def ensure_transformers_cache_api_compat(logger: Callable[[str], None]) -> None:
+    """
+    Patch Transformers cache API drift for remote-code models.
+
+    Kimi/DeepSeek remote code expects `past_key_values.get_max_length()`, but Transformers 4.57.6
+    renamed/standardized this as `Cache.get_max_cache_shape()`.
+
+    We add a small alias on the Cache base class:
+    - return `None` for dynamic/unbounded caches (where max_cache_shape is negative)
+    - otherwise return a positive int
+    """
+    try:
+        from transformers.cache_utils import Cache  # type: ignore
+    except Exception:
+        return
+
+    if hasattr(Cache, "get_max_length"):
+        return
+
+    def _get_max_length(self: Any, layer_idx: int = 0) -> int | None:  # noqa: ANN401
+        try:
+            m = self.get_max_cache_shape(layer_idx)  # type: ignore[misc]
+        except TypeError:
+            # Older signatures might not accept a layer index.
+            m = self.get_max_cache_shape()  # type: ignore[misc]
+        except Exception:
+            return None
+
+        try:
+            mi = int(m)
+        except Exception:
+            return None
+        # Transformers uses negative to mean "unbounded".
+        if mi < 0:
+            return None
+        return mi
+
+    setattr(_get_max_length, "_heretic_patched", True)
+    Cache.get_max_length = _get_max_length  # type: ignore[attr-defined]
+    logger("* transformers: patched Cache.get_max_length() compatibility alias")
+
 def ensure_remote_code_generation_mixin(logger: Callable[[str], None]) -> None:
     """
     Make remote-code generative models compatible with Transformers >=4.50.
@@ -368,6 +409,69 @@ def ensure_compressed_tensors_fast_load(
     setattr(_apply_quantization_config_fast, "_heretic_original", original)
     apply_mod.apply_quantization_config = _apply_quantization_config_fast  # type: ignore[assignment]
     logger("Enabled compressed-tensors fast-load shim (experimental).")
+
+
+def ensure_compressed_tensors_ephemeral_decompression(logger: Callable[[str], None]) -> None:
+    """
+    Prevent `compressed-tensors` from "freezing" dense expert weights into VRAM.
+
+    Why this is needed:
+    - `compressed_tensors.linear.CompressedLinear.forward()` currently decompresses a compressed
+      weight once, registers it as a real `Parameter` (`weight`), and flips the module's
+      `quantization_status` to `FROZEN`.
+    - For MoE models (like Kimi K2.5), visiting many experts causes *monotonic* VRAM growth:
+      each visited expert permanently materializes multiple large dense matrices.
+
+    What we do:
+    - Monkey-patch `CompressedLinear.forward` to keep decompression *ephemeral*:
+      decompress -> run `F.linear` -> drop the temporary tensor.
+    - This trades throughput for bounded VRAM.
+
+    Opt-out:
+    - Set `HERETIC_CT_ALLOW_FREEZE=1` to keep upstream freezing behavior.
+    """
+    if os.environ.get("HERETIC_CT_ALLOW_FREEZE", "").strip() == "1":
+        return
+
+    try:
+        from torch.nn.functional import linear as _linear
+
+        from compressed_tensors.linear.compressed_linear import (  # type: ignore
+            CompressedLinear,
+        )
+        from compressed_tensors.quantization import QuantizationStatus  # type: ignore
+    except Exception:
+        return
+
+    current = getattr(CompressedLinear, "forward", None)
+    if current is None:
+        return
+    if getattr(current, "_heretic_patched", False):
+        return
+
+    def _forward(self: Any, input: Any) -> Any:  # noqa: ANN401
+        # If the layer is still compressed, decompress to a temporary tensor and do NOT
+        # register it as a persistent parameter (which would "freeze" it into VRAM).
+        try:
+            if getattr(self, "quantization_status", None) == QuantizationStatus.COMPRESSED:
+                w = self.compressor.decompress_module(self)
+                if w is None:
+                    # Best-effort fallback if compressor refuses to decompress.
+                    return _linear(input, self.weight, self.bias)
+                if getattr(w, "device", None) != getattr(input, "device", None):
+                    w = w.to(input.device)
+                return _linear(input, w, self.bias)
+        except Exception:
+            # Fall back to the original implementation if anything unexpected happens.
+            return current(self, input)
+
+        # Already frozen (or non-standard status): behave like a normal Linear.
+        return _linear(input, self.weight, self.bias)
+
+    setattr(_forward, "_heretic_patched", True)
+    setattr(_forward, "_heretic_original", current)
+    CompressedLinear.forward = _forward  # type: ignore[assignment]
+    logger("* compressed-tensors: patched CompressedLinear to avoid frozen dense weights (ephemeral decompression)")
 
 
 def ensure_compressed_tensors_skip_recompress(logger: Callable[[str], None]) -> None:

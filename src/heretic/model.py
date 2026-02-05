@@ -1566,11 +1566,20 @@ class Model:
         self,
         prompts: list[Prompt],
         skip_special_tokens: bool = False,
+        *,
+        max_new_tokens: int | None = None,
+        use_cache: bool | None = None,
     ) -> list[str]:
-        inputs, outputs = self.generate(
-            prompts,
-            max_new_tokens=self.settings.max_response_length,
+        gen_kwargs: dict[str, Any] = {}
+        gen_kwargs["max_new_tokens"] = (
+            int(max_new_tokens)
+            if max_new_tokens is not None
+            else int(self.settings.max_response_length)
         )
+        if use_cache is not None:
+            gen_kwargs["use_cache"] = bool(use_cache)
+
+        inputs, outputs = self.generate(prompts, **gen_kwargs)
 
         return self.tokenizer.batch_decode(
             # Extract the newly generated part.
@@ -1584,13 +1593,20 @@ class Model:
         self,
         prompts: list[Prompt],
         skip_special_tokens: bool = False,
+        *,
+        batch_size: int | None = None,
+        max_new_tokens: int | None = None,
+        use_cache: bool | None = None,
     ) -> list[str]:
         responses = []
 
-        for batch in batchify(prompts, self.settings.batch_size):
+        bs = int(batch_size) if batch_size is not None else int(self.settings.batch_size)
+        for batch in batchify(prompts, bs):
             for response in self.get_responses(
                 batch,
                 skip_special_tokens=skip_special_tokens,
+                max_new_tokens=max_new_tokens,
+                use_cache=use_cache,
             ):
                 responses.append(response)
 
