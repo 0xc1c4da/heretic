@@ -20,3 +20,6 @@ wheels/
 
 # Study checkpoints
 /checkpoints/*.jsonl
+
+# References
+/references/

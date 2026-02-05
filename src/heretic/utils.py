@@ -3,7 +3,9 @@
 
 import gc
 import getpass
+import hashlib
 import os
+import struct
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
@@ -29,6 +31,18 @@ from rich.console import Console
 from .config import DatasetSpecification, Settings
 
 print = Console(highlight=False).print
+
+
+def sha256_token_ids(token_ids: list[int]) -> str:
+    """Stable hash of token IDs (little-endian uint32 stream).
+
+    Matches the format used by the SGLang backend patches.
+    """
+
+    h = hashlib.sha256()
+    for tid in token_ids:
+        h.update(struct.pack("<I", int(tid)))
+    return h.hexdigest()
 
 
 def print_memory_usage():

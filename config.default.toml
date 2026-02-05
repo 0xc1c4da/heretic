@@ -126,6 +126,10 @@ refusal_markers = [
 # System prompt to use when prompting the model.
 system_prompt = "You are a helpful assistant."
 
+# Run backend startup validations before the main run.
+# (Can also be enabled via HERETIC_VALIDATE_BACKEND=1.)
+validate_backend = false
+
 # Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).
 [good_prompts]
 dataset = "mlabonne/harmless_alpaca"

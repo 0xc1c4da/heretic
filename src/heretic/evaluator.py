@@ -29,7 +29,7 @@ class Evaluator:
         print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded")
 
         print("* Obtaining first-token probability distributions...")
-        self.base_logprobs = model.get_logprobs_batched(self.good_prompts)
+        self.base_logprobs = self._get_first_token_logprobs(self.good_prompts)
 
         print()
         print(
@@ -94,7 +94,7 @@ class Evaluator:
 
     def get_score(self) -> tuple[tuple[float, float], float, int]:
         print("  * Obtaining first-token probability distributions...")
-        logprobs = self.model.get_logprobs_batched(self.good_prompts)
+        logprobs = self._get_first_token_logprobs(self.good_prompts)
         kl_divergence = F.kl_div(
             logprobs,
             self.base_logprobs,
@@ -123,3 +123,12 @@ class Evaluator:
         )
 
         return score, kl_divergence, refusals
+
+    def _get_first_token_logprobs(self, prompts: list[Prompt]) -> Tensor:
+        input_ids_batch = self.model.encode_prompts(prompts)
+        result = self.model.backend.score(input_ids_batch)
+        if result.logprobs_full is None:
+            raise NotImplementedError(
+                "Backend does not provide full-vocab logprobs needed for KL computation."
+            )
+        return result.logprobs_full
