@@ -218,6 +218,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    ct_allow_freeze: bool = Field(
+        default=False,
+        description=(
+            "If true, allow `compressed-tensors` to permanently materialize dense weights on first use "
+            "(\"freeze\" behavior). This can improve throughput but may cause monotonic VRAM growth for MoE "
+            "models. If false (default), Heretic keeps decompression ephemeral to bound VRAM."
+        ),
+    )
+
     precision_policy: str = Field(
         default="auto",
         description=(

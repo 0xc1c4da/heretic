@@ -276,6 +276,8 @@ def run():
     # Optional preflight: speed up loading of pre-compressed compressed-tensors checkpoints.
     ensure_compressed_tensors_fast_load(print, enabled=bool(getattr(settings, "ct_fast_load", False)))
     # Preflight: avoid permanent dense weight materialization ("freeze") for compressed-tensors Linear.
+    if bool(getattr(settings, "ct_allow_freeze", False)) and "HERETIC_CT_ALLOW_FREEZE" not in os.environ:
+        os.environ["HERETIC_CT_ALLOW_FREEZE"] = "1"
     ensure_compressed_tensors_ephemeral_decompression(print)
 
     # We do our own trial logging, so we don't need the INFO messages
