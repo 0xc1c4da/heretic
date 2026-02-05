@@ -36,7 +36,8 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod, Settings
+from .config import BackendType, QuantizationMethod, Settings
+from .backend.validation import run_startup_validations
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .utils import (
@@ -395,6 +396,19 @@ def run():
     else:
         print("* None found")
 
+    # Phase 8: optional backend validations (startup sanity checks).
+    # Enable via config (`validate_backend = true`) or env var (`HERETIC_VALIDATE_BACKEND=1`).
+    if settings.validate_backend:
+        print()
+        print("Running backend startup validations...")
+        run_startup_validations(
+            backend=model.backend,
+            prompts=good_prompts,
+            encode_prompts=model.encode_prompts,
+            baseline_residuals_fn=model.get_residuals,
+        )
+        print("* Backend validations passed")
+
     evaluator = Evaluator(settings, model)
 
     if settings.evaluate_model is not None:
@@ -526,9 +540,26 @@ def run():
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        backend_type = getattr(settings, "backend", BackendType.LOCAL)
+        if backend_type == BackendType.LOCAL:
+            model.abliterate(refusal_directions, direction_index, parameters)
+        else:
+            # Backend path: build adapter tensors locally, load into backend, evaluate, then unload.
+            adapter_name = f"trial_{trial_index}"
+            tensors = model.abliterate(
+                refusal_directions,
+                direction_index,
+                parameters,
+                export_tensors=True,
+            )
+            assert tensors is not None
+            # Minimal config; backend-specific loader may require additional fields later.
+            config = {"r": model.peft_config.r, "lora_alpha": model.peft_config.lora_alpha}
+            model.backend.load_adapter(name=adapter_name, tensors=tensors, config=config)
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
+        if backend_type != BackendType.LOCAL:
+            model.backend.unload_adapter(name=adapter_name)
 
         elapsed_time = time.perf_counter() - start_time
         remaining_time = (elapsed_time / (trial_index - start_index)) * (

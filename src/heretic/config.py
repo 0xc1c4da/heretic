@@ -26,6 +26,11 @@ class RowNormalization(str, Enum):
     FULL = "full"
 
 
+class BackendType(str, Enum):
+    LOCAL = "local"
+    SGLANG = "sglang"
+
+
 class DatasetSpecification(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
@@ -63,6 +68,29 @@ class DatasetSpecification(BaseModel):
 
 class Settings(BaseSettings):
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
+
+    backend: BackendType = Field(
+        default=BackendType.LOCAL,
+        description="Execution backend. 'local' runs HF in-process; 'sglang' uses an external SGLang server.",
+    )
+
+    validate_backend: bool = Field(
+        default=False,
+        description=(
+            "Run backend startup validations before the main run. "
+            "Can also be enabled via HERETIC_VALIDATE_BACKEND=1."
+        ),
+    )
+
+    sglang_url: str = Field(
+        default="http://localhost:30000",
+        description="SGLang server base URL when backend='sglang'.",
+    )
+
+    sglang_admin_url: str | None = Field(
+        default=None,
+        description="Optional separate base URL for SGLang admin endpoints (LoRA, compute_vtw). Defaults to sglang_url.",
+    )
 
     evaluate_model: str | None = Field(
         default=None,

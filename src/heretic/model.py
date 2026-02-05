@@ -29,8 +29,10 @@ from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
 
-from .config import QuantizationMethod, RowNormalization, Settings
-from .utils import Prompt, batchify, empty_cache, print
+from .config import BackendType, QuantizationMethod, RowNormalization, Settings
+from .backend.hf_local import HFLocalBackend
+from .backend.base import HereticBackend
+from .utils import Prompt, batchify, empty_cache, print, sha256_token_ids
 
 
 def get_model_class(
@@ -56,6 +58,7 @@ class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
     peft_config: LoraConfig
+    backend: HereticBackend
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -63,92 +66,27 @@ class Model:
         self.needs_reload = False
 
         print()
-        print(f"Loading model [bold]{settings.model}[/]...")
+        backend_type = getattr(settings, "backend", BackendType.LOCAL)
+        if backend_type != BackendType.LOCAL:
+            raise NotImplementedError(
+                "Non-local backends are wired later in the refactor; set backend='local' for now."
+            )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            settings.model,
-            trust_remote_code=settings.trust_remote_code,
-        )
-
-        # Fallback for tokenizers that don't declare a special pad token.
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # CRITICAL: Always use left-padding for decoder-only models during generation.
-        #           Right-padding causes empty outputs because the model sees PAD tokens
-        #           after the prompt and thinks the sequence is complete.
-        self.tokenizer.padding_side = "left"
-
-        self.model = None  # ty:ignore[invalid-assignment]
+        # Local execution: delegate model loading + quantization + LoRA init to HFLocalBackend.
+        self.backend = HFLocalBackend(settings)
+        # Expose underlying model/tokenizer to keep the rest of the code working.
+        self.model = self.backend._state.model  # ty:ignore[protected-access]
+        self.tokenizer = self.backend._state.tokenizer  # ty:ignore[protected-access]
+        self.peft_config = self.backend._state.peft_config  # ty:ignore[protected-access]
+        # Retain these legacy fields for merge/reload paths.
+        self.trusted_models = self.backend._state.trusted_models  # ty:ignore[protected-access]
         self.max_memory = (
             {int(k) if k.isdigit() else k: v for k, v in settings.max_memory.items()}
             if settings.max_memory
             else None
         )
-        self.trusted_models = {settings.model: settings.trust_remote_code}
 
-        if self.settings.evaluate_model is not None:
-            self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
-
-        for dtype in settings.dtypes:
-            print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
-
-            try:
-                quantization_config = self._get_quantization_config(dtype)
-
-                extra_kwargs = {}
-                # Only include quantization_config if it's not None
-                # (some models like gpt-oss have issues with explicit None).
-                if quantization_config is not None:
-                    extra_kwargs["quantization_config"] = quantization_config
-
-                self.model = get_model_class(settings.model).from_pretrained(
-                    settings.model,
-                    dtype=dtype,
-                    device_map=settings.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
-                    **extra_kwargs,
-                )
-
-                # If we reach this point and the model requires trust_remote_code,
-                # either the user accepted, or settings.trust_remote_code is True.
-                if self.trusted_models.get(settings.model) is None:
-                    self.trusted_models[settings.model] = True
-
-                # A test run can reveal dtype-related problems such as the infamous
-                # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
-                # (https://github.com/meta-llama/llama/issues/380).
-                self.generate(
-                    [
-                        Prompt(
-                            system=settings.system_prompt,
-                            user="What is 1+1?",
-                        )
-                    ],
-                    max_new_tokens=1,
-                )
-            except Exception as error:
-                self.model = None  # ty:ignore[invalid-assignment]
-                empty_cache()
-                print(f"[red]Failed[/] ({error})")
-                continue
-
-            if settings.quantization == QuantizationMethod.BNB_4BIT:
-                print("[green]Ok[/] (quantized to 4-bit precision)")
-            else:
-                print("[green]Ok[/]")
-
-            break
-
-        if self.model is None:
-            raise Exception("Failed to load model with all configured dtypes.")
-
-        self._apply_lora()
-
-        # LoRA B matrices are initialized to zero by default in PEFT,
-        # so we don't need to do anything manually.
-
+        print(f"Loaded local backend for [bold]{settings.model}[/].")
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
         print("* Abliterable components:")
         for component, modules in self.get_layer_modules(0).items():
@@ -283,30 +221,12 @@ class Model:
                     torch.nn.init.zeros_(module.weight)
             return
 
-        dtype = self.model.dtype
-
-        # Purge existing model object from memory to make space.
-        self.model = None  # ty:ignore[invalid-assignment]
-        empty_cache()
-
-        quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
-
-        # Build kwargs, only include quantization_config if it's not None
-        extra_kwargs = {}
-        if quantization_config is not None:
-            extra_kwargs["quantization_config"] = quantization_config
-
-        self.model = get_model_class(self.settings.model).from_pretrained(
-            self.settings.model,
-            dtype=dtype,
-            device_map=self.settings.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
-            **extra_kwargs,
-        )
-
-        self._apply_lora()
-
+        # Slow path: rebuild the backend (e.g. after merge_and_unload()).
+        self.backend = HFLocalBackend(self.settings)
+        self.model = self.backend._state.model  # ty:ignore[protected-access]
+        self.tokenizer = self.backend._state.tokenizer  # ty:ignore[protected-access]
+        self.peft_config = self.backend._state.peft_config  # ty:ignore[protected-access]
+        self.trusted_models = self.backend._state.trusted_models  # ty:ignore[protected-access]
         self.needs_reload = False
 
     def get_layers(self) -> ModuleList:
@@ -381,7 +301,15 @@ class Model:
         refusal_directions: Tensor,
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
-    ):
+        *,
+        export_tensors: bool = False,
+    ) -> dict[str, Tensor] | None:
+        exported: dict[str, Tensor] | None = {} if export_tensors else None
+
+        module_name_by_id = None
+        if export_tensors:
+            module_name_by_id = {id(m): n for n, m in self.model.named_modules()}
+
         if direction_index is None:
             refusal_direction = None
         else:
@@ -519,11 +447,24 @@ class Model:
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
 
+                    if exported is not None and module_name_by_id is not None:
+                        module_name = module_name_by_id.get(id(module))
+                        if module_name is None:
+                            continue
+                        exported[f"{module_name}.lora_A.default.weight"] = weight_A.detach().clone().cpu()
+                        exported[f"{module_name}.lora_B.default.weight"] = weight_B.detach().clone().cpu()
+
+        return exported
+
     def generate(
         self,
         prompts: list[Prompt],
         **kwargs: Any,
     ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
+        input_ids_batch = self.encode_prompts(prompts)
+        _ = [sha256_token_ids(ids) for ids in input_ids_batch]
+        inputs = self._pad_input_ids_batch(input_ids_batch)
+
         chats = [
             [
                 {"role": "system", "content": prompt.system},
@@ -548,12 +489,8 @@ class Model:
             # at the point where responses start to differ for different prompts.
             chat_prompts = [prompt + self.response_prefix for prompt in chat_prompts]
 
-        inputs = self.tokenizer(
-            chat_prompts,
-            return_tensors="pt",
-            padding=True,
-            return_token_type_ids=False,
-        ).to(self.model.device)
+        # Keep the original chat prompt construction for compatibility/debugging,
+        # but the actual model invocation uses canonical token IDs (`inputs` above).
 
         # FIXME: The type checker has been disabled here because of the extremely complex
         #        interplay between different generate() signatures and dynamic delegation.
@@ -565,6 +502,52 @@ class Model:
         )  # ty:ignore[call-non-callable]
 
         return inputs, outputs
+
+    def encode_prompts(self, prompts: list[Prompt]) -> list[list[int]]:
+        chats = [
+            [
+                {"role": "system", "content": prompt.system},
+                {"role": "user", "content": prompt.user},
+            ]
+            for prompt in prompts
+        ]
+
+        ids = cast(
+            list[list[int]],
+            self.tokenizer.apply_chat_template(
+                chats,
+                add_generation_prompt=True,
+                tokenize=True,
+            ),
+        )
+
+        if self.response_prefix:
+            prefix_ids = cast(
+                list[int],
+                self.tokenizer(self.response_prefix, add_special_tokens=False)["input_ids"],
+            )
+            ids = [x + prefix_ids for x in ids]
+
+        return ids
+
+    def _pad_input_ids_batch(self, input_ids_batch: list[list[int]]) -> BatchEncoding:
+        pad_id = self.tokenizer.pad_token_id
+        assert pad_id is not None
+
+        max_len = max(len(x) for x in input_ids_batch)
+        padded = []
+        attn = []
+        for ids in input_ids_batch:
+            pad_len = max_len - len(ids)
+            padded.append([pad_id] * pad_len + ids)
+            attn.append([0] * pad_len + [1] * len(ids))
+
+        return BatchEncoding(
+            {
+                "input_ids": torch.tensor(padded, dtype=torch.long, device=self.model.device),
+                "attention_mask": torch.tensor(attn, dtype=torch.long, device=self.model.device),
+            }
+        )
 
     def get_responses(
         self,
@@ -601,31 +584,27 @@ class Model:
         return responses
 
     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
-        # We only generate one token, and we return the residual vectors
-        # at that token position, for each prompt and layer.
-        _, outputs = self.generate(
-            prompts,
-            max_new_tokens=1,
+        """Return residual-stream vectors under the standardized contract.
+
+        Contract: `block_input_last_token`
+        - Use last token of the *prompt* (not generated token).
+        - Include embeddings stream as index 0.
+
+        Shape: (batch, layers_plus_embeddings, d_model)
+        """
+
+        input_ids_batch = self.encode_prompts(prompts)
+        inputs = self._pad_input_ids_batch(input_ids_batch)
+
+        outputs = self.model(  # ty:ignore[operator]
+            **inputs,
             output_hidden_states=True,
-            return_dict_in_generate=True,
+            return_dict=True,
+            use_cache=False,
         )
+        hidden_states = cast(tuple[FloatTensor], outputs.hidden_states)
 
-        # This cast is valid because GenerateDecoderOnlyOutput is the return type
-        # of model.generate with return_dict_in_generate=True.
-        outputs = cast(GenerateDecoderOnlyOutput, outputs)
-
-        # Hidden states for the first (only) generated token.
-        # This cast is valid because we passed output_hidden_states=True above.
-        hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
-
-        # The returned tensor has shape (prompt, layer, component).
-        residuals = torch.stack(
-            # layer_hidden_states has shape (prompt, position, component),
-            # so this extracts the hidden states at the end of each prompt,
-            # and stacks them up over the layers.
-            [layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states],
-            dim=1,
-        )
+        residuals = torch.stack([hs[:, -1, :] for hs in hidden_states], dim=1)
 
         # Upcast the data type to avoid precision (bfloat16) or range (float16)
         # problems during calculations involving residual vectors.
