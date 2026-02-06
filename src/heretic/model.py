@@ -796,12 +796,29 @@ class Model:
                 # on-disk model snapshots used purely for tokenizer/config.
                 try:
                     backend = cast(SGLangBackend, self.backend)
-                    descs = backend.module_map(include_projs=["o_proj", "down_proj"])
-                    layers = [
-                        d.get("layer")
-                        for d in descs
-                        if isinstance(d, dict) and isinstance(d.get("layer"), int)
-                    ]
+                    descs: Any = backend.module_map(include_projs=["o_proj", "down_proj"])
+                    # Defensive: in some multi-DP configurations, the server can return a
+                    # list-of-lists; the SGLang backend normalizes this, but keep this robust.
+                    if isinstance(descs, list) and descs and isinstance(descs[0], list):
+                        descs = descs[0]
+
+                    layers: list[int] = []
+                    if isinstance(descs, list):
+                        for d in descs:
+                            if not isinstance(d, dict):
+                                continue
+                            layer = d.get("layer")
+                            if isinstance(layer, int):
+                                layers.append(layer)
+                                continue
+                            # Fallback: parse from module_path if server didn't populate `layer`.
+                            mp = d.get("module_path")
+                            if isinstance(mp, str):
+                                import re
+
+                                m = re.search(r"\.layers\.(\d+)\.", mp)
+                                if m:
+                                    layers.append(int(m.group(1)))
                     if layers:
                         self._num_layers = int(max(layers) + 1)
                         print(
