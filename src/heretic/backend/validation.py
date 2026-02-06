@@ -414,10 +414,53 @@ def run_startup_validations(
                 atol=cfg.vtw_atol,
             )
         else:
-            # Still ensure endpoint is reachable if supported, but don't fail if not configured.
+            # Still ensure endpoint is reachable if supported.
             supports = backend.get_metadata().supports
             if supports.get("compute_vtw", False):
-                notes.append("compute_vtw supported but no vtw_case provided; skipped numeric check.")
+                # Best-effort: pick a target from module_map if backend provides it.
+                target: ModuleRef | None = None
+                v: torch.Tensor | None = None
+                try:
+                    module_descs = backend.module_map(include_projs=["o_proj", "down_proj"])
+                    for d in module_descs:
+                        if not isinstance(d, dict):
+                            continue
+                        path = d.get("module_path") or d.get("name")
+                        out_f = d.get("out_features")
+                        shape = d.get("shape")
+                        if not isinstance(path, str):
+                            continue
+                        if isinstance(out_f, int) and out_f > 0:
+                            out_dim = int(out_f)
+                        elif (
+                            isinstance(shape, list)
+                            and len(shape) == 2
+                            and all(isinstance(x, int) for x in shape)
+                            and int(shape[0]) > 0
+                        ):
+                            out_dim = int(shape[0])
+                        else:
+                            continue
+                        target = ModuleRef(
+                            module_path=path,
+                            kind="parameter",
+                            layer=d.get("layer") if isinstance(d.get("layer"), int) else None,
+                            expert_id=d.get("expert_id") if isinstance(d.get("expert_id"), int) else None,
+                            proj=d.get("proj") if isinstance(d.get("proj"), str) else None,
+                        )
+                        v = torch.zeros((out_dim,), dtype=torch.float32)
+                        v[0] = 1.0
+                        break
+                except Exception:
+                    target = None
+                    v = None
+
+                if target is not None and v is not None:
+                    validate_compute_vtw(backend, v=v, target=target, baseline_vtw=None)
+                else:
+                    notes.append(
+                        "compute_vtw supported but no vtw_case provided and could not auto-select a target; skipped numeric check."
+                    )
     except Exception as e:
         vtw_ok = False
         notes.append(f"compute_vtw failed: {e}")
