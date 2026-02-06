@@ -302,22 +302,78 @@ class SGLangBackend(HereticBackend):
             if not isinstance(outputs, list):
                 raise RuntimeError(f"Unexpected /generate response: {outputs}")
 
-            hs: list[list[float]] = []
+            def _is_num(x: Any) -> bool:
+                return isinstance(x, (int, float))
+
+            def _is_list_of_nums(x: Any) -> bool:
+                return isinstance(x, list) and (len(x) == 0 or all(_is_num(v) for v in x))
+
+            def _is_list_of_list_of_nums(x: Any) -> bool:
+                return isinstance(x, list) and (len(x) == 0 or all(_is_list_of_nums(v) for v in x))
+
+            def _is_list_of_list_of_list_of_nums(x: Any) -> bool:
+                return isinstance(x, list) and (len(x) == 0 or all(_is_list_of_list_of_nums(v) for v in x))
+
+            def _parse_hidden_states(raw_hs: Any) -> torch.Tensor:
+                """Parse SGLang meta_info.hidden_states into (layers, d_model) float32.
+
+                Observed schemas (depending on SGLang build / flags):
+                - vector:               [features]
+                - steps x features:     [[features], ...]
+                - layers x d_model:     [[d_model], ...]           (no step dim)
+                - steps x layers x dm:  [[[d_model], ...], ...]
+                """
+                if not isinstance(raw_hs, list) or len(raw_hs) == 0:
+                    raise RuntimeError("hidden_states is empty or not a list.")
+
+                x: Any = raw_hs
+
+                # Case: steps x layers x d_model
+                if _is_list_of_list_of_list_of_nums(x):
+                    x = x[-1]  # last step
+                    t2 = torch.tensor(x, dtype=torch.float32)
+                    if t2.ndim != 2:
+                        raise RuntimeError(f"Unexpected hidden_states tensor shape (steps*layers*dm): {tuple(t2.shape)}")
+                    return t2
+
+                # Case: list[list[num]] -> either steps x features OR layers x d_model
+                if _is_list_of_list_of_nums(x):
+                    # Heuristic: if outer dim matches requested capture_layers, treat as layers x d_model.
+                    if len(x) == len(capture_layers):
+                        t2 = torch.tensor(x, dtype=torch.float32)
+                        if t2.ndim != 2:
+                            raise RuntimeError(f"Unexpected hidden_states tensor shape (layers*dm): {tuple(t2.shape)}")
+                        return t2
+
+                    # Otherwise, treat as steps x features and take last step.
+                    x = x[-1]
+
+                # Now x should be a flat vector [features].
+                if not _is_list_of_nums(x):
+                    raise RuntimeError("Unsupported hidden_states schema (expected numeric lists).")
+                t1 = torch.tensor(x, dtype=torch.float32)
+                if t1.ndim != 1:
+                    raise RuntimeError(f"Unexpected hidden_states tensor ndim: {t1.ndim}")
+
+                # If features are concatenated across layers, reshape.
+                if len(capture_layers) > 0 and (t1.numel() % len(capture_layers) == 0):
+                    d_model = t1.numel() // len(capture_layers)
+                    return t1.view(len(capture_layers), d_model)
+
+                # Fallback: treat as one layer.
+                return t1.view(1, -1)
+
+            per_item: list[torch.Tensor] = []
             for out in outputs:
                 if not isinstance(out, dict):
                     raise RuntimeError(f"Unexpected /generate item: {out}")
                 meta = out.get("meta_info") or {}
                 hs_steps = meta.get("hidden_states")
-                if not isinstance(hs_steps, list) or len(hs_steps) == 0:
+                if hs_steps is None:
                     raise RuntimeError(
                         "SGLang /generate response missing meta_info.hidden_states (return_hidden_states=True)."
                     )
-                vec = hs_steps[-1]
-                if not isinstance(vec, list):
-                    raise RuntimeError(
-                        f"Unexpected hidden_states step type in /generate: {type(vec)}"
-                    )
-                hs.append(vec)
+                per_item.append(_parse_hidden_states(hs_steps))
 
         except Exception:
             model_name = self.model or "default"
@@ -348,15 +404,19 @@ class SGLangBackend(HereticBackend):
                     )
                 hs.append(vec)
 
-        # Shape heuristics: SGLang concatenates captured layers along feature dim.
-        t = torch.tensor(hs, dtype=torch.float32)
-        if t.ndim == 2 and len(capture_layers) > 0 and t.shape[1] % len(capture_layers) == 0:
-            d = t.shape[1] // len(capture_layers)
-            t = t.view(t.shape[0], len(capture_layers), d)
-        elif t.ndim == 1:
-            t = t.view(1, 1, -1)
-        elif t.ndim == 2:
-            t = t.unsqueeze(1)
+        if "per_item" in locals():
+            # /generate path: already parsed to (layers, d_model) per item.
+            t = torch.stack(per_item, dim=0)
+        else:
+            # Fallback path: older servers may return a flat vector per choice.
+            t = torch.tensor(hs, dtype=torch.float32)
+            if t.ndim == 2 and len(capture_layers) > 0 and t.shape[1] % len(capture_layers) == 0:
+                d = t.shape[1] // len(capture_layers)
+                t = t.view(t.shape[0], len(capture_layers), d)
+            elif t.ndim == 1:
+                t = t.view(1, 1, -1)
+            elif t.ndim == 2:
+                t = t.unsqueeze(1)
 
         return ResidualCaptureResult(
             residuals=t,
