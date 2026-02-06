@@ -334,15 +334,27 @@ class SGLangBackend(HereticBackend):
                     t2 = torch.tensor(x, dtype=torch.float32)
                     if t2.ndim != 2:
                         raise RuntimeError(f"Unexpected hidden_states tensor shape (steps*layers*dm): {tuple(t2.shape)}")
+                    # Some servers ignore capture_layers and return all layers.
+                    # Always select the requested layers when possible.
+                    if capture_layers and t2.shape[0] > len(capture_layers):
+                        max_idx = max(capture_layers)
+                        if t2.shape[0] > max_idx:
+                            t2 = t2[capture_layers, :]
                     return t2
 
                 # Case: list[list[num]] -> either steps x features OR layers x d_model
                 if _is_list_of_list_of_nums(x):
-                    # Heuristic: if outer dim matches requested capture_layers, treat as layers x d_model.
-                    if len(x) == len(capture_layers):
+                    # If inner width is stable and "d_model-like", this is probably layers x d_model.
+                    inner_lens = {len(row) for row in x if isinstance(row, list)}
+                    is_matrix = len(inner_lens) == 1 and next(iter(inner_lens), 0) >= 128
+                    if len(x) == len(capture_layers) or is_matrix:
                         t2 = torch.tensor(x, dtype=torch.float32)
                         if t2.ndim != 2:
                             raise RuntimeError(f"Unexpected hidden_states tensor shape (layers*dm): {tuple(t2.shape)}")
+                        if capture_layers and t2.shape[0] != len(capture_layers):
+                            max_idx = max(capture_layers)
+                            if t2.shape[0] > max_idx:
+                                t2 = t2[capture_layers, :]
                         return t2
 
                     # Otherwise, treat as steps x features and take last step.
