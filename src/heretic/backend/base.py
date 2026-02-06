@@ -14,6 +14,9 @@ class BackendMetadata:
     model_id: str
     tokenizer_id: str | None
     max_context_len: int | None
+    num_layers: int | None = None
+    hidden_size: int | None = None
+    vocab_size: int | None = None
     supports: dict[str, bool]
 
 
@@ -65,6 +68,15 @@ class VTWResult:
     meta: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class TokenizeChatResult:
+    """Canonical prompt token IDs produced by a backend (optional)."""
+
+    token_ids: list[list[int]]
+    prompt_ids_sha256: list[str] | None = None
+    meta: dict[str, Any] | None = None
+
+
 class HereticBackend(ABC):
     @abstractmethod
     def get_metadata(self) -> BackendMetadata:
@@ -77,6 +89,72 @@ class HereticBackend(ABC):
         *,
         adapter: str | None = None,
     ) -> ScoreResult:
+        raise NotImplementedError
+
+    def score_full_vocab(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        adapter: str | None = None,
+    ) -> torch.Tensor:
+        """Return next-token full-vocab logprobs (batch, vocab)."""
+        result = self.score(input_ids_batch, adapter=adapter)
+        if result.logprobs_full is None:
+            raise NotImplementedError("Backend does not provide full-vocab logprobs.")
+        return result.logprobs_full
+
+    @abstractmethod
+    def generate_text(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        max_new_tokens: int,
+        adapter: str | None = None,
+        temperature: float = 0.0,
+    ) -> list[str]:
+        raise NotImplementedError
+
+    def tokenize_chat(
+        self,
+        chats: list[list[dict[str, Any]]],
+        *,
+        continue_final_message: bool = False,
+    ) -> TokenizeChatResult:
+        """Tokenize chats using the backend's canonical template/tokenizer.
+
+        Not all backends implement this; Heretic may tokenize locally instead.
+        """
+        raise NotImplementedError
+
+    def module_map(self, *, include_projs: list[str] | None = None) -> list[dict[str, Any]]:
+        """Return canonical module descriptors for ablation targeting.
+
+        Implemented by SGLang backend; local backends may not provide a stable map.
+        """
+        raise NotImplementedError
+
+    def compute_vtw_batch(
+        self,
+        *,
+        items: list[dict[str, Any]],
+        timeout_s: float = 300.0,
+    ) -> list[dict[str, Any]]:
+        """Optional batched v^T W endpoint (SGLang-only)."""
+        raise NotImplementedError
+
+    def build_full_rownorm_lora(
+        self,
+        *,
+        name: str,
+        v: torch.Tensor,
+        weight: float,
+        rank: int,
+        out_dtype: str = "float16",
+        svd_q: int | None = None,
+        svd_niter: int = 6,
+        timeout_s: float = 600.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Optional server-side FULL row-norm LoRA builder (SGLang-only)."""
         raise NotImplementedError
 
     @abstractmethod
