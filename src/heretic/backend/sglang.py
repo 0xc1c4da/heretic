@@ -254,32 +254,70 @@ class SGLangBackend(HereticBackend):
         capture_point: str = "block_input_last_token",
         adapter: str | None = None,
     ) -> ResidualCaptureResult:
-        model_name = self.model or "default"
-        if adapter:
-            model_name = f"{model_name}:{adapter}"
+        # Prefer native /generate: stable schema, supports batched input_ids + lora_id.
+        # Fallback to OpenAI /v1/completions for older servers.
+        try:
+            resp = _post_json(
+                f"{self.base_url}/generate",
+                {
+                    "input_ids": input_ids_batch,
+                    "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+                    "stream": False,
+                    "return_hidden_states": True,
+                    "capture_layers": capture_layers,
+                    "lora_id": adapter,
+                },
+                timeout_s=300.0,
+            )
+            outputs = resp.data
+            if not isinstance(outputs, list):
+                raise RuntimeError(f"Unexpected /generate response: {outputs}")
 
-        resp = _post_json(
-            f"{self.base_url}/v1/completions",
-            {
-                "model": model_name,
-                "prompt": input_ids_batch,
-                "max_tokens": 1,
-                "temperature": 0.0,
-                "stream": False,
-                "return_hidden_states": True,
-                "capture_layers": capture_layers,
-            },
-        )
+            hs: list[list[float]] = []
+            for out in outputs:
+                if not isinstance(out, dict):
+                    raise RuntimeError(f"Unexpected /generate item: {out}")
+                meta = out.get("meta_info") or {}
+                hs_steps = meta.get("hidden_states")
+                if not isinstance(hs_steps, list) or len(hs_steps) == 0:
+                    raise RuntimeError(
+                        "SGLang /generate response missing meta_info.hidden_states (return_hidden_states=True)."
+                    )
+                vec = hs_steps[-1]
+                if not isinstance(vec, list):
+                    raise RuntimeError(
+                        f"Unexpected hidden_states step type in /generate: {type(vec)}"
+                    )
+                hs.append(vec)
 
-        # Extract hidden states from choices.
-        choices = resp.data.get("choices", [])
-        hs = []
-        for c in choices:
-            # SGLang places this on the choice, mirroring existing `hidden_states` handling.
-            vec = c.get("hidden_states")
-            if vec is None:
-                raise RuntimeError("SGLang response missing hidden_states (return_hidden_states=True).")
-            hs.append(vec)
+        except Exception:
+            model_name = self.model or "default"
+            if adapter:
+                model_name = f"{model_name}:{adapter}"
+
+            resp = _post_json(
+                f"{self.base_url}/v1/completions",
+                {
+                    "model": model_name,
+                    "prompt": input_ids_batch,
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                    "stream": False,
+                    "return_hidden_states": True,
+                    "capture_layers": capture_layers,
+                },
+            )
+
+            # Extract hidden states from choices.
+            choices = resp.data.get("choices", [])
+            hs = []
+            for c in choices:
+                vec = c.get("hidden_states")
+                if vec is None:
+                    raise RuntimeError(
+                        "SGLang response missing hidden_states (return_hidden_states=True)."
+                    )
+                hs.append(vec)
 
         # Shape heuristics: SGLang concatenates captured layers along feature dim.
         t = torch.tensor(hs, dtype=torch.float32)
