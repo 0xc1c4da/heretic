@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
+import pickle
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
-from multiprocessing.reduction import ForkingPickler
-import io
-import base64
 
 import torch
 import numpy as np
@@ -49,11 +48,14 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout_s: float = 60.0) ->
 
 
 def _serialize_for_sglang(obj: Any) -> str:
-    """Match SGLang MultiprocessingSerializer.serialize(..., output_str=True)."""
-    buf = io.BytesIO()
-    ForkingPickler(buf).dump(obj)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("utf-8")
+    """Serialize tensors safely for SGLang's SafeUnpickler over HTTP.
+
+    Important: do NOT use `multiprocessing.reduction.ForkingPickler` here, because it can
+    encode tensor storages using file descriptors (resource_sharer), which breaks across
+    an HTTP boundary (authkey mismatch).
+    """
+    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return base64.b64encode(payload).decode("utf-8")
 
 
 class SGLangBackend(HereticBackend):
@@ -392,7 +394,7 @@ class SGLangBackend(HereticBackend):
         )
 
     def load_adapter(self, *, name: str, tensors: dict[str, torch.Tensor], config: dict) -> str:
-        # SGLang expects a dict of tensors serialized with ForkingPickler + base64.
+        # SGLang expects a dict of CPU tensors serialized + base64.
         cpu_tensors = {k: v.detach().cpu() for k, v in tensors.items()}
         payload = {
             "lora_name": name,
