@@ -372,35 +372,39 @@ def run():
         print(f"* Chosen batch size: [bold]{settings.batch_size}[/]")
 
     print()
-    print("Checking for common response prefix...")
-    responses = model.get_responses_batched(good_prompts[:100] + bad_prompts[:100])
+    if settings.detect_response_prefix:
+        print("Checking for common response prefix...")
+        responses = model.get_responses_batched(good_prompts[:100] + bad_prompts[:100])
 
-    # Despite being located in os.path, commonprefix actually performs
-    # a naive string operation without any path-specific logic,
-    # which is exactly what we need here. Trailing spaces are removed
-    # to avoid issues where multiple different tokens that all start
-    # with a space character lead to the common prefix ending with
-    # a space, which would result in an uncommon tokenization.
-    model.response_prefix = commonprefix(responses).rstrip(" ")
+        # Despite being located in os.path, commonprefix actually performs
+        # a naive string operation without any path-specific logic,
+        # which is exactly what we need here. Trailing spaces are removed
+        # to avoid issues where multiple different tokens that all start
+        # with a space character lead to the common prefix ending with
+        # a space, which would result in an uncommon tokenization.
+        model.response_prefix = commonprefix(responses).rstrip(" ")
 
-    # Suppress CoT output.
-    if model.response_prefix.startswith("<think>"):
-        # Most thinking models.
-        model.response_prefix = "<think></think>"
-    elif model.response_prefix.startswith("<|channel|>analysis<|message|>"):
-        # gpt-oss.
-        model.response_prefix = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
-    elif model.response_prefix.startswith("<thought>"):
-        # Unknown, suggested by user.
-        model.response_prefix = "<thought></thought>"
-    elif model.response_prefix.startswith("[THINK]"):
-        # Unknown, suggested by user.
-        model.response_prefix = "[THINK][/THINK]"
+        # Suppress CoT output.
+        if model.response_prefix.startswith("<think>"):
+            # Most thinking models.
+            model.response_prefix = "<think></think>"
+        elif model.response_prefix.startswith("<|channel|>analysis<|message|>"):
+            # gpt-oss.
+            model.response_prefix = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
+        elif model.response_prefix.startswith("<thought>"):
+            # Unknown, suggested by user.
+            model.response_prefix = "<thought></thought>"
+        elif model.response_prefix.startswith("[THINK]"):
+            # Unknown, suggested by user.
+            model.response_prefix = "[THINK][/THINK]"
 
-    if model.response_prefix:
-        print(f"* Prefix found: [bold]{model.response_prefix!r}[/]")
+        if model.response_prefix:
+            print(f"* Prefix found: [bold]{model.response_prefix!r}[/]")
+        else:
+            print("* None found")
     else:
-        print("* None found")
+        model.response_prefix = ""
+        print("Skipping response-prefix probe (detect_response_prefix=false).")
 
     # Phase 8: optional backend validations (startup sanity checks).
     # Enable via config (`validate_backend = true`) or env var (`HERETIC_VALIDATE_BACKEND=1`).
