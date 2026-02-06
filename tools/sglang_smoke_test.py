@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import argparse
 import base64
-import io
 import json
+import pickle
 import sys
 import urllib.error
 import urllib.request
-from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
 
@@ -45,11 +44,14 @@ def _get_json(url: str, *, timeout_s: float = 30.0) -> Any:
 
 
 def _serialize_for_sglang(obj: Any) -> str:
-    """Match SGLang MultiprocessingSerializer.serialize(..., output_str=True)."""
-    buf = io.BytesIO()
-    ForkingPickler(buf).dump(obj)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("utf-8")
+    """Serialize tensors safely for SGLang's SafeUnpickler over HTTP.
+
+    Do NOT use `multiprocessing.reduction.ForkingPickler` here: it can encode tensor
+    storages via `multiprocessing.resource_sharer` (FD passing), which fails across
+    an HTTP boundary (authkey mismatch).
+    """
+    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return base64.b64encode(payload).decode("utf-8")
 
 
 def _try_call(label: str, fn):
