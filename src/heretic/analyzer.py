@@ -70,7 +70,7 @@ class Analyzer:
                 compute_geometric_median(
                     self.good_residuals[:, layer_index, :].detach().cpu()
                 ).median
-                for layer_index in range(len(self.model.get_layers()) + 1)
+                for layer_index in range(len(self.model.get_layers()))
             ]
         )
         b = self.bad_residuals.mean(dim=0)
@@ -79,7 +79,7 @@ class Analyzer:
                 compute_geometric_median(
                     self.bad_residuals[:, layer_index, :].detach().cpu()
                 ).median
-                for layer_index in range(len(self.model.get_layers()) + 1)
+                for layer_index in range(len(self.model.get_layers()))
             ]
         )
         r = b - g
@@ -114,12 +114,12 @@ class Analyzer:
         labels = [0] * len(self.good_residuals) + [1] * len(self.bad_residuals)
         silhouettes = [
             silhouette_score(residuals[:, layer_index, :], labels)
-            for layer_index in range(len(self.model.get_layers()) + 1)
+            for layer_index in range(len(self.model.get_layers()))
         ]
 
-        for layer_index in range(1, len(self.model.get_layers()) + 1):
+        for layer_index in range(len(self.model.get_layers())):
             table.add_row(
-                f"{layer_index}",
+                f"{layer_index + 1}",
                 f"{g_b_similarities[layer_index].item():.4f}",
                 f"{g_star_b_star_similarities[layer_index].item():.4f}",
                 f"{g_r_similarities[layer_index].item():.4f}",
@@ -184,7 +184,7 @@ class Analyzer:
         pacmap_init = None
 
         for layer_index in track(
-            range(1, len(self.model.get_layers()) + 1),
+            range(len(self.model.get_layers())),
             description="* Computing PaCMAP projections...",
         ):
             good_residuals = (

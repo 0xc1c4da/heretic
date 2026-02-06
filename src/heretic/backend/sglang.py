@@ -10,6 +10,7 @@ import io
 import base64
 
 import torch
+import numpy as np
 
 from .base import (
     BackendMetadata,
@@ -72,37 +73,178 @@ class SGLangBackend(HereticBackend):
             max_context_len=None,
             supports={
                 "input_ids": True,
-                "prompt_ids_sha256": True,
+                # Only true once the server echoes hashes (e.g., via sgl_ext.prompt_ids_sha256).
+                "prompt_ids_sha256": False,
                 "capture_layers": True,
+                "logprobs_full": True,
                 "compute_vtw": True,
                 "lora_hot_swap": True,
             },
         )
 
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
-        model_name = self.model or "default"
-        if adapter:
-            model_name = f"{model_name}:{adapter}"
-
-        # OpenAI completions supports token IDs in `prompt`.
-        # NOTE: SGLang OpenAI logprobs are top-k; full-vocab KL may need a different path.
         resp = _post_json(
-            f"{self.base_url}/v1/completions",
-            {
-                "model": model_name,
-                "prompt": input_ids_batch,
-                "max_tokens": 1,
-                "temperature": 0.0,
-                "logprobs": 0,
-                "stream": False,
-            },
+            f"{self.base_url}/heretic/score_full_vocab",
+            {"input_ids": input_ids_batch, "lora_id": adapter},
+            timeout_s=300.0,
         )
 
+        data = resp.data
+        b64_list = data.get("logprobs_full_fp16_b64")
+        shapes = data.get("shape")
+        dtype = data.get("dtype")
+        if not isinstance(b64_list, list) or not isinstance(shapes, list) or dtype != "float16":
+            raise RuntimeError(f"Unexpected /heretic/score_full_vocab response: {data}")
+        if len(b64_list) != len(input_ids_batch) or len(shapes) != len(input_ids_batch):
+            raise RuntimeError(
+                f"Batch size mismatch in /heretic/score_full_vocab: {len(b64_list)=} {len(shapes)=} {len(input_ids_batch)=}"
+            )
+
+        rows: list[torch.Tensor] = []
+        for b64, shape in zip(b64_list, shapes):
+            if not isinstance(b64, str) or not isinstance(shape, list) or len(shape) != 1:
+                raise RuntimeError(f"Unexpected row encoding in /heretic/score_full_vocab: {shape=}")
+            vocab = int(shape[0])
+            raw = base64.b64decode(b64.encode("ascii"))
+            arr = np.frombuffer(raw, dtype=np.float16)
+            if arr.size != vocab:
+                raise RuntimeError(
+                    f"Decoded fp16 size mismatch in /heretic/score_full_vocab: {arr.size=} {vocab=}"
+                )
+            rows.append(torch.from_numpy(arr.astype(np.float32, copy=False)))
+
+        logprobs_full = torch.stack(rows, dim=0)
         return ScoreResult(
-            logprobs_full=None,
+            logprobs_full=logprobs_full,
             logprobs_topk=None,
-            meta={"raw": resp.data},
+            meta={"raw": data},
         )
+
+    def generate_text(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        max_new_tokens: int,
+        adapter: str | None = None,
+        temperature: float = 0.0,
+    ) -> list[str]:
+        """Generate completions for token-id prompts via SGLang /generate endpoint.
+
+        We prefer /generate over /v1/completions here because it supports `lora_id`
+        directly and has a simpler, more stable schema for batched token-id prompts.
+        """
+        resp = _post_json(
+            f"{self.base_url}/generate",
+            {
+                "input_ids": input_ids_batch,
+                "sampling_params": {
+                    "max_new_tokens": int(max_new_tokens),
+                    "temperature": float(temperature),
+                },
+                "stream": False,
+                "return_logprob": False,
+                "lora_id": adapter,
+            },
+            timeout_s=300.0,
+        )
+        outputs = resp.data
+        if not isinstance(outputs, list):
+            raise RuntimeError(f"Unexpected /generate response: {outputs}")
+
+        texts: list[str] = []
+        for out in outputs:
+            if not isinstance(out, dict):
+                raise RuntimeError(f"Unexpected /generate item: {out}")
+            t = out.get("text")
+            if not isinstance(t, str):
+                t = ""
+            texts.append(t)
+        return texts
+
+    def module_map(self, *, include_projs: list[str] | None = None) -> list[dict[str, Any]]:
+        resp = _post_json(
+            f"{self.base_url}/heretic/module_map",
+            {"include_projs": include_projs},
+            timeout_s=60.0,
+        )
+        data = resp.data
+        modules = data.get("modules")
+        if not isinstance(modules, list):
+            raise RuntimeError(f"Unexpected /heretic/module_map response: {data}")
+        return modules
+
+    def compute_vtw_batch(
+        self,
+        *,
+        items: list[dict[str, Any]],
+        timeout_s: float = 300.0,
+    ) -> list[dict[str, Any]]:
+        """Call SGLang /compute_vtw_batch admin endpoint."""
+        resp = _post_json(
+            f"{self.admin_url}/compute_vtw_batch",
+            {"items": items},
+            timeout_s=timeout_s,
+        )
+        data = resp.data
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected /compute_vtw_batch response: {data}")
+        return data
+
+    def build_full_rownorm_lora(
+        self,
+        *,
+        name: str,
+        v: torch.Tensor,
+        weight: float,
+        rank: int,
+        out_dtype: str = "float16",
+        svd_q: int | None = None,
+        svd_niter: int = 6,
+        timeout_s: float = 600.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Call SGLang /heretic/build_full_rownorm_lora and decode factors."""
+        resp = _post_json(
+            f"{self.base_url}/heretic/build_full_rownorm_lora",
+            {
+                "name": name,
+                "v": v.detach().to(torch.float32).cpu().tolist(),
+                "weight": float(weight),
+                "rank": int(rank),
+                "svd_q": svd_q,
+                "svd_niter": int(svd_niter),
+                "out_dtype": out_dtype,
+            },
+            timeout_s=timeout_s,
+        )
+        data = resp.data
+        if data.get("dtype") not in ("float16", "bfloat16"):
+            raise RuntimeError(f"Unexpected /heretic/build_full_rownorm_lora response: {data}")
+        a_b64 = data.get("lora_A_b64")
+        b_b64 = data.get("lora_B_b64")
+        a_shape = data.get("lora_A_shape")
+        b_shape = data.get("lora_B_shape")
+        if (
+            not isinstance(a_b64, str)
+            or not isinstance(b_b64, str)
+            or not isinstance(a_shape, list)
+            or not isinstance(b_shape, list)
+            or len(a_shape) != 2
+            or len(b_shape) != 2
+        ):
+            raise RuntimeError(f"Malformed /heretic/build_full_rownorm_lora response: {data}")
+
+        raw_a = base64.b64decode(a_b64.encode("ascii"))
+        raw_b = base64.b64decode(b_b64.encode("ascii"))
+        dt = np.float16 if data["dtype"] == "float16" else np.dtype("bfloat16")
+        # Note: numpy doesn't have native bfloat16 everywhere; keep float16 for transport.
+        if data["dtype"] != "float16":
+            raise RuntimeError("bfloat16 transport is not supported by this client yet.")
+
+        arr_a = np.frombuffer(raw_a, dtype=np.float16).reshape((int(a_shape[0]), int(a_shape[1])))
+        arr_b = np.frombuffer(raw_b, dtype=np.float16).reshape((int(b_shape[0]), int(b_shape[1])))
+        A = torch.from_numpy(arr_a.astype(np.float32, copy=False))
+        B = torch.from_numpy(arr_b.astype(np.float32, copy=False))
+        return A, B
 
     def capture_residuals(
         self,
@@ -184,7 +326,7 @@ class SGLangBackend(HereticBackend):
             meta={"raw": resp.data},
         )
 
-    def load_adapter(self, *, name: str, tensors: dict[str, torch.Tensor], config: dict) -> None:
+    def load_adapter(self, *, name: str, tensors: dict[str, torch.Tensor], config: dict) -> str:
         # SGLang expects a dict of tensors serialized with ForkingPickler + base64.
         cpu_tensors = {k: v.detach().cpu() for k, v in tensors.items()}
         payload = {
@@ -195,7 +337,21 @@ class SGLangBackend(HereticBackend):
             "added_tokens_config": None,
             "lora_id": None,
         }
-        _post_json(f"{self.admin_url}/load_lora_adapter_from_tensors", payload, timeout_s=300.0)
+        resp = _post_json(
+            f"{self.admin_url}/load_lora_adapter_from_tensors",
+            payload,
+            timeout_s=300.0,
+        )
+        data = resp.data
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError(f"Unexpected load_lora_adapter_from_tensors response: {data}")
+        loaded = data.get("loaded_adapters") or {}
+        if not isinstance(loaded, dict) or name not in loaded:
+            raise RuntimeError(f"Missing adapter ref in load_lora response: keys={list(loaded) if isinstance(loaded, dict) else loaded}")
+        ref = loaded[name]
+        if not isinstance(ref, dict) or not isinstance(ref.get("lora_id"), str):
+            raise RuntimeError(f"Malformed adapter ref in load_lora response: {ref}")
+        return ref["lora_id"]
 
     def unload_adapter(self, *, name: str) -> None:
         _post_json(

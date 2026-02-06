@@ -32,6 +32,7 @@ from transformers.generation import (
 from .config import BackendType, QuantizationMethod, RowNormalization, Settings
 from .backend.hf_local import HFLocalBackend
 from .backend.base import HereticBackend
+from .backend.sglang import SGLangBackend
 from .utils import Prompt, batchify, empty_cache, print, sha256_token_ids
 
 
@@ -67,32 +68,66 @@ class Model:
 
         print()
         backend_type = getattr(settings, "backend", BackendType.LOCAL)
-        if backend_type != BackendType.LOCAL:
-            raise NotImplementedError(
-                "Non-local backends are wired later in the refactor; set backend='local' for now."
+        self._backend_type = backend_type
+        self._num_layers: int | None = None
+
+        if backend_type == BackendType.LOCAL:
+            # Local execution: delegate model loading + quantization + LoRA init to HFLocalBackend.
+            self.backend = HFLocalBackend(settings)
+            # Expose underlying model/tokenizer to keep the rest of the code working.
+            self.model = self.backend._state.model  # ty:ignore[protected-access]
+            self.tokenizer = self.backend._state.tokenizer  # ty:ignore[protected-access]
+            self.peft_config = self.backend._state.peft_config  # ty:ignore[protected-access]
+            # Retain these legacy fields for merge/reload paths.
+            self.trusted_models = self.backend._state.trusted_models  # ty:ignore[protected-access]
+            self.max_memory = (
+                {int(k) if k.isdigit() else k: v for k, v in settings.max_memory.items()}
+                if settings.max_memory
+                else None
             )
 
-        # Local execution: delegate model loading + quantization + LoRA init to HFLocalBackend.
-        self.backend = HFLocalBackend(settings)
-        # Expose underlying model/tokenizer to keep the rest of the code working.
-        self.model = self.backend._state.model  # ty:ignore[protected-access]
-        self.tokenizer = self.backend._state.tokenizer  # ty:ignore[protected-access]
-        self.peft_config = self.backend._state.peft_config  # ty:ignore[protected-access]
-        # Retain these legacy fields for merge/reload paths.
-        self.trusted_models = self.backend._state.trusted_models  # ty:ignore[protected-access]
-        self.max_memory = (
-            {int(k) if k.isdigit() else k: v for k, v in settings.max_memory.items()}
-            if settings.max_memory
-            else None
-        )
-
-        print(f"Loaded local backend for [bold]{settings.model}[/].")
-        print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
-        print("* Abliterable components:")
-        for component, modules in self.get_layer_modules(0).items():
-            print(
-                f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
+            print(f"Loaded local backend for [bold]{settings.model}[/].")
+            print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
+            print("* Abliterable components:")
+            for component, modules in self.get_layer_modules(0).items():
+                print(
+                    f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
+                )
+        elif backend_type == BackendType.SGLANG:
+            # Remote execution: do NOT load HF weights. Only keep tokenizer + config locally.
+            self.backend = SGLangBackend(
+                base_url=settings.sglang_url,
+                admin_url=settings.sglang_admin_url,
+                model=settings.model,
             )
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                settings.model,
+                trust_remote_code=settings.trust_remote_code,
+            )
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.padding_side = "left"
+
+            cfg = PretrainedConfig.from_pretrained(
+                settings.model, trust_remote_code=settings.trust_remote_code
+            )
+            self._num_layers = cast(
+                int | None,
+                getattr(cfg, "num_hidden_layers", None) or getattr(cfg, "n_layer", None),
+            )
+
+            # Legacy attributes are unused in remote mode but expected to exist.
+            self.model = cast(Any, None)
+            self.peft_config = cast(Any, None)
+            self.trusted_models = {settings.model: settings.trust_remote_code}
+            self.max_memory = None
+
+            print(f"Loaded SGLang backend for [bold]{settings.model}[/].")
+            if self._num_layers is not None:
+                print(f"* Transformer model with [bold]{self._num_layers}[/] layers (from config)")
+        else:
+            raise ValueError(f"Unknown backend type: {backend_type}")
 
     def _apply_lora(self):
         # Guard against calling this method at the wrong time.
@@ -216,6 +251,10 @@ class Model:
         - Slow path: If switching models or after merge_and_unload(),
           performs full model reload with quantization config.
         """
+        if self._backend_type != BackendType.LOCAL:
+            # Remote backends hold no in-process weights.
+            return
+
         current_model = getattr(self.model.config, "name_or_path", None)
         if current_model == self.settings.model and not self.needs_reload:
             # Reset LoRA adapters to zero (identity transformation)
@@ -233,6 +272,12 @@ class Model:
         self.needs_reload = False
 
     def get_layers(self) -> ModuleList:
+        if self._backend_type != BackendType.LOCAL:
+            if self._num_layers is None:
+                raise RuntimeError("Remote backend layer count is unknown (missing config field).")
+            # Return a synthetic module list so callers can take len(...).
+            return ModuleList([torch.nn.Identity() for _ in range(self._num_layers)])
+
         model = self.model
 
         # Unwrap PeftModel (always true after _apply_lora)
@@ -247,6 +292,9 @@ class Model:
         return model.model.layers
 
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
+        if self._backend_type != BackendType.LOCAL:
+            raise NotImplementedError("Layer module introspection is only available for local backend.")
+
         layer = self.get_layers()[layer_index]
 
         modules = {}
@@ -297,6 +345,9 @@ class Model:
         return modules
 
     def get_abliterable_components(self) -> list[str]:
+        if self._backend_type != BackendType.LOCAL:
+            # Keep component names stable for downstream logic; remote module selection uses /heretic/module_map.
+            return ["attn.o_proj", "mlp.down_proj"]
         return list(self.get_layer_modules(0).keys())
 
     def abliterate(
@@ -307,6 +358,137 @@ class Model:
         *,
         export_tensors: bool = False,
     ) -> dict[str, Tensor] | None:
+        if self._backend_type == BackendType.SGLANG:
+            if not export_tensors:
+                raise ValueError(
+                    "backend='sglang' requires export_tensors=True (we load adapters into the server)."
+                )
+
+            backend = cast(SGLangBackend, self.backend)
+
+            # Build a minimal LoRA config dict compatible with SGLang's LoRAConfig.
+            target_modules = ["o_proj", "down_proj"]
+            if self.settings.row_normalization == RowNormalization.FULL:
+                lora_rank = self.settings.full_normalization_lora_rank
+            else:
+                lora_rank = 1
+
+            self.peft_config = LoraConfig(
+                r=lora_rank,
+                target_modules=target_modules,
+                lora_alpha=lora_rank,
+                lora_dropout=0,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+
+            # Select which direction to use.
+            if direction_index is None:
+                refusal_direction = None
+            else:
+                frac, idx = math.modf(direction_index)
+                idx_i = int(idx)
+                refusal_direction = F.normalize(
+                    refusal_directions[idx_i].lerp(refusal_directions[idx_i + 1], frac),
+                    p=2,
+                    dim=0,
+                )
+
+            # Fetch canonical module paths from backend and group by component + layer.
+            module_descs = backend.module_map(include_projs=["o_proj", "down_proj"])
+            by_layer_component: dict[tuple[int, str], list[str]] = {}
+            for d in module_descs:
+                layer = d.get("layer")
+                proj = d.get("proj")
+                path = d.get("module_path")
+                if not isinstance(layer, int) or not isinstance(proj, str) or not isinstance(path, str):
+                    continue
+                if proj == "o_proj":
+                    comp = "attn.o_proj"
+                elif proj == "down_proj":
+                    comp = "mlp.down_proj"
+                else:
+                    continue
+                by_layer_component.setdefault((layer, comp), []).append(path)
+
+            exported: dict[str, Tensor] = {}
+
+            # Precompute v^T W for all rank-1 modules in one batch call when possible.
+            vtw_by_name: dict[str, list[float]] = {}
+            if self.settings.row_normalization != RowNormalization.FULL:
+                items: list[dict[str, Any]] = []
+                for (layer_index, comp), paths in by_layer_component.items():
+                    params = parameters[comp]
+                    distance = abs(layer_index - params.max_weight_position)
+                    if distance > params.min_weight_distance:
+                        continue
+                    if refusal_direction is None:
+                        v_vec = refusal_directions[layer_index]
+                    else:
+                        v_vec = refusal_direction
+                    for p in paths:
+                        items.append(
+                            {
+                                "name": p,
+                                "v": v_vec.detach().to(torch.float32).cpu().tolist(),
+                                "dtype": "float32",
+                            }
+                        )
+                if items:
+                    results = backend.compute_vtw_batch(items=items)
+                    for r in results:
+                        name = r.get("name")
+                        vtw = r.get("vtw")
+                        if isinstance(name, str) and isinstance(vtw, list):
+                            vtw_by_name[name] = vtw
+
+            for (layer_index, comp), paths in by_layer_component.items():
+                params = parameters[comp]
+                distance = abs(layer_index - params.max_weight_position)
+                if distance > params.min_weight_distance:
+                    continue
+
+                # Interpolate linearly between max_weight and min_weight over min_weight_distance.
+                w = params.max_weight + (distance / params.min_weight_distance) * (
+                    params.min_weight - params.max_weight
+                )
+
+                if refusal_direction is None:
+                    v_vec = refusal_directions[layer_index]
+                else:
+                    v_vec = refusal_direction
+
+                v_vec = v_vec.to(torch.float32)
+
+                for p in paths:
+                    module_base = p[: -len(".weight")] if p.endswith(".weight") else p
+
+                    if self.settings.row_normalization == RowNormalization.FULL:
+                        A, B = backend.build_full_rownorm_lora(
+                            name=p,
+                            v=v_vec,
+                            weight=float(w),
+                            rank=int(self.settings.full_normalization_lora_rank),
+                            out_dtype="float16",
+                        )
+                    else:
+                        vtw = vtw_by_name.get(p)
+                        if vtw is None:
+                            raise RuntimeError(f"Missing v^T W for module {p}")
+                        A = torch.tensor(vtw, dtype=torch.float32).view(1, -1)
+                        B = (-float(w) * v_vec).view(-1, 1)
+
+                    # SGLang expects weights keyed by strings that include "layers.<idx>." and "lora_A"/"lora_B".
+                    exported[f"{module_base}.lora_A.weight"] = A.to(torch.float16).cpu()
+                    exported[f"{module_base}.lora_B.weight"] = B.to(torch.float16).cpu()
+
+            return exported
+
+        if self._backend_type != BackendType.LOCAL:
+            raise NotImplementedError(
+                "Remote backend support is only implemented for backend='sglang'."
+            )
+
         exported: dict[str, Tensor] | None = {} if export_tensors else None
 
         module_name_by_id = None
@@ -316,9 +498,7 @@ class Model:
         if direction_index is None:
             refusal_direction = None
         else:
-            # The index must be shifted by 1 because the first element
-            # of refusal_directions is the direction for the embeddings.
-            weight, index = math.modf(direction_index + 1)
+            weight, index = math.modf(direction_index)
             refusal_direction = F.normalize(
                 refusal_directions[int(index)].lerp(
                     refusal_directions[int(index) + 1],
@@ -349,9 +529,7 @@ class Model:
                 )
 
                 if refusal_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of refusal_directions is the direction for the embeddings.
-                    layer_refusal_direction = refusal_directions[layer_index + 1]
+                    layer_refusal_direction = refusal_directions[layer_index]
                 else:
                     layer_refusal_direction = refusal_direction
 
@@ -556,7 +734,19 @@ class Model:
         self,
         prompts: list[Prompt],
         skip_special_tokens: bool = False,
+        *,
+        adapter: str | None = None,
     ) -> list[str]:
+        if self._backend_type == BackendType.SGLANG:
+            # Remote generation via SGLang server.
+            input_ids_batch = self.encode_prompts(prompts)
+            backend = cast(SGLangBackend, self.backend)
+            return backend.generate_text(
+                input_ids_batch,
+                max_new_tokens=self.settings.max_response_length,
+                adapter=adapter,
+            )
+
         inputs, outputs = self.generate(
             prompts,
             max_new_tokens=self.settings.max_response_length,
@@ -574,6 +764,8 @@ class Model:
         self,
         prompts: list[Prompt],
         skip_special_tokens: bool = False,
+        *,
+        adapter: str | None = None,
     ) -> list[str]:
         responses = []
 
@@ -581,6 +773,7 @@ class Model:
             for response in self.get_responses(
                 batch,
                 skip_special_tokens=skip_special_tokens,
+                adapter=adapter,
             ):
                 responses.append(response)
 
@@ -591,23 +784,40 @@ class Model:
 
         Contract: `block_input_last_token`
         - Use last token of the *prompt* (not generated token).
-        - Include embeddings stream as index 0.
+        - Do NOT include embeddings stream.
 
-        Shape: (batch, layers_plus_embeddings, d_model)
+        Shape: (batch, layers, d_model)
         """
 
         input_ids_batch = self.encode_prompts(prompts)
-        inputs = self._pad_input_ids_batch(input_ids_batch)
 
-        outputs = self.model(  # ty:ignore[operator]
-            **inputs,
-            output_hidden_states=True,
-            return_dict=True,
-            use_cache=False,
-        )
-        hidden_states = cast(tuple[FloatTensor], outputs.hidden_states)
+        if self._backend_type == BackendType.SGLANG:
+            # Delegate capture to backend. We request all layers when available.
+            if self._num_layers is None:
+                raise RuntimeError(
+                    "Cannot infer number of layers for SGLang residual capture (missing config field)."
+                )
+            capture_layers = list(range(self._num_layers))
+            out = self.backend.capture_residuals(
+                input_ids_batch,
+                capture_layers=capture_layers,
+                capture_point="block_input_last_token",
+                adapter=None,
+            )
+            residuals = out.residuals
+        else:
+            inputs = self._pad_input_ids_batch(input_ids_batch)
 
-        residuals = torch.stack([hs[:, -1, :] for hs in hidden_states], dim=1)
+            outputs = self.model(  # ty:ignore[operator]
+                **inputs,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+            hidden_states = cast(tuple[FloatTensor], outputs.hidden_states)
+
+            # hidden_states[0] is embeddings; drop it to match contract.
+            residuals = torch.stack([hs[:, -1, :] for hs in hidden_states[1:]], dim=1)
 
         # Upcast the data type to avoid precision (bfloat16) or range (float16)
         # problems during calculations involving residual vectors.
@@ -635,8 +845,14 @@ class Model:
     # We work with logprobs rather than probabilities for numerical stability
     # when computing the KL divergence.
     def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
-        # We only generate one token, and we return the (log) probability distributions
-        # over the vocabulary at that token position, for each prompt.
+        input_ids_batch = self.encode_prompts(prompts)
+        if self._backend_type == BackendType.SGLANG:
+            scored = self.backend.score(input_ids_batch, adapter=None)
+            if scored.logprobs_full is None:
+                raise RuntimeError("SGLang backend did not return full-vocab logprobs.")
+            return scored.logprobs_full
+
+        # Local path: generate one token and return logprobs over vocab at that position.
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,
@@ -644,15 +860,8 @@ class Model:
             return_dict_in_generate=True,
         )
 
-        # This cast is valid because GenerateDecoderOnlyOutput is the return type
-        # of model.generate with return_dict_in_generate=True.
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
-
-        # Logits for the first (only) generated token.
-        # This cast is valid because we passed output_scores=True above.
         logits = cast(tuple[FloatTensor], outputs.scores)[0]
-
-        # The returned tensor has shape (prompt, token).
         return F.log_softmax(logits, dim=-1)
 
     def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:

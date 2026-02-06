@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 
 import torch
 
@@ -65,22 +65,54 @@ def _extract_prompt_hashes_from_raw(raw: Any) -> list[str | None]:
     Supports:
     - top-level: {"prompt_ids_sha256": "..."}
     - per-choice: {"choices": [{"prompt_ids_sha256": "..."}, ...]}
+    - SGLang extension: {"sgl_ext": {"prompt_ids_sha256": "..."}}
+    - per-choice SGLang extension: {"choices": [{"sgl_ext": {"prompt_ids_sha256": "..."}}, ...]}
     """
     if not isinstance(raw, dict):
         return []
     if "prompt_ids_sha256" in raw:
         v = raw.get("prompt_ids_sha256")
         return [v if isinstance(v, str) else None]
+    sgl_ext = raw.get("sgl_ext")
+    if isinstance(sgl_ext, dict) and isinstance(sgl_ext.get("prompt_ids_sha256"), str):
+        return [cast(str, sgl_ext["prompt_ids_sha256"])]
     choices = raw.get("choices")
     if not isinstance(choices, list):
         return []
     out: list[str | None] = []
     for c in choices:
-        if isinstance(c, dict) and isinstance(c.get("prompt_ids_sha256"), str):
+        if not isinstance(c, dict):
+            out.append(None)
+            continue
+        if isinstance(c.get("prompt_ids_sha256"), str):
             out.append(c["prompt_ids_sha256"])
+            continue
+        ext = c.get("sgl_ext")
+        if isinstance(ext, dict) and isinstance(ext.get("prompt_ids_sha256"), str):
+            out.append(ext["prompt_ids_sha256"])
         else:
             out.append(None)
     return out
+
+
+def validate_full_vocab_score(
+    backend: HereticBackend,
+    *,
+    input_ids_batch: list[list[int]],
+) -> None:
+    """Ensure backend.score returns full-vocab logprobs with correct batch shape."""
+    result = backend.score(input_ids_batch)
+    t = result.logprobs_full
+    if t is None:
+        raise BackendValidationError("Backend score returned no logprobs_full (required for KL).")
+    if not isinstance(t, torch.Tensor):
+        raise BackendValidationError(f"Backend logprobs_full is not a torch.Tensor: {type(t)}")
+    if t.ndim != 2:
+        raise BackendValidationError(f"Expected logprobs_full.ndim==2, got {t.ndim}")
+    if t.shape[0] != len(input_ids_batch):
+        raise BackendValidationError(
+            f"Expected logprobs_full batch {len(input_ids_batch)}, got {t.shape[0]}"
+        )
 
 
 def validate_prompt_equivalence(
@@ -342,7 +374,7 @@ def run_startup_validations(
     try:
         baseline = None
         if baseline_residuals_fn is not None:
-            # baseline is layers_plus_embeddings; select requested capture layers.
+            # baseline is (batch, layers, d_model); select requested capture layers.
             full = baseline_residuals_fn(sample)
             baseline = full[:, list(cfg.residual_capture_layers), :].contiguous()
         validate_residual_mapping(
@@ -389,6 +421,14 @@ def run_startup_validations(
     except Exception as e:
         vtw_ok = False
         notes.append(f"compute_vtw failed: {e}")
+
+    # 5) full-vocab scoring (KL prerequisite)
+    try:
+        validate_full_vocab_score(backend, input_ids_batch=input_ids_batch[: min(4, len(input_ids_batch))])
+    except Exception as e:
+        notes.append(f"full_vocab_score failed: {e}")
+        # Treat as a hard failure in strict mode.
+        prompt_ok = False
 
     # Allow disabling failures in emergency debug sessions.
     if os.environ.get("HERETIC_VALIDATION_STRICT", "1") not in ("0", "false", "False"):

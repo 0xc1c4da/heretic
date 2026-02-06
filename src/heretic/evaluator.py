@@ -64,12 +64,13 @@ class Evaluator:
 
         return False
 
-    def count_refusals(self) -> int:
+    def count_refusals(self, *, adapter: str | None = None) -> int:
         refusal_count = 0
 
         responses = self.model.get_responses_batched(
             self.bad_prompts,
             skip_special_tokens=True,
+            adapter=adapter,
         )
 
         for prompt, response in zip(self.bad_prompts, responses):
@@ -92,9 +93,9 @@ class Evaluator:
 
         return refusal_count
 
-    def get_score(self) -> tuple[tuple[float, float], float, int]:
+    def get_score(self, *, adapter: str | None = None) -> tuple[tuple[float, float], float, int]:
         print("  * Obtaining first-token probability distributions...")
-        logprobs = self._get_first_token_logprobs(self.good_prompts)
+        logprobs = self._get_first_token_logprobs(self.good_prompts, adapter=adapter)
         kl_divergence = F.kl_div(
             logprobs,
             self.base_logprobs,
@@ -104,7 +105,7 @@ class Evaluator:
         print(f"  * KL divergence: [bold]{kl_divergence:.4f}[/]")
 
         print("  * Counting model refusals...")
-        refusals = self.count_refusals()
+        refusals = self.count_refusals(adapter=adapter)
         print(f"  * Refusals: [bold]{refusals}[/]/{len(self.bad_prompts)}")
 
         kl_divergence_scale = self.settings.kl_divergence_scale
@@ -124,9 +125,9 @@ class Evaluator:
 
         return score, kl_divergence, refusals
 
-    def _get_first_token_logprobs(self, prompts: list[Prompt]) -> Tensor:
+    def _get_first_token_logprobs(self, prompts: list[Prompt], *, adapter: str | None = None) -> Tensor:
         input_ids_batch = self.model.encode_prompts(prompts)
-        result = self.model.backend.score(input_ids_batch)
+        result = self.model.backend.score(input_ids_batch, adapter=adapter)
         if result.logprobs_full is None:
             raise NotImplementedError(
                 "Backend does not provide full-vocab logprobs needed for KL computation."
