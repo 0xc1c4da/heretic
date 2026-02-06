@@ -415,7 +415,12 @@ def run():
             backend=model.backend,
             prompts=good_prompts,
             encode_prompts=model.encode_prompts,
-            baseline_residuals_fn=model.get_residuals,
+            # For backend="sglang", baseline residuals are not meaningful (they would come from the same
+            # remote backend) and may require full-layer capture, which depends on local HF config fields
+            # not always being present in tokenizer-only snapshots.
+            baseline_residuals_fn=(
+                model.get_residuals if settings.backend == BackendType.LOCAL else None
+            ),
         )
         print("* Backend validations passed")
 
