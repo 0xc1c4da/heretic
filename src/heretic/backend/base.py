@@ -14,10 +14,10 @@ class BackendMetadata:
     model_id: str
     tokenizer_id: str | None
     max_context_len: int | None
+    supports: dict[str, bool]
     num_layers: int | None = None
     hidden_size: int | None = None
     vocab_size: int | None = None
-    supports: dict[str, bool]
 
 
 @dataclass(frozen=True)
