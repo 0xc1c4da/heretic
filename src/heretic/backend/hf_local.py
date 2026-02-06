@@ -29,6 +29,7 @@ from .base import (
     ModuleRef,
     ResidualCaptureResult,
     ScoreResult,
+    TokenizeChatResult,
     VTWResult,
 )
 
@@ -198,14 +199,92 @@ class HFLocalBackend(HereticBackend):
             model_id=model_id,
             tokenizer_id=getattr(self._state.tokenizer, "name_or_path", None),
             max_context_len=getattr(base.config, "max_position_embeddings", None),
+            num_layers=getattr(base.config, "num_hidden_layers", None),
+            hidden_size=getattr(base.config, "hidden_size", None),
+            vocab_size=getattr(base.config, "vocab_size", None),
             supports={
                 "input_ids": True,
                 "logprobs_full": True,
                 "hidden_states_hf": True,
                 "lora_inprocess": True,
                 "compute_vtw": True,
+                "tokenize_chat": True,
+                "generate_text": True,
             },
         )
+
+    def generate_text(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        max_new_tokens: int,
+        adapter: str | None = None,
+        temperature: float = 0.0,
+    ) -> list[str]:
+        if adapter is not None:
+            raise NotImplementedError("HFLocalBackend adapter selection is not implemented yet.")
+        if temperature != 0.0:
+            raise NotImplementedError(
+                "HFLocalBackend generate_text only supports temperature=0.0 for now."
+            )
+
+        tokenizer = self._state.tokenizer
+        model = self._state.model
+
+        input_ids, attention_mask = _left_pad(input_ids_batch, tokenizer.pad_token_id)
+        input_ids = input_ids.to(model.device)
+        attention_mask = attention_mask.to(model.device)
+
+        outputs = model.generate(  # ty:ignore[call-non-callable]
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        # Decode only the newly generated region.
+        gen = outputs[:, input_ids.shape[1] :]
+        return tokenizer.batch_decode(gen, skip_special_tokens=True)
+
+    def tokenize_chat(
+        self,
+        chats: list[list[dict[str, Any]]],
+        *,
+        continue_final_message: bool = False,
+    ) -> TokenizeChatResult:
+        tokenizer = self._state.tokenizer
+
+        token_ids_batch: list[list[int]] = []
+        for chat in chats:
+            messages = list(chat)
+            prefix = ""
+            if (
+                continue_final_message
+                and messages
+                and messages[-1].get("role") == "assistant"
+            ):
+                content = messages[-1].get("content")
+                if isinstance(content, str):
+                    prefix = content
+                messages = messages[:-1]
+
+            ids = cast(
+                list[int],
+                tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                ),
+            )
+            if prefix:
+                prefix_ids = cast(
+                    list[int],
+                    tokenizer(prefix, add_special_tokens=False)["input_ids"],
+                )
+                ids = ids + prefix_ids
+            token_ids_batch.append(ids)
+
+        return TokenizeChatResult(token_ids=token_ids_batch, prompt_ids_sha256=None, meta=None)
 
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
         if adapter is not None:
