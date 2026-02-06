@@ -102,7 +102,9 @@ class HereticBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def load_adapter(self, *, name: str, tensors: dict[str, torch.Tensor], config: dict) -> None:
+    def load_adapter(
+        self, *, name: str, tensors: dict[str, torch.Tensor], config: dict
+    ) -> str | None:
         raise NotImplementedError
 
     @abstractmethod

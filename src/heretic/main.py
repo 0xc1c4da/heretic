@@ -553,11 +553,21 @@ def run():
                 export_tensors=True,
             )
             assert tensors is not None
-            # Minimal config; backend-specific loader may require additional fields later.
-            config = {"r": model.peft_config.r, "lora_alpha": model.peft_config.lora_alpha}
-            model.backend.load_adapter(name=adapter_name, tensors=tensors, config=config)
+            # Minimal config compatible with SGLang LoRAConfig.
+            config = {
+                "r": model.peft_config.r,
+                "lora_alpha": model.peft_config.lora_alpha,
+                "target_modules": list(model.peft_config.target_modules),
+            }
+            adapter_id = model.backend.load_adapter(
+                name=adapter_name,
+                tensors=tensors,
+                config=config,
+            )
         print("* Evaluating...")
-        score, kl_divergence, refusals = evaluator.get_score()
+        score, kl_divergence, refusals = evaluator.get_score(
+            adapter=(adapter_id if backend_type != BackendType.LOCAL else None),
+        )
         if backend_type != BackendType.LOCAL:
             model.backend.unload_adapter(name=adapter_name)
 

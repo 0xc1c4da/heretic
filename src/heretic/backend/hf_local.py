@@ -298,7 +298,9 @@ class HFLocalBackend(HereticBackend):
         vtw = v @ W.to(dtype)
         return VTWResult(target=target, vtw=vtw, implementation="dense_matmul")
 
-    def load_adapter(self, *, name: str, tensors: dict[str, torch.Tensor], config: dict) -> None:
+    def load_adapter(
+        self, *, name: str, tensors: dict[str, torch.Tensor], config: dict
+    ) -> str | None:
         raise NotImplementedError("Adapter hot-swap is implemented via SGLang backend.")
 
     def unload_adapter(self, *, name: str) -> None:
