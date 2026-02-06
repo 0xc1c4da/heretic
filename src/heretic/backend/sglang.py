@@ -200,6 +200,11 @@ class SGLangBackend(HereticBackend):
         modules = data.get("modules")
         if not isinstance(modules, list):
             raise RuntimeError(f"Unexpected /heretic/module_map response: {data}")
+        # When SGLang runs with dp_size > 1, it returns one module list per DP rank:
+        # {"modules": [rank0_modules, rank1_modules, ...]}.
+        # Those lists should be identical; normalize to a single list for clients.
+        if modules and isinstance(modules[0], list):
+            modules = modules[0]
         return modules
 
     def compute_vtw_batch(
