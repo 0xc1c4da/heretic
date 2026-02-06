@@ -791,6 +791,28 @@ class Model:
         if self._backend_type == BackendType.SGLANG:
             # Delegate capture to backend. We request all layers when available.
             if self._num_layers is None:
+                # Try to infer layer count from the remote module map.
+                # This avoids relying on local HF config fields, which may be missing in some
+                # on-disk model snapshots used purely for tokenizer/config.
+                try:
+                    backend = cast(SGLangBackend, self.backend)
+                    descs = backend.module_map(include_projs=["o_proj", "down_proj"])
+                    layers = [
+                        d.get("layer")
+                        for d in descs
+                        if isinstance(d, dict) and isinstance(d.get("layer"), int)
+                    ]
+                    if layers:
+                        self._num_layers = int(max(layers) + 1)
+                        print(
+                            f"* Inferred [bold]{self._num_layers}[/] layers from SGLang /heretic/module_map"
+                        )
+                except Exception as e:
+                    raise RuntimeError(
+                        "Cannot infer number of layers for SGLang residual capture (missing config field and module_map inference failed)."
+                    ) from e
+
+            if self._num_layers is None:
                 raise RuntimeError(
                     "Cannot infer number of layers for SGLang residual capture (missing config field)."
                 )
