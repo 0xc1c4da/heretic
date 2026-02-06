@@ -260,6 +260,8 @@ def main() -> int:
                         {
                             "lora_name": adapter_name,
                             "config_dict": {
+                                # SGLang expects PEFT-style config fields.
+                                "peft_type": "LORA",
                                 "r": r,
                                 "lora_alpha": r,
                                 "target_modules": target_modules,

@@ -396,6 +396,9 @@ class SGLangBackend(HereticBackend):
     def load_adapter(self, *, name: str, tensors: dict[str, torch.Tensor], config: dict) -> str:
         # SGLang expects a dict of CPU tensors serialized + base64.
         cpu_tensors = {k: v.detach().cpu() for k, v in tensors.items()}
+        # Ensure minimal PEFT-style config keys required by SGLang.
+        config = dict(config)
+        config.setdefault("peft_type", "LORA")
         payload = {
             "lora_name": name,
             "config_dict": config,
