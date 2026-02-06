@@ -18,6 +18,7 @@ from .base import (
     ModuleRef,
     ResidualCaptureResult,
     ScoreResult,
+    TokenizeChatResult,
     VTWResult,
 )
 
@@ -79,7 +80,33 @@ class SGLangBackend(HereticBackend):
                 "logprobs_full": True,
                 "compute_vtw": True,
                 "lora_hot_swap": True,
+                "tokenize_chat": True,
+                "generate_text": True,
             },
+        )
+
+    def tokenize_chat(
+        self,
+        chats: list[list[dict[str, Any]]],
+        *,
+        continue_final_message: bool = False,
+    ) -> TokenizeChatResult:
+        resp = _post_json(
+            f"{self.base_url}/heretic/tokenize_chat",
+            {
+                "chats": chats,
+                "continue_final_message": continue_final_message,
+            },
+            timeout_s=120.0,
+        )
+        token_ids = resp.data.get("token_ids")
+        prompt_ids_sha256 = resp.data.get("prompt_ids_sha256")
+        if not isinstance(token_ids, list):
+            raise RuntimeError(f"Unexpected /heretic/tokenize_chat response: {resp.data}")
+        return TokenizeChatResult(
+            token_ids=token_ids,
+            prompt_ids_sha256=prompt_ids_sha256 if isinstance(prompt_ids_sha256, list) else None,
+            meta={"raw": resp.data},
         )
 
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
