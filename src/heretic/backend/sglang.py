@@ -283,6 +283,30 @@ class SGLangBackend(HereticBackend):
         capture_point: str = "block_input_last_token",
         adapter: str | None = None,
     ) -> ResidualCaptureResult:
+        # Hidden-state capture support can vary by server/model and may effectively only
+        # work reliably for single-item requests. To keep the contract stable for Heretic
+        # (batch, layers, d_model), we chunk larger batches into per-item requests.
+        if len(input_ids_batch) > 1:
+            parts: list[torch.Tensor] = []
+            raws: list[Any] = []
+            for ids in input_ids_batch:
+                one = self.capture_residuals(
+                    [ids],
+                    capture_layers=capture_layers,
+                    capture_point=capture_point,
+                    adapter=adapter,
+                )
+                # one.residuals: (1, layers, d_model)
+                parts.append(one.residuals[0])
+                raws.append((one.meta or {}).get("raw"))
+            t = torch.stack(parts, dim=0)
+            return ResidualCaptureResult(
+                residuals=t,
+                captured_layers=capture_layers,
+                capture_point=capture_point,
+                meta={"raw": raws},
+            )
+
         # Prefer native /generate: stable schema, supports batched input_ids + lora_id.
         # Fallback to OpenAI /v1/completions for older servers.
         try:
@@ -382,9 +406,7 @@ class SGLangBackend(HereticBackend):
                 meta = out.get("meta_info") or {}
                 hs_steps = meta.get("hidden_states")
                 if hs_steps is None:
-                    raise RuntimeError(
-                        "SGLang /generate response missing meta_info.hidden_states (return_hidden_states=True)."
-                    )
+                    raise RuntimeError("SGLang /generate missing meta_info.hidden_states.")
                 per_item.append(_parse_hidden_states(hs_steps))
 
         except Exception:
