@@ -301,6 +301,15 @@ class Settings(BaseSettings):
         description="System prompt to use when prompting the model.",
     )
 
+    detect_response_prefix: bool = Field(
+        default=True,
+        description=(
+            "Whether to probe for a common response prefix by generating a small batch of "
+            "responses at startup. This is used to suppress boilerplate (e.g., thinking tags). "
+            "Disable to skip the extra warmup generation."
+        ),
+    )
+
     good_prompts: DatasetSpecification = Field(
         default=DatasetSpecification(
             dataset="mlabonne/harmless_alpaca",
