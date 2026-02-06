@@ -357,6 +357,17 @@ def run_startup_validations(
         )
 
     input_ids_batch = encode_prompts(sample)
+    # Remote backends can have stricter per-request batch limits than Heretic's dataset slices.
+    # For startup validations we only need a small batch to validate endpoint contracts.
+    try:
+        backend_name = backend.get_metadata().backend_name
+    except Exception:
+        backend_name = ""
+    if backend_name == "sglang" and len(input_ids_batch) > 4:
+        notes.append(
+            f"startup validation: limiting SGLang batch from {len(input_ids_batch)} to 4 prompts"
+        )
+        input_ids_batch = input_ids_batch[:4]
 
     prompt_ok = True
     residual_ok = True
