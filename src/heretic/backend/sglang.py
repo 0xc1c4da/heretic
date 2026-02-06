@@ -194,7 +194,7 @@ class SGLangBackend(HereticBackend):
         resp = _post_json(
             f"{self.base_url}/heretic/module_map",
             {"include_projs": include_projs},
-            timeout_s=60.0,
+            timeout_s=300.0,
         )
         data = resp.data
         modules = data.get("modules")

@@ -119,6 +119,7 @@ def main() -> int:
         lambda: _post_json(
             f"{base_url}/heretic/module_map",
             {"include_projs": None},
+            timeout_s=300.0,
         ),
     )
 
