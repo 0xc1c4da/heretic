@@ -2,3 +2,7 @@
 	path = vendor/sglang
 	url = https://github.com/0xc1c4da/sglang.git
 	branch = heretic-main
+[submodule "vendor/ktransformers"]
+	path = vendor/ktransformers
+	url = https://github.com/kvcache-ai/ktransformers.git
+	branch = kimi_k2.5
