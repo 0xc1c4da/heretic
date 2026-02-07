@@ -619,9 +619,31 @@ class Model:
                         A = torch.tensor(vtw, dtype=torch.float32).view(1, -1)
                         B = (-float(w) * v_vec).view(-1, 1)
 
-                    # SGLang expects weights keyed by strings that include "layers.<idx>." and "lora_A"/"lora_B".
-                    exported[f"{module_base}.lora_A.weight"] = A.to(torch.float16).cpu()
-                    exported[f"{module_base}.lora_B.weight"] = B.to(torch.float16).cpu()
+                    # Preflight: ensure exported shapes match backend logical dims when provided.
+                    # The backend's module_map is the source of truth for (out_features, in_features).
+                    info = None
+                    for d in module_descs:
+                        if isinstance(d, dict) and d.get("module_path") == p:
+                            info = d
+                            break
+                    if info is not None:
+                        exp_in = info.get("in_features")
+                        exp_out = info.get("out_features")
+                        if isinstance(exp_in, int) and A.ndim == 2 and int(A.shape[1]) != int(exp_in):
+                            raise RuntimeError(
+                                f"LoRA A shape mismatch for {p}: got {tuple(int(x) for x in A.shape)} "
+                                f"expected (*, {int(exp_in)})"
+                            )
+                        if isinstance(exp_out, int) and B.ndim == 2 and int(B.shape[0]) != int(exp_out):
+                            raise RuntimeError(
+                                f"LoRA B shape mismatch for {p}: got {tuple(int(x) for x in B.shape)} "
+                                f"expected ({int(exp_out)}, *)"
+                            )
+
+                    # Emit PEFT-style default adapter keys to improve HF/PEFT reload compatibility.
+                    # SGLang accepts these as it matches on substring `lora_A`/`lora_B`.
+                    exported[f\"{module_base}.lora_A.default.weight\"] = A.to(torch.float16).cpu()
+                    exported[f\"{module_base}.lora_B.default.weight\"] = B.to(torch.float16).cpu()
 
             if not exported:
                 # Produce a highly actionable error instead of silently returning an empty adapter.

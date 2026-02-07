@@ -35,25 +35,40 @@ class LoraAdapterBundle:
         b = 0
         layer_compatible = 0
         module_bases: dict[str, set[str]] = {}
+        def _suffix_kind(key: str) -> tuple[str, str] | None:
+            # Return (base, kind) where kind in {"A","B"}.
+            for suf, kind in (
+                (".lora_A.default.weight", "A"),
+                (".lora_B.default.weight", "B"),
+                (".lora_A.weight", "A"),
+                (".lora_B.weight", "B"),
+            ):
+                if key.endswith(suf):
+                    return (key[: -len(suf)], kind)
+            return None
+
         for k, v in self.tensors.items():
             if not isinstance(k, str) or not isinstance(v, torch.Tensor):
                 raise ValueError(f"Invalid LoRA tensor entry: {type(k).__name__} -> {type(v).__name__}")
-            if not (k.endswith(".lora_A.weight") or k.endswith(".lora_B.weight")):
-                raise ValueError(f"Unexpected LoRA tensor key (missing lora_A/lora_B suffix): {k}")
+            sk = _suffix_kind(k)
+            if sk is None:
+                raise ValueError(
+                    "Unexpected LoRA tensor key suffix (expected one of "
+                    "'.lora_A.weight', '.lora_B.weight', '.lora_A.default.weight', '.lora_B.default.weight'): "
+                    f"{k}"
+                )
             if v.ndim != 2:
                 raise ValueError(f"Unexpected LoRA tensor rank (expected 2D): {k} {tuple(int(x) for x in v.shape)}")
 
             if re.search(r"layers\.(\d+)\.", k) is not None:
                 layer_compatible += 1
 
-            if k.endswith(".lora_A.weight"):
+            base, kind = sk
+            if kind == "A":
                 a += 1
-                base = k[: -len(".lora_A.weight")]
-                module_bases.setdefault(base, set()).add("A")
             else:
                 b += 1
-                base = k[: -len(".lora_B.weight")]
-                module_bases.setdefault(base, set()).add("B")
+            module_bases.setdefault(base, set()).add(kind)
 
         if a == 0 or b == 0:
             raise ValueError(f"LoRA bundle missing A/B weights: {a=} {b=}")
