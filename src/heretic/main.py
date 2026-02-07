@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import warnings
+from contextlib import suppress
 from dataclasses import asdict
 from importlib.metadata import version
 from os.path import commonprefix
@@ -53,6 +54,57 @@ from .utils import (
     prompt_select,
     prompt_text,
 )
+
+
+def save_lora_adapter_bundle(
+    *,
+    tensors: dict[str, torch.Tensor],
+    config: dict,
+    tokenizer,
+    save_directory: str,
+    base_model_name_or_path: str,
+) -> None:
+    """Save a LoRA adapter bundle to disk (PEFT/SGLang compatible).
+
+    Writes:
+    - `adapter_config.json`
+    - `adapter_model.safetensors` (preferred) or `adapter_model.bin` (fallback)
+    - tokenizer files via `tokenizer.save_pretrained(...)`
+    """
+    os.makedirs(save_directory, exist_ok=True)
+
+    adapter_cfg = dict(config)
+    adapter_cfg.setdefault("peft_type", "LORA")
+    adapter_cfg.setdefault("base_model_name_or_path", base_model_name_or_path)
+    adapter_cfg.setdefault("inference_mode", True)
+
+    with open(os.path.join(save_directory, "adapter_config.json"), "w") as f:
+        import json
+
+        json.dump(adapter_cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+    # Ensure tensors are CPU + contiguous.
+    state: dict[str, torch.Tensor] = {}
+    for k, v in tensors.items():
+        if not isinstance(k, str) or not isinstance(v, torch.Tensor):
+            continue
+        state[k] = v.detach().to("cpu").contiguous()
+    if not state:
+        raise RuntimeError("No LoRA tensors to save (empty export).")
+
+    # Prefer safetensors; fall back to torch.save for environments without it.
+    try:
+        from safetensors.torch import save_file as safetensors_save_file  # type: ignore[import-not-found]
+
+        safetensors_save_file(
+            state,
+            os.path.join(save_directory, "adapter_model.safetensors"),
+        )
+    except Exception:
+        torch.save(state, os.path.join(save_directory, "adapter_model.bin"))
+
+    tokenizer.save_pretrained(save_directory)
 
 
 def obtain_merge_strategy(settings: Settings) -> str | None:
@@ -703,14 +755,24 @@ def run():
         print()
         print("[bold green]Optimization finished![/]")
         print()
-        print(
-            (
-                "The following trials resulted in Pareto optimal combinations of refusals and KL divergence. "
-                "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
-                "or chat with it to test how well it works. You can return to this menu later to select a different trial. "
-                "[yellow]Note that KL divergence values above 1 usually indicate significant damage to the original model's capabilities.[/]"
+        if settings.backend == BackendType.LOCAL:
+            print(
+                (
+                    "The following trials resulted in Pareto optimal combinations of refusals and KL divergence. "
+                    "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
+                    "or chat with it to test how well it works. You can return to this menu later to select a different trial. "
+                    "[yellow]Note that KL divergence values above 1 usually indicate significant damage to the original model's capabilities.[/]"
+                )
             )
-        )
+        else:
+            print(
+                (
+                    "The following trials resulted in Pareto optimal combinations of refusals and KL divergence. "
+                    "After selecting a trial, you will be able to save the LoRA adapter and chat with the model via the backend. "
+                    "You can return to this menu later to select a different trial. "
+                    "[yellow]Note that KL divergence values above 1 usually indicate significant damage to the original model's capabilities.[/]"
+                )
+            )
 
         while True:
             print()
@@ -750,171 +812,243 @@ def run():
             print("* Parameters:")
             for name, value in get_trial_parameters(trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
+            backend_type = getattr(settings, "backend", BackendType.LOCAL)
+            adapter_name = f"selected_trial_{trial.user_attrs['index']}"
+            adapter_id = None
+            adapter_tensors = None
+            adapter_config = None
+
             print("* Resetting model...")
             model.reset_model()
             print("* Abliterating...")
-            model.abliterate(
-                refusal_directions,
-                trial.user_attrs["direction_index"],
-                {
-                    k: AbliterationParameters(**v)
-                    for k, v in trial.user_attrs["parameters"].items()
-                },
-            )
-
-            while True:
-                print()
-                action = prompt_select(
-                    "What do you want to do with the decensored model?",
-                    [
-                        "Save the model to a local folder",
-                        "Upload the model to Hugging Face",
-                        "Chat with the model",
-                        "Nothing (return to trial selection menu)",
-                    ],
+            if backend_type == BackendType.LOCAL:
+                model.abliterate(
+                    refusal_directions,
+                    trial.user_attrs["direction_index"],
+                    {
+                        k: AbliterationParameters(**v)
+                        for k, v in trial.user_attrs["parameters"].items()
+                    },
+                )
+            else:
+                # Backend path: build adapter tensors locally, load into backend.
+                adapter_tensors = model.abliterate(
+                    refusal_directions,
+                    trial.user_attrs["direction_index"],
+                    {
+                        k: AbliterationParameters(**v)
+                        for k, v in trial.user_attrs["parameters"].items()
+                    },
+                    export_tensors=True,
+                )
+                assert adapter_tensors is not None
+                adapter_config = {
+                    "r": model.peft_config.r,
+                    "lora_alpha": model.peft_config.lora_alpha,
+                    "target_modules": list(model.peft_config.target_modules),
+                }
+                print("* Loading adapter into backend...")
+                adapter_id = model.backend.load_adapter(
+                    name=adapter_name,
+                    tensors=adapter_tensors,
+                    config=adapter_config,
                 )
 
-                if (
-                    action is None
-                    or action == "Nothing (return to trial selection menu)"
-                ):
-                    break
+            try:
+                while True:
+                    print()
+                    if backend_type == BackendType.LOCAL:
+                        action = prompt_select(
+                            "What do you want to do with the decensored model?",
+                            [
+                                "Save the model to a local folder",
+                                "Upload the model to Hugging Face",
+                                "Chat with the model",
+                                "Nothing (return to trial selection menu)",
+                            ],
+                        )
+                    else:
+                        action = prompt_select(
+                            "What do you want to do with the decensored model?",
+                            [
+                                "Save LoRA adapter to a local folder",
+                                "Chat with the model",
+                                "Nothing (return to trial selection menu)",
+                            ],
+                        )
 
-                # All actions are wrapped in a try/except block so that if an error occurs,
-                # another action can be tried, instead of the program crashing and losing
-                # the optimized model.
-                try:
-                    match action:
-                        case "Save the model to a local folder":
-                            save_directory = prompt_path("Path to the folder:")
-                            if not save_directory:
-                                continue
+                    if (
+                        action is None
+                        or action == "Nothing (return to trial selection menu)"
+                    ):
+                        break
 
-                            save_model(
-                                model,
-                                save_directory,
-                                settings,
-                            )
+                    # All actions are wrapped in a try/except block so that if an error occurs,
+                    # another action can be tried, instead of the program crashing and losing
+                    # the optimized model.
+                    try:
+                        match action:
+                            case "Save the model to a local folder":
+                                save_directory = prompt_path("Path to the folder:")
+                                if not save_directory:
+                                    continue
 
-                        case "Upload the model to Hugging Face":
-                            # We don't use huggingface_hub.login() because that stores the token on disk,
-                            # and since this program will often be run on rented or shared GPU servers,
-                            # it's better to not persist credentials.
-                            token = huggingface_hub.get_token()
-                            if not token:
-                                token = prompt_password("Hugging Face access token:")
-                            if not token:
-                                continue
+                                save_model(
+                                    model,
+                                    save_directory,
+                                    settings,
+                                )
 
-                            user = huggingface_hub.whoami(token)
-                            fullname = user.get(
-                                "fullname",
-                                user.get("name", "unknown user"),
-                            )
-                            email = user.get("email", "no email found")
-                            print(f"Logged in as [bold]{fullname} ({email})[/]")
+                            case "Save LoRA adapter to a local folder":
+                                save_directory = prompt_path("Path to the folder:")
+                                if not save_directory:
+                                    continue
+                                assert adapter_tensors is not None
+                                assert adapter_config is not None
+                                save_lora_adapter_bundle(
+                                    tensors=adapter_tensors,
+                                    config=adapter_config,
+                                    tokenizer=model.tokenizer,
+                                    save_directory=save_directory,
+                                    base_model_name_or_path=settings.model,
+                                )
+                                print(f"Adapter saved to [bold]{save_directory}[/].")
 
-                            repo_id = prompt_text(
-                                "Name of repository:",
-                                default=f"{user['name']}/{Path(settings.model).name}-heretic",
-                            )
+                            case "Upload the model to Hugging Face":
+                                # We don't use huggingface_hub.login() because that stores the token on disk,
+                                # and since this program will often be run on rented or shared GPU servers,
+                                # it's better to not persist credentials.
+                                token = huggingface_hub.get_token()
+                                if not token:
+                                    token = prompt_password("Hugging Face access token:")
+                                if not token:
+                                    continue
 
-                            visibility = prompt_select(
-                                "Should the repository be public or private?",
-                                [
-                                    "Public",
-                                    "Private",
-                                ],
-                            )
-                            private = visibility == "Private"
+                                user = huggingface_hub.whoami(token)
+                                fullname = user.get(
+                                    "fullname",
+                                    user.get("name", "unknown user"),
+                                )
+                                email = user.get("email", "no email found")
+                                print(f"Logged in as [bold]{fullname} ({email})[/]")
 
-                            strategy = obtain_merge_strategy(settings)
-                            if strategy is None:
-                                print("[yellow]Action cancelled.[/]")
-                                continue
+                                repo_id = prompt_text(
+                                    "Name of repository:",
+                                    default=f"{user['name']}/{Path(settings.model).name}-heretic",
+                                )
 
-                            if strategy == "adapter":
-                                print("Uploading LoRA adapter...")
-                                model.model.push_to_hub(
+                                visibility = prompt_select(
+                                    "Should the repository be public or private?",
+                                    [
+                                        "Public",
+                                        "Private",
+                                    ],
+                                )
+                                private = visibility == "Private"
+
+                                strategy = obtain_merge_strategy(settings)
+                                if strategy is None:
+                                    print("[yellow]Action cancelled.[/]")
+                                    continue
+
+                                if strategy == "adapter":
+                                    print("Uploading LoRA adapter...")
+                                    model.model.push_to_hub(
+                                        repo_id,
+                                        private=private,
+                                        token=token,
+                                    )
+                                else:
+                                    print("Uploading merged model...")
+                                    merged_model = model.get_merged_model()
+                                    merged_model.push_to_hub(
+                                        repo_id,
+                                        private=private,
+                                        token=token,
+                                    )
+                                    del merged_model
+                                    empty_cache()
+
+                                model.tokenizer.push_to_hub(
                                     repo_id,
                                     private=private,
                                     token=token,
                                 )
-                            else:
-                                print("Uploading merged model...")
-                                merged_model = model.get_merged_model()
-                                merged_model.push_to_hub(
-                                    repo_id,
-                                    private=private,
-                                    token=token,
-                                )
-                                del merged_model
-                                empty_cache()
 
-                            model.tokenizer.push_to_hub(
-                                repo_id,
-                                private=private,
-                                token=token,
-                            )
-
-                            # If the model path doesn't exist locally, it can be assumed
-                            # to be a model hosted on the Hugging Face Hub, in which case
-                            # we can retrieve the model card.
-                            if not Path(settings.model).exists():
-                                card = ModelCard.load(settings.model)
-                                if card.data is None:
-                                    card.data = ModelCardData()
-                                if card.data.tags is None:
-                                    card.data.tags = []
-                                card.data.tags.append("heretic")
-                                card.data.tags.append("uncensored")
-                                card.data.tags.append("decensored")
-                                card.data.tags.append("abliterated")
-                                card.text = (
-                                    get_readme_intro(
-                                        settings,
-                                        trial,
-                                        evaluator.base_refusals,
-                                        evaluator.bad_prompts,
+                                # If the model path doesn't exist locally, it can be assumed
+                                # to be a model hosted on the Hugging Face Hub, in which case
+                                # we can retrieve the model card.
+                                if not Path(settings.model).exists():
+                                    card = ModelCard.load(settings.model)
+                                    if card.data is None:
+                                        card.data = ModelCardData()
+                                    if card.data.tags is None:
+                                        card.data.tags = []
+                                    card.data.tags.append("heretic")
+                                    card.data.tags.append("uncensored")
+                                    card.data.tags.append("decensored")
+                                    card.data.tags.append("abliterated")
+                                    card.text = (
+                                        get_readme_intro(
+                                            settings,
+                                            trial,
+                                            evaluator.base_refusals,
+                                            evaluator.bad_prompts,
+                                        )
+                                        + card.text
                                     )
-                                    + card.text
+                                    card.push_to_hub(repo_id, token=token)
+
+                                print(f"Model uploaded to [bold]{repo_id}[/].")
+
+                            case "Chat with the model":
+                                print()
+                                print(
+                                    "[cyan]Press Ctrl+C at any time to return to the menu.[/]"
                                 )
-                                card.push_to_hub(repo_id, token=token)
 
-                            print(f"Model uploaded to [bold]{repo_id}[/].")
+                                chat = [
+                                    {"role": "system", "content": settings.system_prompt},
+                                ]
 
-                        case "Chat with the model":
-                            print()
-                            print(
-                                "[cyan]Press Ctrl+C at any time to return to the menu.[/]"
-                            )
+                                while True:
+                                    try:
+                                        message = prompt_text(
+                                            "User:",
+                                            qmark=">",
+                                            unsafe=True,
+                                        )
+                                        if not message:
+                                            break
+                                        chat.append({"role": "user", "content": message})
 
-                            chat = [
-                                {"role": "system", "content": settings.system_prompt},
-                            ]
-
-                            while True:
-                                try:
-                                    message = prompt_text(
-                                        "User:",
-                                        qmark=">",
-                                        unsafe=True,
-                                    )
-                                    if not message:
+                                        print("[bold]Assistant:[/] ", end="")
+                                        if backend_type == BackendType.LOCAL:
+                                            response = model.stream_chat_response(chat)
+                                        else:
+                                            tok = model.backend.tokenize_chat([chat])
+                                            texts = model.backend.generate_text(
+                                                tok.token_ids,
+                                                max_new_tokens=4096,
+                                                adapter=adapter_id,
+                                                temperature=0.0,
+                                            )
+                                            response = texts[0]
+                                            print(response)
+                                        chat.append(
+                                            {"role": "assistant", "content": response}
+                                        )
+                                    except (KeyboardInterrupt, EOFError):
+                                        # Ctrl+C/Ctrl+D
                                         break
-                                    chat.append({"role": "user", "content": message})
 
-                                    print("[bold]Assistant:[/] ", end="")
-                                    response = model.stream_chat_response(chat)
-                                    chat.append(
-                                        {"role": "assistant", "content": response}
-                                    )
-                                except (KeyboardInterrupt, EOFError):
-                                    # Ctrl+C/Ctrl+D
-                                    break
-
-                except Exception as error:
-                    print(f"[red]Error: {error}[/]")
+                    except Exception as error:
+                        print(f"[red]Error: {error}[/]")
+            finally:
+                if backend_type != BackendType.LOCAL:
+                    # Best-effort cleanup so we don't accumulate dynamic adapters.
+                    with suppress(Exception):
+                        model.backend.unload_adapter(name=adapter_name)
 
 
 def main():
