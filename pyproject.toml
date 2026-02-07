@@ -56,6 +56,8 @@ dev = [
 inference = [
     # When developing against embedded SGLang Engine, keep it editable and uv-managed.
     "sglang",
+    # Required for KTransformers RAWINT4 / EP wrapper (Kimi-K2.5).
+    "kt-kernel",
 ]
 
 [project.urls]
@@ -78,7 +80,12 @@ module-name = "heretic"
 [tool.uv]
 # Ensure `uv sync` installs the inference group by default in this repo.
 default-groups = ["dev", "inference"]
+# Work around torch==2.9.1 + CuDNN<9.15 Conv3d perf/mem bug for multimodal models.
+# SGLang hard-fails on this combination (see PyTorch issue 168167).
+override-dependencies = ["nvidia-cudnn-cu12==9.16.0.29"]
 
 [tool.uv.sources]
 # Vendored SGLang (submodule) as editable dependency.
 sglang = { path = "vendor/sglang/python", editable = true }
+# Vendored KT-Kernel (submodule) as editable dependency.
+kt-kernel = { path = "vendor/ktransformers/kt-kernel", editable = true }
