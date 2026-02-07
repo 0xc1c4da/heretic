@@ -130,15 +130,22 @@ def main() -> int:
         default=None,
         help="Override Settings.full_normalization_lora_rank (only used when row_normalization='full').",
     )
-    args = ap.parse_args()
+    # Important: heretic.config.Settings is configured to auto-parse CLI args.
+    # We parse our script args first, then pass any remaining args through to Settings.
+    args, passthrough_args = ap.parse_known_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    settings = _build_settings(
-        args.model,
-        full_normalization_lora_rank=args.full_normalization_lora_rank,
-    )
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = [sys.argv[0], *passthrough_args]
+        settings = _build_settings(
+            args.model,
+            full_normalization_lora_rank=args.full_normalization_lora_rank,
+        )
+    finally:
+        sys.argv = old_argv
 
     print()
     print("=== make-lora.py ===")
