@@ -357,7 +357,9 @@ class SGLangOfflineBackend(HereticBackend):
             return isinstance(x, (int, float))
 
         def _is_list_of_nums(x: Any) -> bool:
-            return isinstance(x, list) and (len(x) == 0 or all(_is_num(v) for v in x))
+            # Empty vectors are not valid hidden states; they usually indicate an empty
+            # prompt (no tokens) or an upstream capture failure.
+            return isinstance(x, list) and len(x) > 0 and all(_is_num(v) for v in x)
 
         def _parse_hidden_states(raw_hs: Any) -> torch.Tensor:
             if not isinstance(raw_hs, list) or len(raw_hs) == 0:
@@ -410,6 +412,8 @@ class SGLangOfflineBackend(HereticBackend):
                     raise RuntimeError(f"Unexpected hidden_states vector ndim: {vec_arr.ndim}")
                 t1 = torch.from_numpy(vec_arr.astype(np.float32, copy=False))
             else:
+                if len(vec_list) == 0:
+                    raise RuntimeError("hidden_states vector is empty.")
                 t1 = torch.tensor(vec_list, dtype=torch.float32)
             if t1.ndim != 1:
                 raise RuntimeError(f"Unexpected hidden_states vector ndim: {t1.ndim}")

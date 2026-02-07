@@ -212,7 +212,19 @@ def load_prompts(
         # Probably a repository path; let load_dataset figure it out.
         dataset = load_dataset(path, split=split_str)
 
-    prompts = list(dataset[specification.column])
+    # Normalize prompts early. Some datasets contain empty/whitespace entries; those
+    # can produce empty tokenization which breaks residual capture (no "last token").
+    raw_prompts = list(dataset[specification.column])
+    prompts: list[str] = []
+    for p in raw_prompts:
+        if p is None:
+            continue
+        if not isinstance(p, str):
+            p = str(p)
+        p = p.strip()
+        if not p:
+            continue
+        prompts.append(p)
 
     if specification.prefix:
         prompts = [f"{specification.prefix} {prompt}" for prompt in prompts]
