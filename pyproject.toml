@@ -34,7 +34,8 @@ dependencies = [
     "pydantic-settings>=2.10.1",
     "questionary>=2.1.1",
     "rich>=14.1.0",
-    "transformers>=4.57.3",
+    # Keep compatible with vendored SGLang (pins transformers==4.57.1).
+    "transformers>=4.57.1",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +52,10 @@ research = [
 dev = [
     "ruff>=0.14.5",
     "ty>=0.0.5",
+]
+inference = [
+    # When developing against embedded SGLang Engine, keep it editable and uv-managed.
+    "sglang",
 ]
 
 [project.urls]
@@ -69,3 +74,11 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "heretic"
+
+[tool.uv]
+# Ensure `uv sync` installs the inference group by default in this repo.
+default-groups = ["dev", "inference"]
+
+[tool.uv.sources]
+# Vendored SGLang (submodule) as editable dependency.
+sglang = { path = "vendor/sglang/python", editable = true }

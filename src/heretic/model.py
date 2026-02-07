@@ -33,6 +33,7 @@ from .config import BackendType, QuantizationMethod, RowNormalization, Settings
 from .backend.hf_local import HFLocalBackend
 from .backend.base import HereticBackend
 from .backend.sglang import SGLangBackend
+from .backend.sglang_offline import SGLangOfflineBackend
 from .utils import Prompt, batchify, empty_cache, print, sha256_token_ids
 
 
@@ -126,6 +127,35 @@ class Model:
             print(f"Loaded SGLang backend for [bold]{settings.model}[/].")
             if self._num_layers is not None:
                 print(f"* Transformer model with [bold]{self._num_layers}[/] layers (from config)")
+        elif backend_type == BackendType.SGLANG_OFFLINE:
+            # Embedded execution: do NOT load HF weights. SGLang Engine runs in-process.
+            self.backend = SGLangOfflineBackend(
+                model_path=settings.model,
+                trust_remote_code=bool(settings.trust_remote_code),
+                engine_args=getattr(settings, "sglang_offline_args", None),
+            )
+
+            # Keep a local tokenizer for prompt building / hashing (can be pushed server-side later).
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                settings.model,
+                trust_remote_code=settings.trust_remote_code,
+            )
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.padding_side = "left"
+
+            # Prefer backend-reported metadata.
+            self._num_layers = self.backend.get_metadata().num_layers
+
+            # Legacy attributes are unused in SGLang mode but expected to exist.
+            self.model = cast(Any, None)
+            self.peft_config = cast(Any, None)
+            self.trusted_models = {settings.model: settings.trust_remote_code}
+            self.max_memory = None
+
+            print(f"Loaded SGLang offline backend for [bold]{settings.model}[/].")
+            if self._num_layers is not None:
+                print(f"* Transformer model with [bold]{self._num_layers}[/] layers (from backend)")
         else:
             raise ValueError(f"Unknown backend type: {backend_type}")
 
@@ -358,13 +388,13 @@ class Model:
         *,
         export_tensors: bool = False,
     ) -> dict[str, Tensor] | None:
-        if self._backend_type == BackendType.SGLANG:
+        if self._backend_type in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
             if not export_tensors:
                 raise ValueError(
-                    "backend='sglang' requires export_tensors=True (we load adapters into the server)."
+                    "backend='sglang' requires export_tensors=True (we load adapters into the backend)."
                 )
 
-            backend = cast(SGLangBackend, self.backend)
+            backend = cast(Any, self.backend)
 
             # Build a minimal LoRA config dict compatible with SGLang's LoRAConfig.
             target_modules = ["o_proj", "down_proj"]
@@ -741,11 +771,10 @@ class Model:
         *,
         adapter: str | None = None,
     ) -> list[str]:
-        if self._backend_type == BackendType.SGLANG:
-            # Remote generation via SGLang server.
+        if self._backend_type in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
+            # SGLang generation (remote HTTP or embedded offline).
             input_ids_batch = self.encode_prompts(prompts)
-            backend = cast(SGLangBackend, self.backend)
-            return backend.generate_text(
+            return self.backend.generate_text(
                 input_ids_batch,
                 max_new_tokens=self.settings.max_response_length,
                 adapter=adapter,
@@ -795,7 +824,7 @@ class Model:
 
         input_ids_batch = self.encode_prompts(prompts)
 
-        if self._backend_type == BackendType.SGLANG:
+        if self._backend_type in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
             # Delegate capture to backend. We request all layers when available.
             if self._num_layers is None:
                 # Prefer server-reported metadata when available.
@@ -814,8 +843,8 @@ class Model:
                 # This avoids relying on local HF config fields, which may be missing in some
                 # on-disk model snapshots used purely for tokenizer/config.
                 try:
-                    backend = cast(SGLangBackend, self.backend)
-                    descs: Any = backend.module_map(
+                    sgl_backend = cast(Any, self.backend)
+                    descs: Any = sgl_backend.module_map(
                         include_projs=["o_proj", "down_proj"],
                         # Default: exclude MoE experts for metadata inference.
                         include_experts=[],
@@ -905,7 +934,7 @@ class Model:
     # when computing the KL divergence.
     def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
         input_ids_batch = self.encode_prompts(prompts)
-        if self._backend_type == BackendType.SGLANG:
+        if self._backend_type in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
             scored = self.backend.score(input_ids_batch, adapter=None)
             if scored.logprobs_full is None:
                 raise RuntimeError("SGLang backend did not return full-vocab logprobs.")

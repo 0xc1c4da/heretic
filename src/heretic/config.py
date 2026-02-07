@@ -2,7 +2,7 @@
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
 
 from enum import Enum
-from typing import Dict
+from typing import Any, Dict
 
 from pydantic import BaseModel, Field
 from pydantic_settings import (
@@ -29,6 +29,7 @@ class RowNormalization(str, Enum):
 class BackendType(str, Enum):
     LOCAL = "local"
     SGLANG = "sglang"
+    SGLANG_OFFLINE = "sglang_offline"
 
 
 class DatasetSpecification(BaseModel):
@@ -71,7 +72,10 @@ class Settings(BaseSettings):
 
     backend: BackendType = Field(
         default=BackendType.LOCAL,
-        description="Execution backend. 'local' runs HF in-process; 'sglang' uses an external SGLang server.",
+        description=(
+            "Execution backend. 'local' runs HF in-process; 'sglang' uses an external SGLang server; "
+            "'sglang_offline' embeds SGLang Engine in-process."
+        ),
     )
 
     validate_backend: bool = Field(
@@ -90,6 +94,14 @@ class Settings(BaseSettings):
     sglang_admin_url: str | None = Field(
         default=None,
         description="Optional separate base URL for SGLang admin endpoints (LoRA, compute_vtw). Defaults to sglang_url.",
+    )
+
+    sglang_offline_args: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Extra keyword arguments passed to `sglang.srt.entrypoints.engine.Engine` "
+            "(same fields as SGLang `ServerArgs`). Used when backend='sglang_offline'."
+        ),
     )
 
     evaluate_model: str | None = Field(

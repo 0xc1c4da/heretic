@@ -1,0 +1,525 @@
+from __future__ import annotations
+
+import base64
+import pickle
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+import numpy as np
+import torch
+
+from .base import (
+    BackendMetadata,
+    HereticBackend,
+    ModuleRef,
+    ResidualCaptureResult,
+    ScoreResult,
+    TokenizeChatResult,
+    VTWResult,
+)
+
+
+def _serialize_for_sglang(obj: Any) -> str:
+    # Same format as the HTTP backend: SGLang expects a base64-encoded pickle payload.
+    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return base64.b64encode(payload).decode("utf-8")
+
+
+@dataclass(frozen=True)
+class _OfflineGen:
+    outputs: list[dict[str, Any]]
+
+
+class SGLangOfflineBackend(HereticBackend):
+    """Embedded (offline) SGLang backend using `sglang.srt.entrypoints.engine.Engine`."""
+
+    def __init__(
+        self,
+        *,
+        model_path: str,
+        trust_remote_code: bool = False,
+        engine_args: dict[str, Any] | None = None,
+    ):
+        try:
+            from sglang.version import __version__ as sglang_version
+            from sglang.srt.entrypoints.engine import Engine
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "Failed to import SGLang Engine.\n\n"
+                "If you're working from this repo, make sure you've initialized and installed the vendored submodule:\n"
+                "  git submodule update --init --recursive\n"
+                "  uv pip install -e vendor/sglang/python\n\n"
+                f"Original import error: {e}"
+            ) from e
+
+        self._sglang_version = sglang_version
+        self._adapter_ids_by_name: dict[str, str] = {}
+
+        args = dict(engine_args or {})
+        args.setdefault("model_path", model_path)
+        args.setdefault("trust_remote_code", bool(trust_remote_code))
+
+        # Heretic requires residual capture + LoRA hot swap.
+        args.setdefault("enable_return_hidden_states", True)
+        args.setdefault("enable_lora", True)
+        # Reasonable defaults for Heretic's typical usage; users can override via engine_args.
+        args.setdefault("max_lora_rank", 64)
+        args.setdefault("lora_target_modules", ["all"])
+
+        self._engine = Engine(**args)
+
+    def _run(self, coro):
+        return self._engine.loop.run_until_complete(coro)
+
+    def _generate_req(self, obj) -> _OfflineGen:
+        gen = self._engine.tokenizer_manager.generate_request(obj, None)
+        outputs = self._run(gen.__anext__())
+        if not isinstance(outputs, list) or any(not isinstance(x, dict) for x in outputs):
+            raise RuntimeError(f"Unexpected SGLang offline generate output: {type(outputs).__name__}")
+        return _OfflineGen(outputs=outputs)
+
+    def get_metadata(self) -> BackendMetadata:
+        tm = self._engine.tokenizer_manager
+        hf_cfg = getattr(tm.model_config, "hf_config", None)
+
+        num_layers = getattr(hf_cfg, "num_hidden_layers", None) if hf_cfg is not None else None
+        hidden_size = getattr(hf_cfg, "hidden_size", None) if hf_cfg is not None else None
+        vocab_size = getattr(hf_cfg, "vocab_size", None) if hf_cfg is not None else None
+
+        served_model_name = getattr(tm, "served_model_name", None) or tm.server_args.model_path
+
+        return BackendMetadata(
+            backend_name="sglang_offline",
+            backend_version=self._sglang_version,
+            model_id=str(served_model_name),
+            tokenizer_id=str(getattr(tm.server_args, "tokenizer_path", None) or tm.server_args.model_path),
+            max_context_len=getattr(tm.model_config, "context_len", None),
+            supports={
+                "input_ids": True,
+                "prompt_ids_sha256": False,
+                "capture_layers": True,
+                "logprobs_full": True,
+                "compute_vtw": True,
+                "lora_hot_swap": True,
+                "tokenize_chat": True,
+                "generate_text": True,
+            },
+            num_layers=int(num_layers) if isinstance(num_layers, int) else None,
+            hidden_size=int(hidden_size) if isinstance(hidden_size, int) else None,
+            vocab_size=int(vocab_size) if isinstance(vocab_size, int) else None,
+        )
+
+    def lora_status(self) -> list[dict[str, Any]]:
+        """Offline equivalent of `GET /heretic/lora_status` (observability)."""
+        tm = self._engine.tokenizer_manager
+        if not getattr(tm.server_args, "enable_lora", False):
+            return []
+        refs = tm.lora_registry.get_all_adapters()
+        out: list[dict[str, Any]] = []
+        for _, ref in (refs or {}).items():
+            # LoRARef is a dataclass-like object.
+            out.append(
+                {
+                    "lora_id": getattr(ref, "lora_id", None),
+                    "lora_name": getattr(ref, "lora_name", None),
+                    "lora_path": getattr(ref, "lora_path", None),
+                    "pinned": bool(getattr(ref, "pinned", False)),
+                }
+            )
+        return out
+
+    def tokenize_chat(
+        self,
+        chats: list[list[dict[str, Any]]],
+        *,
+        continue_final_message: bool = False,
+    ) -> TokenizeChatResult:
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+        from sglang.srt.utils.prompt_identity import sha256_token_ids_le_u32
+
+        serving_chat = OpenAIServingChat(self._engine.tokenizer_manager, self._engine.template_manager)
+
+        token_ids_batch: list[list[int]] = []
+        sha_batch: list[str] = []
+
+        for chat in chats:
+            messages: list[dict[str, Any]] = []
+            for m in chat:
+                role = str(m.get("role"))
+                content = m.get("content")
+                if content is None:
+                    content = ""
+                msg: dict[str, Any] = {"role": role, "content": content}
+                name = m.get("name")
+                if name is not None:
+                    msg["name"] = name
+                messages.append(msg)
+
+            chat_req = ChatCompletionRequest(
+                model=self._engine.tokenizer_manager.served_model_name,
+                messages=messages,
+                stream=False,
+                temperature=0.0,
+                max_tokens=1,
+                continue_final_message=continue_final_message,
+            )
+
+            processed = serving_chat._process_messages(chat_req, is_multimodal=False)  # noqa: SLF001
+            prompt_ids = processed.prompt_ids
+            if isinstance(prompt_ids, str):
+                prompt_ids = self._engine.tokenizer_manager.tokenizer.encode(prompt_ids)
+            token_ids = [int(x) for x in prompt_ids]
+            token_ids_batch.append(token_ids)
+            sha_batch.append(sha256_token_ids_le_u32(token_ids))
+
+        return TokenizeChatResult(token_ids=token_ids_batch, prompt_ids_sha256=sha_batch)
+
+    def module_map(
+        self,
+        *,
+        include_projs: list[str] | None = None,
+        include_layers: list[int] | None = None,
+        include_experts: list[int] | None = None,
+        max_experts_per_layer: int | None = None,
+        expert_strategy: str = "first",
+    ) -> list[dict[str, Any]]:
+        from sglang.srt.managers.io_struct import HereticModuleMapReqInput
+
+        obj = HereticModuleMapReqInput(
+            include_projs=include_projs,
+            include_layers=include_layers,
+            include_experts=include_experts,
+            max_experts_per_layer=max_experts_per_layer,
+            expert_strategy=expert_strategy,
+        )
+        data = self._run(self._engine.tokenizer_manager.heretic_module_map(obj, None))
+        modules = data.get("modules") if isinstance(data, dict) else None
+        if not isinstance(modules, list):
+            raise RuntimeError(f"Unexpected heretic_module_map output: {data}")
+        return modules
+
+    def compute_vtw_batch(
+        self,
+        *,
+        items: list[dict[str, Any]],
+        timeout_s: float = 300.0,
+    ) -> list[dict[str, Any]]:
+        from sglang.srt.managers.io_struct import ComputeVTWBatchItem, ComputeVTWBatchReqInput
+
+        batch_items: list[ComputeVTWBatchItem] = []
+        for it in items:
+            batch_items.append(
+                ComputeVTWBatchItem(
+                    name=str(it["name"]),
+                    v=[float(x) for x in it["v"]],
+                    dtype=str(it.get("dtype") or "float32"),
+                )
+            )
+        obj = ComputeVTWBatchReqInput(items=batch_items)
+        # timeout is currently handled at the HTTP layer; offline calls are in-process.
+        _ = timeout_s
+        res = self._run(self._engine.tokenizer_manager.compute_vtw_batch(obj, None))
+        if not isinstance(res, list):
+            raise RuntimeError(f"Unexpected compute_vtw_batch output: {res}")
+        return res
+
+    def build_full_rownorm_lora(
+        self,
+        *,
+        name: str,
+        v: torch.Tensor,
+        weight: float,
+        rank: int,
+        out_dtype: str = "float16",
+        svd_q: int | None = None,
+        svd_niter: int = 6,
+        timeout_s: float = 600.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.managers.io_struct import HereticBuildFullRownormLoraReqInput
+
+        obj = HereticBuildFullRownormLoraReqInput(
+            name=name,
+            v=[float(x) for x in v.detach().to(torch.float32).cpu().tolist()],
+            weight=float(weight),
+            rank=int(rank),
+            svd_q=int(svd_q) if svd_q is not None else None,
+            svd_niter=int(svd_niter),
+            out_dtype=str(out_dtype),
+        )
+        _ = timeout_s
+        data = self._run(self._engine.tokenizer_manager.heretic_build_full_rownorm_lora(obj, None))
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected build_full_rownorm_lora output: {data}")
+        if data.get("dtype") != "float16":
+            raise RuntimeError(f"Unexpected dtype in build_full_rownorm_lora: {data.get('dtype')}")
+
+        a_b64 = data.get("lora_A_b64")
+        b_b64 = data.get("lora_B_b64")
+        a_shape = data.get("lora_A_shape")
+        b_shape = data.get("lora_B_shape")
+        if (
+            not isinstance(a_b64, str)
+            or not isinstance(b_b64, str)
+            or not isinstance(a_shape, list)
+            or not isinstance(b_shape, list)
+            or len(a_shape) != 2
+            or len(b_shape) != 2
+        ):
+            raise RuntimeError(f"Malformed build_full_rownorm_lora output: {data}")
+
+        raw_a = base64.b64decode(a_b64.encode("ascii"))
+        raw_b = base64.b64decode(b_b64.encode("ascii"))
+        arr_a = np.frombuffer(raw_a, dtype=np.float16).reshape((int(a_shape[0]), int(a_shape[1])))
+        arr_b = np.frombuffer(raw_b, dtype=np.float16).reshape((int(b_shape[0]), int(b_shape[1])))
+        A = torch.from_numpy(arr_a.astype(np.float32, copy=False))
+        B = torch.from_numpy(arr_b.astype(np.float32, copy=False))
+        return A, B
+
+    def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        obj = GenerateReqInput(
+            input_ids=input_ids_batch,
+            sampling_params={"max_new_tokens": 0, "temperature": 1.0},
+            stream=False,
+            return_logprob=False,
+            return_next_token_logprobs_full=True,
+            lora_id=adapter,
+        )
+        gen = self._generate_req(obj)
+
+        rows: list[torch.Tensor] = []
+        for out in gen.outputs:
+            meta = out.get("meta_info") or {}
+            b64_steps = meta.get("heretic_next_token_logprobs_full_fp16_b64")
+            shape_steps = meta.get("heretic_next_token_logprobs_full_shape")
+            dtype_steps = meta.get("heretic_next_token_logprobs_full_dtype")
+            if not b64_steps or not shape_steps or not dtype_steps:
+                raise RuntimeError(
+                    f"Missing full-vocab logprobs in offline response meta_info: keys={list(meta.keys())}"
+                )
+            b64 = b64_steps[0]
+            shape = shape_steps[0]
+            dtype = dtype_steps[0]
+            if dtype != "float16" or not isinstance(shape, list) or len(shape) != 1:
+                raise RuntimeError(f"Unexpected full-vocab dtype/shape in offline response: {dtype=} {shape=}")
+            vocab = int(shape[0])
+            raw = base64.b64decode(b64.encode("ascii"))
+            arr = np.frombuffer(raw, dtype=np.float16)
+            if arr.size != vocab:
+                raise RuntimeError(f"Decoded fp16 size mismatch: {arr.size=} {vocab=}")
+            rows.append(torch.from_numpy(arr.astype(np.float32, copy=False)))
+
+        logprobs_full = torch.stack(rows, dim=0)
+        return ScoreResult(logprobs_full=logprobs_full, meta={"transport": "offline"})
+
+    def generate_text(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        max_new_tokens: int,
+        adapter: str | None = None,
+        temperature: float = 0.0,
+    ) -> list[str]:
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        obj = GenerateReqInput(
+            input_ids=input_ids_batch,
+            sampling_params={"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)},
+            stream=False,
+            return_logprob=False,
+            lora_id=adapter,
+        )
+        gen = self._generate_req(obj)
+        texts: list[str] = []
+        for out in gen.outputs:
+            t = out.get("text")
+            if not isinstance(t, str):
+                raise RuntimeError(f"Unexpected offline generate text schema: {out}")
+            texts.append(t)
+        return texts
+
+    def capture_residuals(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        capture_layers: list[int],
+        capture_point: str = "block_input_last_token",
+        adapter: str | None = None,
+    ) -> ResidualCaptureResult:
+        # Keep contract identical to HTTP backend: (batch, layers, d_model) for last prompt token.
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        _ = capture_point  # currently only one capture point is supported in SGLang integration.
+
+        def _is_num(x: Any) -> bool:
+            return isinstance(x, (int, float))
+
+        def _is_list_of_nums(x: Any) -> bool:
+            return isinstance(x, list) and (len(x) == 0 or all(_is_num(v) for v in x))
+
+        def _parse_hidden_states(raw_hs: Any) -> torch.Tensor:
+            if not isinstance(raw_hs, list) or len(raw_hs) == 0:
+                raise RuntimeError("hidden_states is empty or not a list.")
+
+            vec_list: list[float] | None = None
+            vec_arr: np.ndarray | None = None
+
+            # Prefer prefill step: tokens x features; take last prompt token.
+            for step in raw_hs:
+                if isinstance(step, np.ndarray):
+                    if step.ndim == 2 and step.shape[0] > 0:
+                        vec_arr = step[-1]
+                        break
+                    if step.ndim == 1 and step.shape[0] > 0:
+                        vec_arr = step
+                        break
+                elif (
+                    isinstance(step, list)
+                    and len(step) > 0
+                    and isinstance(step[-1], list)
+                    and _is_list_of_nums(step[-1])
+                ):
+                    vec_list = step[-1]
+                    break
+
+            # Fall back to the last step when it's already a vector.
+            if vec_arr is None and vec_list is None:
+                last = raw_hs[-1]
+                if isinstance(last, np.ndarray):
+                    if last.ndim == 2 and last.shape[0] > 0:
+                        vec_arr = last[-1]
+                    elif last.ndim == 1 and last.shape[0] > 0:
+                        vec_arr = last
+                elif _is_list_of_nums(last):
+                    vec_list = last
+                elif (
+                    isinstance(last, list)
+                    and len(last) > 0
+                    and isinstance(last[-1], list)
+                    and _is_list_of_nums(last[-1])
+                ):
+                    vec_list = last[-1]
+
+            if vec_arr is None and vec_list is None:
+                raise RuntimeError("Unsupported hidden_states schema (expected numeric vectors).")
+
+            if vec_arr is not None:
+                if vec_arr.ndim != 1:
+                    raise RuntimeError(f"Unexpected hidden_states vector ndim: {vec_arr.ndim}")
+                t1 = torch.from_numpy(vec_arr.astype(np.float32, copy=False))
+            else:
+                t1 = torch.tensor(vec_list, dtype=torch.float32)
+            if t1.ndim != 1:
+                raise RuntimeError(f"Unexpected hidden_states vector ndim: {t1.ndim}")
+
+            if len(capture_layers) <= 0:
+                return t1.view(1, -1)
+
+            if t1.numel() % len(capture_layers) != 0:
+                raise RuntimeError(
+                    f"Hidden-state feature dim {t1.numel()} is not divisible by requested layers {len(capture_layers)}."
+                )
+
+            d_model = t1.numel() // len(capture_layers)
+            return t1.view(len(capture_layers), d_model)
+
+        obj = GenerateReqInput(
+            input_ids=input_ids_batch,
+            sampling_params={"max_new_tokens": 0, "temperature": 0.0},
+            stream=False,
+            return_hidden_states=True,
+            capture_layers=capture_layers,
+            lora_id=adapter,
+        )
+        gen = self._generate_req(obj)
+
+        per_item: list[torch.Tensor] = []
+        for out in gen.outputs:
+            meta = out.get("meta_info") or {}
+            hs_steps = meta.get("hidden_states")
+            if hs_steps is None:
+                raise RuntimeError("SGLang offline generate missing meta_info.hidden_states.")
+            per_item.append(_parse_hidden_states(hs_steps))
+
+        t = torch.stack(per_item, dim=0)
+        return ResidualCaptureResult(
+            residuals=t,
+            captured_layers=capture_layers,
+            capture_point=capture_point,
+            meta={"raw": gen.outputs},
+        )
+
+    def compute_vtw(
+        self,
+        v: torch.Tensor,
+        *,
+        target: ModuleRef,
+        adapter: str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> VTWResult:
+        from sglang.srt.managers.io_struct import ComputeVTWReqInput
+
+        if adapter is not None:
+            raise NotImplementedError("compute_vtw(adapter=...) is not supported yet.")
+        if dtype != torch.float32:
+            raise NotImplementedError("Only float32 is supported for compute_vtw in SGLang backends.")
+
+        obj = ComputeVTWReqInput(
+            name=target.module_path,
+            v=[float(x) for x in v.detach().to(torch.float32).cpu().tolist()],
+            dtype="float32",
+        )
+        data = self._run(self._engine.tokenizer_manager.compute_vtw(obj, None))
+        if not isinstance(data, dict) or "vtw" not in data:
+            raise RuntimeError(f"Unexpected compute_vtw output: {data}")
+        vtw = torch.tensor(data["vtw"], dtype=torch.float32)
+        return VTWResult(
+            target=target,
+            vtw=vtw,
+            implementation=data.get("implementation"),
+            meta={"raw": data},
+        )
+
+    def load_adapter(self, *, name: str, tensors: dict[str, torch.Tensor], config: dict) -> str | None:
+        from sglang.srt.managers.io_struct import LoadLoRAAdapterFromTensorsReqInput
+
+        cpu_tensors = {k: v.detach().cpu() for k, v in tensors.items()}
+        config = dict(config)
+        config.setdefault("peft_type", "LORA")
+
+        obj = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name=name,
+            config_dict=config,
+            serialized_tensors=_serialize_for_sglang(cpu_tensors),
+            pinned=False,
+            added_tokens_config=None,
+            lora_id=None,
+        )
+        out = self._run(self._engine.tokenizer_manager.load_lora_adapter_from_tensors(obj, None))
+        if not getattr(out, "success", False):
+            raise RuntimeError(f"Unexpected load_lora_adapter_from_tensors output: {out}")
+        loaded = getattr(out, "loaded_adapters", None) or {}
+        if not isinstance(loaded, dict) or name not in loaded:
+            raise RuntimeError(
+                f"Missing adapter ref in load_lora response: keys={list(loaded) if isinstance(loaded, dict) else loaded}"
+            )
+        ref = loaded[name]
+        if not isinstance(ref, dict) or not isinstance(ref.get("lora_id"), str):
+            raise RuntimeError(f"Malformed adapter ref in load_lora response: {ref}")
+        lora_id = ref["lora_id"]
+        self._adapter_ids_by_name[name] = lora_id
+        return lora_id
+
+    def unload_adapter(self, *, name: str) -> None:
+        from sglang.srt.managers.io_struct import UnloadLoRAAdapterReqInput
+
+        lora_id = self._adapter_ids_by_name.get(name)
+        obj = UnloadLoRAAdapterReqInput(lora_name=name, lora_id=lora_id)
+        out = self._run(self._engine.tokenizer_manager.unload_lora_adapter(obj, None))
+        if not getattr(out, "success", True):
+            raise RuntimeError(f"Unexpected unload_lora_adapter output: {out}")
+        if lora_id is not None:
+            self._adapter_ids_by_name.pop(name, None)
+

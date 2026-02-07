@@ -1,0 +1,95 @@
+# Kimi-K2.5 on 8×H200 SXM — embedded SGLang (offline) backend
+#
+# Usage:
+#   cp config.kimi_k25_h200_offline.toml config.toml
+#   uv run heretic
+#
+# Notes:
+# - This runs SGLang Engine in-process (no HTTP server).
+# - We keep LoRA + return_hidden_states enabled, as required by Heretic.
+
+model = "/models/kimi-k2.5"
+backend = "sglang_offline"
+trust_remote_code = true
+validate_backend = true
+detect_response_prefix = false
+
+# Keep Heretic-side batch conservative until you verify fused-kernel fast path.
+batch_size = 1
+max_batch_size = 8
+max_response_length = 64
+
+# Exercise FULL rownorm path (server-side primitive via embedded engine).
+row_normalization = "full"
+full_normalization_lora_rank = 64
+
+# All SGLang Engine/ServerArgs kwargs go here.
+# Keys match `sglang.srt.server_args.ServerArgs` fields.
+sglang_offline_args = {
+  # Runtime parallelism
+  tp_size = 8,
+
+  # Kernel backends (high leverage)
+  attention_backend = "flashinfer",
+
+  # Memory/scheduling (tune to your workload)
+  mem_fraction_static = 0.96,
+  max_total_tokens = 50000,
+  chunked_prefill_size = 32768,
+  enable_mixed_chunk = true,
+
+  # Required features for Heretic
+  enable_return_hidden_states = true,
+  enable_lora = true,
+
+  # LoRA performance knobs (critical)
+  max_lora_rank = 64,
+  # Avoid `all` unless you truly need it (it increases overhead).
+  lora_target_modules = ["o_proj", "down_proj"],
+  # Keep small: base-only + 1 adapter is the common case for Heretic.
+  max_loras_per_batch = 2,
+  # Cache a small number of adapters; increase if you reuse many adapters.
+  max_loaded_loras = 8,
+  # Choose LoRA kernel backend.
+  lora_backend = "csgmv",
+  max_lora_chunk_size = 64,
+  enable_lora_overlap_loading = true,
+
+  # KTransformers / KT-Kernel (MoE fast path for RAW-INT4)
+  kt_weight_path = "/models/kimi-k2.5",
+  kt_method = "RAWINT4",
+  # On 8×H200 you should aim for all experts on GPU for best decode speed.
+  kt_num_gpu_experts = 384,
+  # Minimal CPU fallback (should be rarely used when all experts are on GPU).
+  kt_cpuinfer = 8,
+  kt_threadpool_count = 1,
+
+  # Start conservative for stability; revisit after baseline perf is good.
+  disable_shared_experts_fusion = true,
+}
+
+# One quick end-to-end trial by default.
+n_trials = 1
+n_startup_trials = 0
+study_checkpoint_dir = "checkpoints/kimi_k25_h200_offline_trial1"
+
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:32]"
+column = "text"
+
+[bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:32]"
+column = "text"
+
+[good_evaluation_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:16]"
+column = "text"
+
+[bad_evaluation_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:16]"
+column = "text"
+

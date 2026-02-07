@@ -235,9 +235,10 @@ def validate_lora_sanity(
         raise LoRASanityError("Synthetic adapter builder returned no tensors.")
 
     base = backend.score(input_ids_batch)
-    backend.load_adapter(name=adapter_name, tensors=tensors, config=config)
+    adapter_ref = backend.load_adapter(name=adapter_name, tensors=tensors, config=config)
     try:
-        adapted = backend.score(input_ids_batch, adapter=adapter_name)
+        # Some backends (e.g. SGLang) use an internal adapter id for the hot path.
+        adapted = backend.score(input_ids_batch, adapter=adapter_ref or adapter_name)
     finally:
         backend.unload_adapter(name=adapter_name)
 
@@ -363,11 +364,71 @@ def run_startup_validations(
         backend_name = backend.get_metadata().backend_name
     except Exception:
         backend_name = ""
-    if backend_name == "sglang" and len(input_ids_batch) > 4:
+    if backend_name in ("sglang", "sglang_offline") and len(input_ids_batch) > 4:
         notes.append(
             f"startup validation: limiting SGLang batch from {len(input_ids_batch)} to 4 prompts"
         )
         input_ids_batch = input_ids_batch[:4]
+
+    # If the caller didn't provide a synthetic adapter builder, try a best-effort fallback for
+    # SGLang-style backends that expose module_map shapes.
+    if build_synthetic_adapter is None:
+        supports = {}
+        try:
+            supports = backend.get_metadata().supports
+        except Exception:
+            supports = {}
+        if supports.get("lora_hot_swap", False):
+            try:
+                module_descs = backend.module_map(
+                    include_projs=["o_proj", "down_proj"],
+                    include_experts=[],
+                )
+            except Exception:
+                module_descs = []
+
+            def _pick_weight_with_shape():
+                for d in module_descs:
+                    if not isinstance(d, dict):
+                        continue
+                    path = d.get("module_path") or d.get("name")
+                    shape = d.get("shape")
+                    if not isinstance(path, str) or not isinstance(shape, list) or len(shape) != 2:
+                        continue
+                    if not all(isinstance(x, int) for x in shape):
+                        continue
+                    out_f, in_f = int(shape[0]), int(shape[1])
+                    if out_f > 0 and in_f > 0 and path.endswith(".weight"):
+                        return path, out_f, in_f
+                return None
+
+            picked = _pick_weight_with_shape()
+            if picked is not None:
+                path, out_f, in_f = picked
+                base = path[: -len(".weight")]
+                key_a = f"{base}.lora_A.weight"
+                key_b = f"{base}.lora_B.weight"
+                target_modules = (
+                    ["down_proj"]
+                    if "down_proj" in path
+                    else (["o_proj"] if "o_proj" in path else [base.split(".")[-1]])
+                )
+
+                def _builder():
+                    r = 1
+                    tensors = {
+                        key_a: torch.zeros((r, in_f), dtype=torch.float16),
+                        key_b: torch.zeros((out_f, r), dtype=torch.float16),
+                    }
+                    config = {
+                        "peft_type": "LORA",
+                        "r": r,
+                        "lora_alpha": r,
+                        "target_modules": target_modules,
+                    }
+                    return tensors, config
+
+                build_synthetic_adapter = _builder
 
     prompt_ok = True
     residual_ok = True
