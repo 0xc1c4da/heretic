@@ -89,6 +89,22 @@ greater control. Run `heretic --help` to see available command-line options,
 or look at [`config.default.toml`](config.default.toml) if you prefer to use
 a configuration file.
 
+## SGLang backends (remote HTTP and embedded offline)
+
+Heretic can optionally use [SGLang](https://github.com/sgl-project/sglang) as its
+execution backend.
+
+- **Remote HTTP backend**: run an SGLang server separately and point Heretic at it.
+- **Embedded offline backend**: Heretic embeds SGLang's `Engine` in-process (no HTTP).
+
+For embedded/offline development in this repository, SGLang is included as a git
+submodule under `vendor/sglang`.
+
+```
+git submodule update --init --recursive
+uv pip install -e vendor/sglang/python
+```
+
 At the start of a program run, Heretic benchmarks the system to determine
 the optimal batch size to make the most of the available hardware.
 On an RTX 3090, with the default configuration, decensoring Llama-3.1-8B-Instruct

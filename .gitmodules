@@ -1,0 +1,4 @@
+[submodule "vendor/sglang"]
+	path = vendor/sglang
+	url = https://github.com/0xc1c4da/sglang.git
+	branch = heretic-main
