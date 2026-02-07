@@ -642,8 +642,8 @@ class Model:
 
                     # Emit PEFT-style default adapter keys to improve HF/PEFT reload compatibility.
                     # SGLang accepts these as it matches on substring `lora_A`/`lora_B`.
-                    exported[f\"{module_base}.lora_A.default.weight\"] = A.to(torch.float16).cpu()
-                    exported[f\"{module_base}.lora_B.default.weight\"] = B.to(torch.float16).cpu()
+                    exported[f"{module_base}.lora_A.default.weight"] = A.to(torch.float16).cpu()
+                    exported[f"{module_base}.lora_B.default.weight"] = B.to(torch.float16).cpu()
 
             if not exported:
                 # Produce a highly actionable error instead of silently returning an empty adapter.
