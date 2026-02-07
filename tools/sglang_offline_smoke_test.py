@@ -41,14 +41,16 @@ def main() -> int:
     args = ap.parse_args()
 
     from heretic.backend.sglang_offline import SGLangOfflineBackend
+    from heretic.hf_resolve import resolve_model_dir
 
     extra = json.loads(args.engine_args_json)
     if not isinstance(extra, dict):
         raise SystemExit("--engine-args-json must decode to an object/dict")
 
+    resolved = resolve_model_dir(args.model_path)
     try:
         backend = SGLangOfflineBackend(
-            model_path=args.model_path,
+            model_path=resolved.resolved_dir,
             trust_remote_code=bool(args.trust_remote_code),
             engine_args={"tp_size": int(args.tp_size), **extra},
         )

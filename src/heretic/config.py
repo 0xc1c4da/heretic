@@ -70,6 +70,28 @@ class DatasetSpecification(BaseModel):
 class Settings(BaseSettings):
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
+    hf_revision: str | None = Field(
+        default=None,
+        description=(
+            "Optional Hugging Face revision (commit hash / tag / branch) to pin when `model` is an HF id. "
+            "If unset, uses the default revision (usually 'main')."
+        ),
+    )
+
+    hf_cache_dir: str | None = Field(
+        default=None,
+        description=(
+            "Optional Hugging Face cache directory override. If unset, uses HF defaults (HF_HOME / ~/.cache/huggingface)."
+        ),
+    )
+
+    hf_local_files_only: bool = Field(
+        default=False,
+        description=(
+            "If true, do not contact Hugging Face; require the model to already exist in cache."
+        ),
+    )
+
     backend: BackendType = Field(
         default=BackendType.LOCAL,
         description=(

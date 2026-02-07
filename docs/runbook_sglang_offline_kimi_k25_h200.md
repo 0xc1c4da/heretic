@@ -57,6 +57,7 @@ Key config fields:
 - `sglang_offline_args = { ... }` contains SGLang `ServerArgs` kwargs
 - `enable_lora=true` and `enable_return_hidden_states=true` are required for Heretic
 - `kt_*` keys enable KT-Kernel and are the main MoE performance lever
+- `model` can be either a local directory or an HF id (e.g. `moonshotai/Kimi-K2.5`); when it’s an HF id, Heretic resolves it to an HF cache snapshot directory and uses that same resolved path for SGLang+KT.
 
 ## First-run validation checklist (fast path)
 

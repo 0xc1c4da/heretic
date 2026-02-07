@@ -8,11 +8,15 @@
 # - This runs SGLang Engine in-process (no HTTP server).
 # - We keep LoRA + return_hidden_states enabled, as required by Heretic.
 
-model = "/models/kimi-k2.5"
+# You can specify either an explicit local directory OR an HF model id.
+model = "moonshotai/Kimi-K2.5"
 backend = "sglang_offline"
 trust_remote_code = true
 validate_backend = true
 detect_response_prefix = false
+
+# Optional: pin an exact revision for fully reproducible runs.
+# hf_revision = "<commit-hash-or-tag>"
 
 # Keep Heretic-side batch conservative until you verify fused-kernel fast path.
 batch_size = 1
@@ -56,7 +60,8 @@ sglang_offline_args = {
   enable_lora_overlap_loading = true,
 
   # KTransformers / KT-Kernel (MoE fast path for RAW-INT4)
-  kt_weight_path = "/models/kimi-k2.5",
+  # If omitted, Heretic will resolve `model` to a local HF snapshot dir and set this automatically.
+  # kt_weight_path = "/models/kimi-k2.5",
   kt_method = "RAWINT4",
   # On 8×H200 you should aim for all experts on GPU for best decode speed.
   kt_num_gpu_experts = 384,
