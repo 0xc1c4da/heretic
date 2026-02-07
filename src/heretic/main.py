@@ -56,57 +56,6 @@ from .utils import (
 )
 
 
-def save_lora_adapter_bundle(
-    *,
-    tensors: dict[str, torch.Tensor],
-    config: dict,
-    tokenizer,
-    save_directory: str,
-    base_model_name_or_path: str,
-) -> None:
-    """Save a LoRA adapter bundle to disk (PEFT/SGLang compatible).
-
-    Writes:
-    - `adapter_config.json`
-    - `adapter_model.safetensors` (preferred) or `adapter_model.bin` (fallback)
-    - tokenizer files via `tokenizer.save_pretrained(...)`
-    """
-    os.makedirs(save_directory, exist_ok=True)
-
-    adapter_cfg = dict(config)
-    adapter_cfg.setdefault("peft_type", "LORA")
-    adapter_cfg.setdefault("base_model_name_or_path", base_model_name_or_path)
-    adapter_cfg.setdefault("inference_mode", True)
-
-    with open(os.path.join(save_directory, "adapter_config.json"), "w") as f:
-        import json
-
-        json.dump(adapter_cfg, f, indent=2, sort_keys=True)
-        f.write("\n")
-
-    # Ensure tensors are CPU + contiguous.
-    state: dict[str, torch.Tensor] = {}
-    for k, v in tensors.items():
-        if not isinstance(k, str) or not isinstance(v, torch.Tensor):
-            continue
-        state[k] = v.detach().to("cpu").contiguous()
-    if not state:
-        raise RuntimeError("No LoRA tensors to save (empty export).")
-
-    # Prefer safetensors; fall back to torch.save for environments without it.
-    try:
-        from safetensors.torch import save_file as safetensors_save_file  # type: ignore[import-not-found]
-
-        safetensors_save_file(
-            state,
-            os.path.join(save_directory, "adapter_model.safetensors"),
-        )
-    except Exception:
-        torch.save(state, os.path.join(save_directory, "adapter_model.bin"))
-
-    tokenizer.save_pretrained(save_directory)
-
-
 def obtain_merge_strategy(settings: Settings) -> str | None:
     """
     Prompts the user for how to proceed with saving the model.
@@ -613,23 +562,15 @@ def run():
         else:
             # Backend path: build adapter tensors locally, load into backend, evaluate, then unload.
             adapter_name = f"trial_{trial_index}"
-            tensors = model.abliterate(
+            bundle = model.build_lora_adapter_bundle(
                 refusal_directions,
                 direction_index,
                 parameters,
-                export_tensors=True,
             )
-            assert tensors is not None
-            # Minimal config compatible with SGLang LoRAConfig.
-            config = {
-                "r": model.peft_config.r,
-                "lora_alpha": model.peft_config.lora_alpha,
-                "target_modules": list(model.peft_config.target_modules),
-            }
             adapter_id = model.backend.load_adapter(
                 name=adapter_name,
-                tensors=tensors,
-                config=config,
+                tensors=bundle.tensors,
+                config=bundle.config_dict,
             )
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score(
@@ -815,8 +756,7 @@ def run():
             backend_type = getattr(settings, "backend", BackendType.LOCAL)
             adapter_name = f"selected_trial_{trial.user_attrs['index']}"
             adapter_id = None
-            adapter_tensors = None
-            adapter_config = None
+            bundle = None
 
             print("* Resetting model...")
             model.reset_model()
@@ -831,27 +771,20 @@ def run():
                     },
                 )
             else:
-                # Backend path: build adapter tensors locally, load into backend.
-                adapter_tensors = model.abliterate(
+                # Backend path: build adapter bundle locally, load into backend.
+                bundle = model.build_lora_adapter_bundle(
                     refusal_directions,
                     trial.user_attrs["direction_index"],
                     {
                         k: AbliterationParameters(**v)
                         for k, v in trial.user_attrs["parameters"].items()
                     },
-                    export_tensors=True,
                 )
-                assert adapter_tensors is not None
-                adapter_config = {
-                    "r": model.peft_config.r,
-                    "lora_alpha": model.peft_config.lora_alpha,
-                    "target_modules": list(model.peft_config.target_modules),
-                }
                 print("* Loading adapter into backend...")
                 adapter_id = model.backend.load_adapter(
                     name=adapter_name,
-                    tensors=adapter_tensors,
-                    config=adapter_config,
+                    tensors=bundle.tensors,
+                    config=bundle.config_dict,
                 )
 
             try:
@@ -903,14 +836,10 @@ def run():
                                 save_directory = prompt_path("Path to the folder:")
                                 if not save_directory:
                                     continue
-                                assert adapter_tensors is not None
-                                assert adapter_config is not None
-                                save_lora_adapter_bundle(
-                                    tensors=adapter_tensors,
-                                    config=adapter_config,
+                                assert bundle is not None
+                                bundle.save_pretrained(
+                                    save_directory,
                                     tokenizer=model.tokenizer,
-                                    save_directory=save_directory,
-                                    base_model_name_or_path=settings.model,
                                 )
                                 print(f"Adapter saved to [bold]{save_directory}[/].")
 

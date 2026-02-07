@@ -394,6 +394,50 @@ class Model:
             return ["attn.o_proj", "mlp.down_proj"]
         return list(self.get_layer_modules(0).keys())
 
+    def build_lora_adapter_bundle(
+        self,
+        refusal_directions: Tensor,
+        direction_index: float | None,
+        parameters: dict[str, AbliterationParameters],
+    ):
+        """Build a PEFT/SGLang-compatible LoRA adapter bundle for SGLang backends."""
+        from .lora_bundle import LoraAdapterBundle
+
+        if self._backend_type not in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
+            raise RuntimeError("build_lora_adapter_bundle() is only supported for SGLang backends.")
+
+        tensors = self.abliterate(
+            refusal_directions,
+            direction_index,
+            parameters,
+            export_tensors=True,
+        )
+        assert tensors is not None
+
+        # PEFT + SGLang compatible config.
+        cfg = {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "inference_mode": True,
+            "r": int(self.peft_config.r),
+            "lora_alpha": int(self.peft_config.lora_alpha),
+            "lora_dropout": float(getattr(self.peft_config, "lora_dropout", 0.0) or 0.0),
+            "target_modules": list(self.peft_config.target_modules),
+            "bias": str(getattr(self.peft_config, "bias", "none") or "none"),
+        }
+
+        bundle = LoraAdapterBundle(
+            tensors={k: v for k, v in tensors.items()},
+            config_dict=cfg,
+            base_model_name_or_path=str(self.settings.model),
+            stats={
+                "exported_tensors": int(len(tensors)),
+                "backend": str(self._backend_type),
+            },
+        )
+        bundle.assert_valid()
+        return bundle
+
     def abliterate(
         self,
         refusal_directions: Tensor,
@@ -445,19 +489,68 @@ class Model:
                 include_experts=[],
             )
             by_layer_component: dict[tuple[int, str], list[str]] = {}
+            # Diagnostics to pinpoint empty exports.
+            desc_count = len(module_descs) if isinstance(module_descs, list) else 0
+            parsed_layer_fail = 0
+            parsed_proj_fail = 0
+            incompatible_layer_id = 0
+            kept = 0
+
+            def _parse_layer_id(module_path: str) -> int | None:
+                # SGLang LoRA expects weight names containing `layers.<idx>.`.
+                # We still parse other common patterns for diagnostics, but treat them as incompatible
+                # with SGLang's current `get_layer_id()` implementation.
+                m = __import__("re").search(r"layers\.(\d+)\.", module_path)
+                if m:
+                    return int(m.group(1))
+                # Fallback patterns for better error messages.
+                for pat in (r"\.h\.(\d+)\.", r"\.blocks\.(\d+)\.", r"\.layer\.(\d+)\."):
+                    m2 = __import__("re").search(pat, module_path)
+                    if m2:
+                        return int(m2.group(1))
+                return None
+
+            def _parse_proj_leaf(module_path: str) -> str | None:
+                # Prefer deriving from path to avoid depending on backend schema.
+                base = module_path[: -len(".weight")] if module_path.endswith(".weight") else module_path
+                leaf = base.split(".")[-1] if base else ""
+                return leaf or None
+
             for d in module_descs:
-                layer = d.get("layer")
-                proj = d.get("proj")
-                path = d.get("module_path")
-                if not isinstance(layer, int) or not isinstance(proj, str) or not isinstance(path, str):
+                if not isinstance(d, dict):
                     continue
+                path = d.get("module_path")
+                if not isinstance(path, str):
+                    continue
+
+                proj = d.get("proj")
+                if not isinstance(proj, str):
+                    proj = _parse_proj_leaf(path)
+                if not isinstance(proj, str):
+                    parsed_proj_fail += 1
+                    continue
+
+                layer = d.get("layer")
+                if not isinstance(layer, int):
+                    layer = _parse_layer_id(path)
+                    if not isinstance(layer, int):
+                        parsed_layer_fail += 1
+                        continue
+
+                # SGLang's LoRA tensor loader (`get_layer_id`) currently only recognizes `layers.<idx>.`.
+                if __import__("re").search(r"layers\.(\d+)\.", path) is None:
+                    incompatible_layer_id += 1
+                    continue
+
                 if proj == "o_proj":
                     comp = "attn.o_proj"
                 elif proj == "down_proj":
                     comp = "mlp.down_proj"
                 else:
                     continue
+
                 by_layer_component.setdefault((layer, comp), []).append(path)
+                kept += 1
 
             exported: dict[str, Tensor] = {}
 
@@ -529,6 +622,39 @@ class Model:
                     # SGLang expects weights keyed by strings that include "layers.<idx>." and "lora_A"/"lora_B".
                     exported[f"{module_base}.lora_A.weight"] = A.to(torch.float16).cpu()
                     exported[f"{module_base}.lora_B.weight"] = B.to(torch.float16).cpu()
+
+            if not exported:
+                # Produce a highly actionable error instead of silently returning an empty adapter.
+                # This prevents saving/loading a no-op LoRA that SGLang would otherwise accept.
+                comps = sorted(set(c for (_, c) in by_layer_component.keys()))
+                layers = sorted(set(l for (l, _) in by_layer_component.keys()))
+                layer_range = (layers[0], layers[-1]) if layers else None
+                p_summary = {
+                    c: {
+                        "max_weight_position": float(parameters[c].max_weight_position),
+                        "min_weight_distance": float(parameters[c].min_weight_distance),
+                    }
+                    for c in parameters
+                }
+                sample_paths = []
+                for _, paths in list(by_layer_component.items())[:2]:
+                    sample_paths.extend(paths[:2])
+                raise RuntimeError(
+                    "SGLang LoRA export produced zero tensors.\n"
+                    f"- module_map_descs={desc_count}\n"
+                    f"- kept_paths={kept}\n"
+                    f"- parsed_layer_fail={parsed_layer_fail}\n"
+                    f"- parsed_proj_fail={parsed_proj_fail}\n"
+                    f"- incompatible_layer_id={incompatible_layer_id} (paths missing `layers.<idx>.`)\n"
+                    f"- layer_range={layer_range}\n"
+                    f"- components={comps}\n"
+                    f"- filter_params={p_summary}\n"
+                    f"- sample_module_paths={sample_paths}\n"
+                    "Most common causes:\n"
+                    "- module paths do not include `layers.<idx>.` (SGLang LoRA layer_id inference mismatch)\n"
+                    "- max_weight_position/min_weight_distance filter excludes all layers\n"
+                    "- target projection names differ from o_proj/down_proj\n"
+                )
 
             return exported
 
