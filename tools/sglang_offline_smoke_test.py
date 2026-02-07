@@ -150,8 +150,9 @@ def main() -> int:
                 print(f"[skip] adapter load: torch not available: {e}")
             else:
                 base = name[: -len(".weight")]
-                key_a = f"{base}.lora_A.weight"
-                key_b = f"{base}.lora_B.weight"
+                # Use PEFT-style `default` keys (also accepted by SGLang loader).
+                key_a = f"{base}.lora_A.default.weight"
+                key_b = f"{base}.lora_B.default.weight"
                 tensors = {
                     key_a: torch.zeros((r, in_f), dtype=torch.float16),
                     key_b: torch.zeros((out_f, r), dtype=torch.float16),
