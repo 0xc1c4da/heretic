@@ -29,49 +29,52 @@ full_normalization_lora_rank = 64
 
 # All SGLang Engine/ServerArgs kwargs go here.
 # Keys match `sglang.srt.server_args.ServerArgs` fields.
-sglang_offline_args = {
-  # Runtime parallelism
-  tp_size = 8,
+#
+# IMPORTANT: this must be a TOML table (NOT an inline `{ ... }` table),
+# because TOML inline tables cannot span multiple lines.
+[sglang_offline_args]
+# Runtime parallelism
+tp_size = 8
 
-  # Kernel backends (high leverage)
-  attention_backend = "flashinfer",
+# Kernel backends (high leverage)
+attention_backend = "flashinfer"
 
-  # Memory/scheduling (tune to your workload)
-  mem_fraction_static = 0.96,
-  max_total_tokens = 50000,
-  chunked_prefill_size = 32768,
-  enable_mixed_chunk = true,
+# Memory/scheduling (tune to your workload)
+mem_fraction_static = 0.96
+max_total_tokens = 50000
+chunked_prefill_size = 32768
+enable_mixed_chunk = true
 
-  # Required features for Heretic
-  enable_return_hidden_states = true,
-  enable_lora = true,
+# Required features for Heretic
+enable_return_hidden_states = true
+enable_lora = true
 
-  # LoRA performance knobs (critical)
-  max_lora_rank = 64,
-  # Avoid `all` unless you truly need it (it increases overhead).
-  lora_target_modules = ["o_proj", "down_proj"],
-  # Keep small: base-only + 1 adapter is the common case for Heretic.
-  max_loras_per_batch = 2,
-  # Cache a small number of adapters; increase if you reuse many adapters.
-  max_loaded_loras = 8,
-  # Choose LoRA kernel backend.
-  lora_backend = "csgmv",
-  max_lora_chunk_size = 64,
-  enable_lora_overlap_loading = true,
+# LoRA performance knobs (critical)
+max_lora_rank = 64
+# Avoid `all` unless you truly need it (it increases overhead).
+lora_target_modules = ["o_proj", "down_proj"]
+# Keep small: base-only + 1 adapter is the common case for Heretic.
+max_loras_per_batch = 2
+# Cache a small number of adapters; increase if you reuse many adapters.
+# NOTE: SGLang requires max_loaded_loras <= 2 * max_loras_per_batch when overlap loading is enabled.
+max_loaded_loras = 4
+# Choose LoRA kernel backend.
+lora_backend = "csgmv"
+max_lora_chunk_size = 64
+enable_lora_overlap_loading = true
 
-  # KTransformers / KT-Kernel (MoE fast path for RAW-INT4)
-  # If omitted, Heretic will resolve `model` to a local HF snapshot dir and set this automatically.
-  # kt_weight_path = "/models/kimi-k2.5",
-  kt_method = "RAWINT4",
-  # On 8×H200 you should aim for all experts on GPU for best decode speed.
-  kt_num_gpu_experts = 384,
-  # Minimal CPU fallback (should be rarely used when all experts are on GPU).
-  kt_cpuinfer = 8,
-  kt_threadpool_count = 1,
+# KTransformers / KT-Kernel (MoE fast path for RAW-INT4)
+# If omitted, Heretic will resolve `model` to a local HF snapshot dir and set this automatically.
+# kt_weight_path = "/models/kimi-k2.5"
+kt_method = "RAWINT4"
+# On 8×H200 you should aim for all experts on GPU for best decode speed.
+kt_num_gpu_experts = 384
+# Minimal CPU fallback (should be rarely used when all experts are on GPU).
+kt_cpuinfer = 8
+kt_threadpool_count = 1
 
-  # Start conservative for stability; revisit after baseline perf is good.
-  disable_shared_experts_fusion = true,
-}
+# Start conservative for stability; revisit after baseline perf is good.
+disable_shared_experts_fusion = true
 
 # One quick end-to-end trial by default.
 n_trials = 1
