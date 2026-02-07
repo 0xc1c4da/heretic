@@ -34,6 +34,7 @@ from .backend.hf_local import HFLocalBackend
 from .backend.base import HereticBackend
 from .backend.sglang import SGLangBackend
 from .backend.sglang_offline import SGLangOfflineBackend
+from .hf_resolve import resolve_model_dir
 from .utils import Prompt, batchify, empty_cache, print, sha256_token_ids
 
 
@@ -129,15 +130,28 @@ class Model:
                 print(f"* Transformer model with [bold]{self._num_layers}[/] layers (from config)")
         elif backend_type == BackendType.SGLANG_OFFLINE:
             # Embedded execution: do NOT load HF weights. SGLang Engine runs in-process.
+            resolved = resolve_model_dir(
+                settings.model,
+                revision=settings.hf_revision,
+                cache_dir=settings.hf_cache_dir,
+                local_files_only=bool(settings.hf_local_files_only),
+            )
+            resolved_dir = resolved.resolved_dir
+
+            engine_args = dict(getattr(settings, "sglang_offline_args", None) or {})
+            # Ensure KT uses the same resolved directory unless explicitly set.
+            engine_args.setdefault("kt_weight_path", resolved_dir)
+            engine_args.setdefault("tokenizer_path", resolved_dir)
+
             self.backend = SGLangOfflineBackend(
-                model_path=settings.model,
+                model_path=resolved_dir,
                 trust_remote_code=bool(settings.trust_remote_code),
-                engine_args=getattr(settings, "sglang_offline_args", None),
+                engine_args=engine_args,
             )
 
             # Keep a local tokenizer for prompt building / hashing (can be pushed server-side later).
             self.tokenizer = AutoTokenizer.from_pretrained(
-                settings.model,
+                resolved_dir,
                 trust_remote_code=settings.trust_remote_code,
             )
             if self.tokenizer.pad_token is None:
