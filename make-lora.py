@@ -22,6 +22,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import transformers
 
 
 # Allow running from repo root without installation (imports from ./src).
@@ -149,6 +150,8 @@ def main() -> int:
 
     # We don't need gradients; this is an inference-only pipeline.
     torch.set_grad_enabled(False)
+    # Silence warning spam from Transformers (mirrors heretic.main).
+    transformers.logging.set_verbosity_error()
 
     old_argv = sys.argv[:]
     try:

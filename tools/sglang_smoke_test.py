@@ -43,6 +43,37 @@ def _get_json(url: str, *, timeout_s: float = 30.0) -> Any:
         raise RuntimeError(f"Request failed for {url}: {e}") from e
 
 
+def _post_bytes(url: str, payload: dict[str, Any], *, timeout_s: float = 60.0) -> bytes:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code} for {url}: {raw}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Request failed for {url}: {e}") from e
+
+
+def _parse_score_full_vocab_bin(raw: bytes) -> tuple[int, int]:
+    # Header: magic(4) + batch(4) + vocab(4)
+    if len(raw) < 12 or raw[:4] != b"HSF1":
+        raise RuntimeError("Malformed score_full_vocab_bin payload (bad magic).")
+    bs = int.from_bytes(raw[4:8], "little", signed=False)
+    vocab = int.from_bytes(raw[8:12], "little", signed=False)
+    payload = raw[12:]
+    expected = bs * vocab * 2  # fp16 bytes
+    if len(payload) != expected:
+        raise RuntimeError(f"Bad payload size: {len(payload)=} {expected=}")
+    return bs, vocab
+
+
 def _serialize_for_sglang(obj: Any) -> str:
     """Serialize tensors safely for SGLang's SafeUnpickler over HTTP.
 
@@ -89,6 +120,8 @@ def main() -> int:
 
     # 0) Basic server liveness
     _try_call("GET /get_model_info", lambda: _get_json(f"{base_url}/get_model_info"))
+    _try_call("GET /heretic/metadata", lambda: _get_json(f"{base_url}/heretic/metadata"))
+    _try_call("GET /heretic/lora_status", lambda: _get_json(f"{base_url}/heretic/lora_status"))
 
     # 1) Tokenize chat (preferred way to obtain token ids)
     ok_tok, tok = _try_call(
@@ -118,7 +151,11 @@ def main() -> int:
         "POST /heretic/module_map",
         lambda: _post_json(
             f"{base_url}/heretic/module_map",
-            {"include_projs": None},
+            {
+                "include_projs": None,
+                # Default posture for Heretic: exclude MoE experts unless explicitly enabled.
+                "include_experts": [],
+            },
             timeout_s=300.0,
         ),
     )
@@ -296,6 +333,24 @@ def main() -> int:
                 timeout_s=300.0,
             ),
         )
+        _try_call(
+            "POST /heretic/score_full_vocab_bin (base)",
+            lambda: _post_bytes(
+                f"{base_url}/heretic/score_full_vocab_bin",
+                {"input_ids": input_ids_batch, "lora_id": None},
+                timeout_s=300.0,
+            ),
+        )
+        _try_call(
+            "validate /heretic/score_full_vocab_bin (base)",
+            lambda: _parse_score_full_vocab_bin(
+                _post_bytes(
+                    f"{base_url}/heretic/score_full_vocab_bin",
+                    {"input_ids": input_ids_batch, "lora_id": None},
+                    timeout_s=300.0,
+                )
+            ),
+        )
         if adapter_id is not None:
             _try_call(
                 "POST /heretic/score_full_vocab (adapter)",
@@ -305,6 +360,40 @@ def main() -> int:
                     timeout_s=300.0,
                 ),
             )
+            _try_call(
+                "POST /heretic/score_full_vocab_bin (adapter)",
+                lambda: _post_bytes(
+                    f"{base_url}/heretic/score_full_vocab_bin",
+                    {"input_ids": input_ids_batch, "lora_id": adapter_id},
+                    timeout_s=300.0,
+                ),
+            )
+            _try_call(
+                "validate /heretic/score_full_vocab_bin (adapter)",
+                lambda: _parse_score_full_vocab_bin(
+                    _post_bytes(
+                        f"{base_url}/heretic/score_full_vocab_bin",
+                        {"input_ids": input_ids_batch, "lora_id": adapter_id},
+                        timeout_s=300.0,
+                    )
+                ),
+            )
+
+        # Failure-mode: invalid lora_id must return HTTP 400 (and must not crash scheduler).
+        def _invalid_lora_id_should_400():
+            try:
+                _post_json(
+                    f"{base_url}/heretic/score_full_vocab",
+                    {"input_ids": input_ids_batch, "lora_id": "not_a_real_lora_id"},
+                    timeout_s=60.0,
+                )
+            except Exception as e:
+                if "HTTP 400" in str(e):
+                    return {"ok": True}
+                raise
+            raise RuntimeError("Expected HTTP 400 for invalid lora_id, got success")
+
+        _try_call("POST /heretic/score_full_vocab (invalid lora_id => 400)", _invalid_lora_id_should_400)
 
         _try_call(
             "POST /generate (base)",
@@ -341,7 +430,7 @@ def main() -> int:
             "POST /unload_lora_adapter",
             lambda: _post_json(
                 f"{admin_url}/unload_lora_adapter",
-                {"lora_name": adapter_name, "lora_id": None},
+                {"lora_name": adapter_name, "lora_id": adapter_id},
                 timeout_s=60.0,
             ),
         )

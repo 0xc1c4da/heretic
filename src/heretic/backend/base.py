@@ -126,7 +126,15 @@ class HereticBackend(ABC):
         """
         raise NotImplementedError
 
-    def module_map(self, *, include_projs: list[str] | None = None) -> list[dict[str, Any]]:
+    def module_map(
+        self,
+        *,
+        include_projs: list[str] | None = None,
+        include_layers: list[int] | None = None,
+        include_experts: list[int] | None = None,
+        max_experts_per_layer: int | None = None,
+        expert_strategy: str = "first",
+    ) -> list[dict[str, Any]]:
         """Return canonical module descriptors for ablation targeting.
 
         Implemented by SGLang backend; local backends may not provide a stable map.

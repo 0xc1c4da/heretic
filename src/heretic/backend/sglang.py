@@ -47,6 +47,41 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout_s: float = 60.0) ->
         raise RuntimeError(f"SGLang request failed for {url}: {e}") from e
 
 
+def _get_json(url: str, *, timeout_s: float = 60.0) -> _HTTPResponse:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+            return _HTTPResponse(status=getattr(resp, "status", 200), data=json.loads(raw))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"SGLang HTTP {e.code} error for {url}: {raw}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"SGLang request failed for {url}: {e}") from e
+
+
+def _post_bytes(
+    url: str, payload: dict[str, Any], *, timeout_s: float = 60.0
+) -> tuple[int, bytes, str | None]:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+            ctype = resp.headers.get("Content-Type")
+            return getattr(resp, "status", 200), raw, ctype
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"SGLang HTTP {e.code} error for {url}: {raw}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"SGLang request failed for {url}: {e}") from e
+
+
 def _serialize_for_sglang(obj: Any) -> str:
     """Serialize tensors safely for SGLang's SafeUnpickler over HTTP.
 
@@ -65,18 +100,29 @@ class SGLangBackend(HereticBackend):
         self.base_url = base_url.rstrip("/")
         self.admin_url = (admin_url or self.base_url).rstrip("/")
         self.model = model  # Optional override; else server default
+        self._adapter_ids_by_name: dict[str, str] = {}
 
     def get_metadata(self) -> BackendMetadata:
-        # Keep lightweight. (We can add a dedicated /metadata endpoint later.)
+        # Prefer server-reported metadata when available.
+        try:
+            resp = _get_json(f"{self.base_url}/heretic/metadata", timeout_s=30.0)
+            data = resp.data if isinstance(resp.data, dict) else {}
+        except Exception:
+            data = {}
+
+        supports = data.get("supports") if isinstance(data, dict) else None
+        if not isinstance(supports, dict):
+            supports = {}
+
         return BackendMetadata(
             backend_name="sglang",
-            backend_version=None,
-            model_id=self.model or "<server-default>",
+            backend_version=data.get("version") if isinstance(data, dict) else None,
+            model_id=(data.get("served_model_name") if isinstance(data, dict) else None)
+            or (self.model or "<server-default>"),
             tokenizer_id=None,
             max_context_len=None,
             supports={
                 "input_ids": True,
-                # Only true once the server echoes hashes (e.g., via sgl_ext.prompt_ids_sha256).
                 "prompt_ids_sha256": False,
                 "capture_layers": True,
                 "logprobs_full": True,
@@ -84,7 +130,23 @@ class SGLangBackend(HereticBackend):
                 "lora_hot_swap": True,
                 "tokenize_chat": True,
                 "generate_text": True,
+                **{k: bool(v) for k, v in supports.items()},
             },
+            num_layers=(
+                int(data.get("num_layers"))
+                if isinstance(data, dict) and isinstance(data.get("num_layers"), int)
+                else None
+            ),
+            hidden_size=(
+                int(data.get("hidden_size"))
+                if isinstance(data, dict) and isinstance(data.get("hidden_size"), int)
+                else None
+            ),
+            vocab_size=(
+                int(data.get("vocab_size"))
+                if isinstance(data, dict) and isinstance(data.get("vocab_size"), int)
+                else None
+            ),
         )
 
     def tokenize_chat(
@@ -112,6 +174,41 @@ class SGLangBackend(HereticBackend):
         )
 
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
+        # Prefer compact binary transport when available; fall back to JSON.
+        try:
+            status, raw, ctype = _post_bytes(
+                f"{self.base_url}/heretic/score_full_vocab_bin",
+                {"input_ids": input_ids_batch, "lora_id": adapter},
+                timeout_s=300.0,
+            )
+            if status == 200 and (ctype is None or "application/octet-stream" in ctype):
+                if len(raw) < 12 or raw[:4] != b"HSF1":
+                    raise RuntimeError("Malformed binary score payload (missing magic).")
+                bs = int.from_bytes(raw[4:8], "little", signed=False)
+                vocab = int.from_bytes(raw[8:12], "little", signed=False)
+                if bs != len(input_ids_batch):
+                    raise RuntimeError(
+                        f"Binary score batch mismatch: {bs=} {len(input_ids_batch)=}"
+                    )
+                payload = raw[12:]
+                expected = bs * vocab * 2  # fp16 bytes
+                if len(payload) != expected:
+                    raise RuntimeError(
+                        f"Binary score payload size mismatch: {len(payload)=} {expected=}"
+                    )
+                arr = np.frombuffer(payload, dtype=np.float16).reshape(bs, vocab)
+                logprobs_full = torch.from_numpy(arr.astype(np.float32, copy=False))
+                return ScoreResult(
+                    logprobs_full=logprobs_full,
+                    logprobs_topk=None,
+                    meta={"transport": "bin"},
+                )
+        except Exception as e:
+            # Fall back only when the binary endpoint is missing.
+            msg = str(e)
+            if "404" not in msg and "Not Found" not in msg:
+                raise
+
         resp = _post_json(
             f"{self.base_url}/heretic/score_full_vocab",
             {"input_ids": input_ids_batch, "lora_id": adapter},
@@ -132,10 +229,12 @@ class SGLangBackend(HereticBackend):
         rows: list[torch.Tensor] = []
         for b64, shape in zip(b64_list, shapes):
             if not isinstance(b64, str) or not isinstance(shape, list) or len(shape) != 1:
-                raise RuntimeError(f"Unexpected row encoding in /heretic/score_full_vocab: {shape=}")
+                raise RuntimeError(
+                    f"Unexpected row encoding in /heretic/score_full_vocab: {shape=}"
+                )
             vocab = int(shape[0])
-            raw = base64.b64decode(b64.encode("ascii"))
-            arr = np.frombuffer(raw, dtype=np.float16)
+            raw_row = base64.b64decode(b64.encode("ascii"))
+            arr = np.frombuffer(raw_row, dtype=np.float16)
             if arr.size != vocab:
                 raise RuntimeError(
                     f"Decoded fp16 size mismatch in /heretic/score_full_vocab: {arr.size=} {vocab=}"
@@ -146,7 +245,7 @@ class SGLangBackend(HereticBackend):
         return ScoreResult(
             logprobs_full=logprobs_full,
             logprobs_topk=None,
-            meta={"raw": data},
+            meta={"transport": "json", "raw": data},
         )
 
     def generate_text(
@@ -190,10 +289,24 @@ class SGLangBackend(HereticBackend):
             texts.append(t)
         return texts
 
-    def module_map(self, *, include_projs: list[str] | None = None) -> list[dict[str, Any]]:
+    def module_map(
+        self,
+        *,
+        include_projs: list[str] | None = None,
+        include_layers: list[int] | None = None,
+        include_experts: list[int] | None = None,
+        max_experts_per_layer: int | None = None,
+        expert_strategy: str = "first",
+    ) -> list[dict[str, Any]]:
         resp = _post_json(
             f"{self.base_url}/heretic/module_map",
-            {"include_projs": include_projs},
+            {
+                "include_projs": include_projs,
+                "include_layers": include_layers,
+                "include_experts": include_experts,
+                "max_experts_per_layer": max_experts_per_layer,
+                "expert_strategy": expert_strategy,
+            },
             timeout_s=300.0,
         )
         data = resp.data
@@ -419,6 +532,18 @@ class SGLangBackend(HereticBackend):
                 if not isinstance(out, dict):
                     raise RuntimeError(f"Unexpected /generate item: {out}")
                 meta = out.get("meta_info") or {}
+                applied = meta.get("capture_layers_applied")
+                if applied is not None:
+                    if not isinstance(applied, list) or any(
+                        not isinstance(x, int) for x in applied
+                    ):
+                        raise RuntimeError(
+                            f"Unexpected capture_layers_applied schema: {type(applied).__name__}"
+                        )
+                    if list(applied) != list(capture_layers):
+                        raise RuntimeError(
+                            f"SGLang did not apply requested capture_layers. requested={capture_layers} applied={applied}"
+                        )
                 hs_steps = meta.get("hidden_states")
                 if hs_steps is None:
                     raise RuntimeError("SGLang /generate missing meta_info.hidden_states.")
@@ -529,12 +654,17 @@ class SGLangBackend(HereticBackend):
         ref = loaded[name]
         if not isinstance(ref, dict) or not isinstance(ref.get("lora_id"), str):
             raise RuntimeError(f"Malformed adapter ref in load_lora response: {ref}")
-        return ref["lora_id"]
+        lora_id = ref["lora_id"]
+        self._adapter_ids_by_name[name] = lora_id
+        return lora_id
 
     def unload_adapter(self, *, name: str) -> None:
+        lora_id = self._adapter_ids_by_name.get(name)
         _post_json(
             f"{self.admin_url}/unload_lora_adapter",
-            {"lora_name": name, "lora_id": None},
+            {"lora_name": name, "lora_id": lora_id},
             timeout_s=60.0,
         )
+        if lora_id is not None:
+            self._adapter_ids_by_name.pop(name, None)
 

@@ -392,7 +392,11 @@ class Model:
                 )
 
             # Fetch canonical module paths from backend and group by component + layer.
-            module_descs = backend.module_map(include_projs=["o_proj", "down_proj"])
+            module_descs = backend.module_map(
+                include_projs=["o_proj", "down_proj"],
+                # Default: exclude MoE experts to keep adapter sizes tractable.
+                include_experts=[],
+            )
             by_layer_component: dict[tuple[int, str], list[str]] = {}
             for d in module_descs:
                 layer = d.get("layer")
@@ -791,12 +795,28 @@ class Model:
         if self._backend_type == BackendType.SGLANG:
             # Delegate capture to backend. We request all layers when available.
             if self._num_layers is None:
+                # Prefer server-reported metadata when available.
+                try:
+                    meta = self.backend.get_metadata()
+                    if isinstance(meta.num_layers, int) and meta.num_layers > 0:
+                        self._num_layers = int(meta.num_layers)
+                        print(
+                            f"* Inferred [bold]{self._num_layers}[/] layers from SGLang /heretic/metadata"
+                        )
+                except Exception:
+                    pass
+
+            if self._num_layers is None:
                 # Try to infer layer count from the remote module map.
                 # This avoids relying on local HF config fields, which may be missing in some
                 # on-disk model snapshots used purely for tokenizer/config.
                 try:
                     backend = cast(SGLangBackend, self.backend)
-                    descs: Any = backend.module_map(include_projs=["o_proj", "down_proj"])
+                    descs: Any = backend.module_map(
+                        include_projs=["o_proj", "down_proj"],
+                        # Default: exclude MoE experts for metadata inference.
+                        include_experts=[],
+                    )
                     # Defensive: in some multi-DP configurations, the server can return a
                     # list-of-lists; the SGLang backend normalizes this, but keep this robust.
                     if isinstance(descs, list) and descs and isinstance(descs[0], list):
