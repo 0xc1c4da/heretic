@@ -23,6 +23,8 @@ def _infer_weight_shape(m: dict[str, Any]) -> tuple[int, int] | None:
     out_f = m.get("out_features")
     in_f = m.get("in_features")
     if isinstance(out_f, int) and isinstance(in_f, int):
+        if out_f <= 0 or in_f <= 0:
+            return None
         return int(out_f), int(in_f)
     return None
 
