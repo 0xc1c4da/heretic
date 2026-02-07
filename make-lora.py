@@ -78,8 +78,18 @@ def _compute_refusal_directions(model: Model, settings: Settings) -> torch.Tenso
     """
     print()
     print("Loading prompt datasets...")
-    good_prompts = load_prompts(settings.good_prompts)
-    bad_prompts = load_prompts(settings.bad_prompts)
+    good_prompts = load_prompts(settings, settings.good_prompts)
+    bad_prompts = load_prompts(settings, settings.bad_prompts)
+
+    # Heretic's main CLI auto-detects batch size when batch_size==0.
+    # In this script we default to a *safe* value for residual capture,
+    # because residual computation uses output_hidden_states=True and is much
+    # more memory-intensive than plain generation.
+    if settings.batch_size == 0:
+        settings.batch_size = 1
+        print()
+        print("[yellow]settings.batch_size was 0 (auto). Using batch_size=1 for residual capture.[/]")
+        print("[yellow]Tip: override via --batch-size N (passthrough to Settings).[/]")
 
     print()
     print("Computing per-layer refusal directions...")
@@ -137,6 +147,9 @@ def main() -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # We don't need gradients; this is an inference-only pipeline.
+    torch.set_grad_enabled(False)
+
     old_argv = sys.argv[:]
     try:
         sys.argv = [sys.argv[0], *passthrough_args]
@@ -159,6 +172,11 @@ def main() -> int:
     print()
     print("Loading model (local backend)...")
     model = Model(settings)
+    # Ensure deterministic inference behavior where possible (disable dropout, etc.).
+    try:
+        model.model.eval()
+    except Exception:
+        pass
 
     refusal_directions = _compute_refusal_directions(model, settings)
 
