@@ -485,6 +485,14 @@ class Model:
                 # Default: exclude MoE experts to keep adapter sizes tractable.
                 include_experts=[],
             )
+            info_by_path: dict[str, dict[str, Any]] = {}
+            if isinstance(module_descs, list):
+                for d in module_descs:
+                    if not isinstance(d, dict):
+                        continue
+                    mp = d.get("module_path")
+                    if isinstance(mp, str):
+                        info_by_path[mp] = d
             by_layer_component: dict[tuple[int, str], list[str]] = {}
             # Diagnostics to pinpoint empty exports.
             desc_count = len(module_descs) if isinstance(module_descs, list) else 0
@@ -618,11 +626,7 @@ class Model:
 
                     # Preflight: ensure exported shapes match backend logical dims when provided.
                     # The backend's module_map is the source of truth for (out_features, in_features).
-                    info = None
-                    for d in module_descs:
-                        if isinstance(d, dict) and d.get("module_path") == p:
-                            info = d
-                            break
+                    info = info_by_path.get(p)
                     if info is not None:
                         exp_in = info.get("in_features")
                         exp_out = info.get("out_features")
