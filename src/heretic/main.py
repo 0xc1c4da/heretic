@@ -492,7 +492,7 @@ def run():
             ],
         )
 
-        last_layer_index = len(model.get_layers()) - 1
+        last_layer_index = model.num_layers - 1
 
         # Discrimination between "harmful" and "harmless" inputs is usually strongest
         # in layers slightly past the midpoint of the layer stack. See the original
@@ -659,6 +659,14 @@ def run():
             raise TrialPruned()
         try:
             result = objective(trial)
+        except Exception as e:
+            # Record failure context for post-mortem without killing the whole study.
+            try:
+                trial.set_user_attr("error_type", type(e).__name__)
+                trial.set_user_attr("error", str(e)[:2000])
+            except Exception:
+                pass
+            raise
         except KeyboardInterrupt:
             # If the user hit Ctrl+C twice, exit immediately.
             if hard_exit_requested:
@@ -700,7 +708,10 @@ def run():
     try:
         install_optimization_sigint_handler()
         study.optimize(
-            objective_wrapper, n_trials=settings.n_trials - count_completed_trials()
+            objective_wrapper,
+            n_trials=settings.n_trials - count_completed_trials(),
+            # Never let a single trial exception kill a long-running study.
+            catch=(Exception,),
         )
 
     except KeyboardInterrupt:
@@ -721,7 +732,21 @@ def run():
         # If no trials at all have been evaluated, the study must have been stopped
         # by pressing Ctrl+C while the first trial was running. In this case, we just
         # re-raise the interrupt to invoke the standard handler defined below.
-        completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        # Be defensive: some storages / manual edits can result in COMPLETE trials missing attrs.
+        completed_trials = []
+        for t in study.trials:
+            if t.state != TrialState.COMPLETE:
+                continue
+            try:
+                r = t.user_attrs.get("refusals")
+                k = t.user_attrs.get("kl_divergence")
+                if not isinstance(r, (int, float)) or not isinstance(k, (int, float)):
+                    continue
+                if not math.isfinite(float(k)):
+                    continue
+                completed_trials.append(t)
+            except Exception:
+                continue
         if not completed_trials:
             raise KeyboardInterrupt
 
@@ -818,6 +843,7 @@ def run():
                     study.optimize(
                         objective_wrapper,
                         n_trials=settings.n_trials - count_completed_trials(),
+                        catch=(Exception,),
                     )
                 except KeyboardInterrupt:
                     if hard_exit_requested:

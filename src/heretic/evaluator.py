@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
 
+import math
+
 import torch.nn.functional as F
+import torch
 from torch import Tensor
 
 from .config import Settings
 from .model import Model
 from .utils import Prompt, load_prompts, print
+
+
+class NonFiniteLogprobsError(RuntimeError):
+    """Raised when backend returns NaN/Inf logprobs that would poison KL computation."""
 
 
 class Evaluator:
@@ -30,6 +37,7 @@ class Evaluator:
 
         print("* Obtaining first-token probability distributions...")
         self.base_logprobs = self._get_first_token_logprobs(self.good_prompts)
+        self._validate_logprobs_tensor(self.base_logprobs, where="base")
 
         print()
         print(
@@ -100,12 +108,15 @@ class Evaluator:
     def get_score(self, *, adapter: str | None = None) -> tuple[tuple[float, float], float, int]:
         print("  * Obtaining first-token probability distributions...")
         logprobs = self._get_first_token_logprobs(self.good_prompts, adapter=adapter)
+        self._validate_logprobs_tensor(logprobs, where="adapted")
         kl_divergence = F.kl_div(
             logprobs,
             self.base_logprobs,
             reduction="batchmean",
             log_target=True,
         ).item()
+        if not math.isfinite(float(kl_divergence)):
+            raise NonFiniteLogprobsError(f"Non-finite KL divergence: {kl_divergence!r}")
         print(f"  * KL divergence: [bold]{kl_divergence:.4f}[/]")
 
         print("  * Counting model refusals...")
@@ -128,6 +139,26 @@ class Evaluator:
         )
 
         return score, kl_divergence, refusals
+
+    def _validate_logprobs_tensor(self, t: Tensor, *, where: str) -> None:
+        # Shape sanity: must be (batch, vocab).
+        if not isinstance(t, torch.Tensor) or t.ndim != 2:
+            raise NonFiniteLogprobsError(f"{where} logprobs_full must be a 2D torch.Tensor, got {type(t)} ndim={getattr(t,'ndim',None)}")
+        if where == "adapted":
+            if tuple(t.shape) != tuple(self.base_logprobs.shape):
+                raise NonFiniteLogprobsError(
+                    f"adapted logprobs_full shape mismatch vs base: {tuple(t.shape)} != {tuple(self.base_logprobs.shape)}"
+                )
+        # Finite check: NaN/Inf will poison KL and downstream Pareto logic.
+        finite = torch.isfinite(t)
+        if not bool(finite.all().item()):
+            bad = int((~finite).sum().item())
+            # Avoid expensive reductions on huge tensors; just grab safe summaries.
+            t_min = float(t[finite].min().item()) if bool(finite.any().item()) else float("nan")
+            t_max = float(t[finite].max().item()) if bool(finite.any().item()) else float("nan")
+            raise NonFiniteLogprobsError(
+                f"Non-finite {where} logprobs_full: bad={bad} of {t.numel()} (finite_min={t_min:.4g} finite_max={t_max:.4g})."
+            )
 
     def _get_first_token_logprobs(self, prompts: list[Prompt], *, adapter: str | None = None) -> Tensor:
         input_ids_batch = self.model.encode_prompts(prompts)

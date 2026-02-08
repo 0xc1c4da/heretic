@@ -325,6 +325,15 @@ class Model:
             f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
         )
 
+    @property
+    def num_layers(self) -> int:
+        """Return the transformer layer count for both local and backend modes."""
+        if self._backend_type == BackendType.LOCAL:
+            return int(len(self.get_layers()))
+        if self._num_layers is None:
+            raise RuntimeError("Remote backend layer count is unknown.")
+        return int(self._num_layers)
+
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """
         Creates quantization config based on settings.
