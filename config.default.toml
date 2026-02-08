@@ -81,6 +81,11 @@ kl_divergence_target = 0.01
 # Example: winsorization_quantile = 0.95 applies a 90% winsorization.
 winsorization_quantile = 1.0
 
+# Range for max_weight parameter during optimization.
+# Higher max values (e.g., 2.0) may be beneficial with row_normalization enabled.
+max_weight_min = 0.8
+max_weight_max = 1.5
+
 # Number of abliteration trials to run during optimization.
 n_trials = 200
 
