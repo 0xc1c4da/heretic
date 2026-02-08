@@ -131,6 +131,14 @@ class Settings(BaseSettings):
         ),
     )
 
+    sglang_hidden_states_dump_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional path to append a one-line JSON dump of SGLang hidden-state metadata when "
+            "residual capture fails (sglang_offline only). If unset, the dump is only emitted to logs."
+        ),
+    )
+
     evaluate_model: str | None = Field(
         default=None,
         description=(

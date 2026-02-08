@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import pickle
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -142,6 +141,16 @@ def _parse_hidden_states_last_prompt_token(
     if len(capture_layers) <= 0:
         return t1.view(1, -1)
 
+    # Sanity check: if SGLang reports which layers were captured, require it to match our request.
+    if isinstance(meta, dict):
+        applied = meta.get("capture_layers_applied")
+        if isinstance(applied, list) and all(isinstance(x, int) for x in applied):
+            if [int(x) for x in applied] != [int(x) for x in capture_layers]:
+                raise RuntimeError(
+                    "capture_layers mismatch: "
+                    f"requested={list(capture_layers)} applied={applied}"
+                )
+
     d_model_meta = None
     if isinstance(meta, dict) and isinstance(meta.get("hidden_states_d_model"), int):
         d_model_meta = int(meta["hidden_states_d_model"])
@@ -184,6 +193,7 @@ class SGLangOfflineBackend(HereticBackend):
         model_path: str,
         trust_remote_code: bool = False,
         engine_args: dict[str, Any] | None = None,
+        hidden_states_dump_path: str | None = None,
     ):
         try:
             from sglang.version import __version__ as sglang_version
@@ -199,6 +209,7 @@ class SGLangOfflineBackend(HereticBackend):
 
         self._sglang_version = sglang_version
         self._adapter_ids_by_name: dict[str, str] = {}
+        self._hidden_states_dump_path = str(hidden_states_dump_path) if hidden_states_dump_path else None
 
         args = dict(engine_args or {})
         args.setdefault("model_path", model_path)
@@ -498,10 +509,6 @@ class SGLangOfflineBackend(HereticBackend):
 
         _ = capture_point  # currently only one capture point is supported in SGLang integration.
 
-        def _env_flag(name: str) -> bool:
-            v = os.environ.get(name)
-            return v is not None and v not in ("", "0", "false", "False")
-
         def _summarize_hidden_states_steps(raw_hs: Any, *, max_steps: int = 8) -> dict[str, Any]:
             if not isinstance(raw_hs, list):
                 return {"type": type(raw_hs).__name__}
@@ -559,7 +566,7 @@ class SGLangOfflineBackend(HereticBackend):
                 "hidden_states_summary": _summarize_hidden_states_steps(raw_hs),
             }
 
-            dump_path = os.environ.get("HERETIC_SGLANG_HIDDEN_STATES_DEBUG_PATH")
+            dump_path = self._hidden_states_dump_path
             if dump_path:
                 try:
                     with open(dump_path, "a", encoding="utf-8") as f:
@@ -598,13 +605,13 @@ class SGLangOfflineBackend(HereticBackend):
                     )
                 )
             except Exception as e:
-                if _env_flag("HERETIC_SGLANG_HIDDEN_STATES_DEBUG"):
-                    _dump_hidden_states_debug(
-                        batch_index=i,
-                        meta=meta,
-                        raw_hs=hs_steps,
-                        err=str(e),
-                    )
+                # Always emit a one-shot diagnostic dump on first failure.
+                _dump_hidden_states_debug(
+                    batch_index=i,
+                    meta=meta,
+                    raw_hs=hs_steps,
+                    err=str(e),
+                )
                 raise
 
         t = torch.stack(per_item, dim=0)
