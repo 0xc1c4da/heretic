@@ -156,6 +156,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    sglang_abliterate_include_projs: list[str] | None = Field(
+        default=None,
+        description=(
+            "When using backend='sglang' or 'sglang_offline', optional list of projection names to "
+            "target for LoRA export and module_map selection (e.g. ['o_proj','down_proj'] or "
+            "['qkv_proj','o_proj','gate_up_proj','down_proj']). If unset, defaults to legacy "
+            "targeting: ['o_proj','down_proj']."
+        ),
+    )
+
     sglang_hidden_states_dump_path: str | None = Field(
         default=None,
         description=(
