@@ -453,7 +453,40 @@ class Model:
             backend = cast(Any, self.backend)
 
             # Build a minimal LoRA config dict compatible with SGLang's LoRAConfig.
-            target_modules = ["o_proj", "down_proj"]
+            target_modules = getattr(self.settings, "sglang_abliterate_include_projs", None)
+            if target_modules is None:
+                target_modules = ["o_proj", "down_proj"]
+            if not isinstance(target_modules, list) or not target_modules:
+                raise ValueError(
+                    "settings.sglang_abliterate_include_projs must be a non-empty list of strings when set."
+                )
+
+            def _normalize_proj(proj: str) -> str:
+                # Match SGLang's normalization conventions (q/k/v -> qkv, gate/up -> gate_up).
+                if proj in ("q_proj", "k_proj", "v_proj"):
+                    return "qkv_proj"
+                if proj in ("gate_proj", "up_proj"):
+                    return "gate_up_proj"
+                return proj
+
+            # Fail fast on configuration mismatches that would silently drop targets.
+            if self._backend_type == BackendType.SGLANG_OFFLINE:
+                engine_targets = self.settings.sglang_offline_args.get("lora_target_modules")
+                if engine_targets is not None:
+                    if not isinstance(engine_targets, (list, set, tuple)):
+                        raise ValueError(
+                            "sglang_offline_args.lora_target_modules must be a list/set of strings when set."
+                        )
+                    engine_norm = {_normalize_proj(str(x)) for x in engine_targets}
+                    req_norm = {_normalize_proj(str(x)) for x in target_modules}
+                    missing = sorted(req_norm - engine_norm)
+                    if missing:
+                        raise ValueError(
+                            "Requested SGLang ablation projections are not enabled in "
+                            f"sglang_offline_args.lora_target_modules; missing={missing}. "
+                            "Add them to `[sglang_offline_args].lora_target_modules` (use normalized names like "
+                            "'qkv_proj' and 'gate_up_proj')."
+                        )
             if self.settings.row_normalization == RowNormalization.FULL:
                 lora_rank = self.settings.full_normalization_lora_rank
             else:
@@ -484,10 +517,19 @@ class Model:
             include_experts = (
                 None if bool(getattr(self.settings, "sglang_abliterate_include_experts", False)) else []
             )
+            if (
+                self._backend_type == BackendType.SGLANG_OFFLINE
+                and bool(getattr(self.settings, "sglang_abliterate_include_experts", False))
+                and not bool(self.settings.sglang_offline_args.get("enable_lora_experts", False))
+            ):
+                raise ValueError(
+                    "settings.sglang_abliterate_include_experts=true requires "
+                    "`enable_lora_experts = true` under `[sglang_offline_args]` for backend='sglang_offline'."
+                )
             max_experts_per_layer = getattr(self.settings, "sglang_abliterate_max_experts_per_layer", None)
             expert_strategy = str(getattr(self.settings, "sglang_abliterate_expert_strategy", "first") or "first")
             module_descs = backend.module_map(
-                include_projs=["o_proj", "down_proj"],
+                include_projs=target_modules,
                 # Default: exclude MoE experts to keep adapter sizes tractable.
                 include_experts=include_experts,
                 max_experts_per_layer=max_experts_per_layer,
@@ -1015,8 +1057,11 @@ class Model:
                 # on-disk model snapshots used purely for tokenizer/config.
                 try:
                     sgl_backend = cast(Any, self.backend)
+                    probe_projs = getattr(self.settings, "sglang_abliterate_include_projs", None)
+                    if probe_projs is None:
+                        probe_projs = ["o_proj", "down_proj"]
                     descs: Any = sgl_backend.module_map(
-                        include_projs=["o_proj", "down_proj"],
+                        include_projs=probe_projs,
                         # Default: exclude MoE experts for metadata inference.
                         include_experts=[],
                     )
