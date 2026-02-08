@@ -147,6 +147,7 @@ class Model:
                 model_path=resolved_dir,
                 trust_remote_code=bool(settings.trust_remote_code),
                 engine_args=engine_args,
+                hidden_states_dump_path=getattr(settings, "sglang_hidden_states_dump_path", None),
             )
 
             # Keep a local tokenizer for prompt building / hashing (can be pushed server-side later).

@@ -466,17 +466,16 @@ def run_startup_validations(
         residual_ok = False
         notes.append(f"residual_mapping failed: {e}")
         # Extra context for debugging SGLang hidden-states schema issues.
-        # Enable one-shot dumps from the offline backend with:
-        #   HERETIC_SGLANG_HIDDEN_STATES_DEBUG=1
-        # Optionally persist dumps:
-        #   HERETIC_SGLANG_HIDDEN_STATES_DEBUG_PATH=/path/to/hs_dump.jsonl
+        # The offline backend emits a one-shot hidden-state schema dump on first failure.
+        # To persist the dump, set:
+        #   sglang_hidden_states_dump_path = "/path/to/hs_dump.jsonl"
         try:
             backend_name = backend.get_metadata().backend_name
         except Exception:
             backend_name = ""
         if backend_name in ("sglang", "sglang_offline"):
             notes.append(
-                "tip: set HERETIC_SGLANG_HIDDEN_STATES_DEBUG=1 to dump meta_info.hidden_states schema/shape on first failure"
+                "tip: set sglang_hidden_states_dump_path to persist the hidden-states dump for offline debugging"
             )
 
     # 3) LoRA sanity
