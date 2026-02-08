@@ -391,8 +391,39 @@ class Model:
 
     def get_abliterable_components(self) -> list[str]:
         if self._backend_type != BackendType.LOCAL:
-            # Keep component names stable for downstream logic; remote module selection uses /heretic/module_map.
-            return ["attn.o_proj", "mlp.down_proj"]
+            # For SGLang backends, components must line up with what we actually export.
+            # Default to the legacy two-module setup unless configured otherwise.
+            projs = getattr(self.settings, "sglang_abliterate_include_projs", None)
+            if projs is None:
+                projs = ["o_proj", "down_proj"]
+
+            def _normalize_proj(proj: str) -> str:
+                if proj in ("q_proj", "k_proj", "v_proj"):
+                    return "qkv_proj"
+                if proj in ("gate_proj", "up_proj"):
+                    return "gate_up_proj"
+                return proj
+
+            norm = {_normalize_proj(str(p)) for p in projs}
+            allowed = {"qkv_proj", "o_proj", "gate_up_proj", "down_proj"}
+            unknown = sorted(norm - allowed)
+            if unknown:
+                raise ValueError(
+                    "Unsupported sglang_abliterate_include_projs entries for SGLang backends: "
+                    f"{unknown}. Supported={sorted(allowed)}"
+                )
+
+            out: list[str] = []
+            # Stable order.
+            if "qkv_proj" in norm:
+                out.append("attn.qkv_proj")
+            if "o_proj" in norm:
+                out.append("attn.o_proj")
+            if "gate_up_proj" in norm:
+                out.append("mlp.gate_up_proj")
+            if "down_proj" in norm:
+                out.append("mlp.down_proj")
+            return out
         return list(self.get_layer_modules(0).keys())
 
     def build_lora_adapter_bundle(
@@ -456,10 +487,10 @@ class Model:
             backend = cast(Any, self.backend)
 
             # Build a minimal LoRA config dict compatible with SGLang's LoRAConfig.
-            target_modules = getattr(self.settings, "sglang_abliterate_include_projs", None)
-            if target_modules is None:
-                target_modules = ["o_proj", "down_proj"]
-            if not isinstance(target_modules, list) or not target_modules:
+            include_projs = getattr(self.settings, "sglang_abliterate_include_projs", None)
+            if include_projs is None:
+                include_projs = ["o_proj", "down_proj"]
+            if not isinstance(include_projs, list) or not include_projs:
                 raise ValueError(
                     "settings.sglang_abliterate_include_projs must be a non-empty list of strings when set."
                 )
@@ -471,6 +502,15 @@ class Model:
                 if proj in ("gate_proj", "up_proj"):
                     return "gate_up_proj"
                 return proj
+
+            target_modules = [_normalize_proj(str(p)) for p in include_projs]
+            allowed = {"qkv_proj", "o_proj", "gate_up_proj", "down_proj"}
+            unknown = sorted({str(x) for x in target_modules} - allowed)
+            if unknown:
+                raise ValueError(
+                    "Unsupported sglang_abliterate_include_projs entries for SGLang backends: "
+                    f"{unknown}. Supported={sorted(allowed)}"
+                )
 
             # Fail fast on configuration mismatches that would silently drop targets.
             if self._backend_type == BackendType.SGLANG_OFFLINE:
@@ -553,6 +593,7 @@ class Model:
             parsed_proj_fail = 0
             incompatible_layer_id = 0
             kept = 0
+            exported_target_modules: set[str] = set()
 
             def _parse_layer_id(module_path: str) -> int | None:
                 # SGLang LoRA expects weight names containing `layers.<idx>.`.
@@ -600,10 +641,16 @@ class Model:
                     incompatible_layer_id += 1
                     continue
 
-                if proj == "o_proj":
+                proj_norm = _normalize_proj(proj)
+
+                if proj_norm == "o_proj":
                     comp = "attn.o_proj"
-                elif proj == "down_proj":
+                elif proj_norm == "qkv_proj":
+                    comp = "attn.qkv_proj"
+                elif proj_norm == "down_proj":
                     comp = "mlp.down_proj"
+                elif proj_norm == "gate_up_proj":
+                    comp = "mlp.gate_up_proj"
                 else:
                     continue
 
@@ -661,6 +708,7 @@ class Model:
 
                 for p in paths:
                     module_base = p[: -len(".weight")] if p.endswith(".weight") else p
+                    exported_target_modules.add(module_base.split(".")[-1])
 
                     if self.settings.row_normalization == RowNormalization.FULL:
                         A, B = backend.build_full_rownorm_lora(
@@ -698,6 +746,16 @@ class Model:
                     # SGLang accepts these as it matches on substring `lora_A`/`lora_B`.
                     exported[f"{module_base}.lora_A.default.weight"] = A.to(torch.float16).cpu()
                     exported[f"{module_base}.lora_B.default.weight"] = B.to(torch.float16).cpu()
+
+            # Fail fast if the adapter config requests targets we didn't export any weights for.
+            # Missing tensors can lead to undefined behavior in some LoRA loaders.
+            missing_targets = sorted(set(target_modules) - exported_target_modules)
+            if missing_targets:
+                raise RuntimeError(
+                    "LoRA export produced no tensors for some requested target_modules: "
+                    f"{missing_targets}. This likely indicates a mismatch between "
+                    "sglang_abliterate_include_projs, model architecture, and module_map filtering."
+                )
 
             if not exported:
                 # Produce a highly actionable error instead of silently returning an empty adapter.
