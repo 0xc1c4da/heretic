@@ -13,7 +13,7 @@ model = "moonshotai/Kimi-K2.5"
 backend = "sglang_offline"
 trust_remote_code = true
 validate_backend = true
-detect_response_prefix = true
+detect_response_prefix = false
 
 # Optional: pin an exact revision for fully reproducible runs.
 # hf_revision = "<commit-hash-or-tag>"
@@ -42,22 +42,15 @@ max_response_length = 100
 
 # Use orthogonalized refusal directions (production default).
 orthogonalize_direction = true
-
-# For SGLang backends, control which projections are targeted during LoRA export.
-# NOTE: With the current refusal-direction method, only `o_proj` and `down_proj` are supported
-# (they have out_features == hidden_size). Targeting `qkv_proj`/`gate_up_proj` requires a different method.
 sglang_abliterate_include_projs = ["o_proj", "down_proj"]
-# Optional (MoE): include routed expert weights in export (can increase adapter size a lot).
-# sglang_abliterate_include_experts = true
-# sglang_abliterate_max_experts_per_layer = 1
-# sglang_abliterate_expert_strategy = "first"
+sglang_abliterate_include_experts = true
 
 # Exercise FULL rownorm path (server-side primitive via embedded engine).
 row_normalization = "full"
 full_normalization_lora_rank = 64
 
 # Refusal evaluation / verbosity
-print_responses = true
+print_responses = false
 print_residual_geometry = false
 plot_residuals = false
 
@@ -72,9 +65,10 @@ kl_divergence_target = 0.01
 winsorization_quantile = 0.995
 
 # Range for max_weight parameter during optimization.
-# Higher max values (e.g., 4.0) may be beneficial with row_normalization="full".
-max_weight_min = 0.8
-max_weight_max = 4.0
+# Higher max values (e.g., 2.0) may be beneficial with row_normalization enabled.
+max_weight_min = 0.05
+max_weight_max = 6.0
+
 
 # Optimization budget
 n_trials = 800
@@ -132,9 +126,9 @@ tp_size = 8
 attention_backend = "flashinfer"
 
 # Memory/scheduling (tune to your workload)
-mem_fraction_static = 0.96
+# mem_fraction_static = 0.96
 max_total_tokens = 50000
-chunked_prefill_size = 32768
+# chunked_prefill_size = 32768
 enable_mixed_chunk = true
 
 # Required features for Heretic
@@ -145,8 +139,8 @@ enable_lora = true
 max_lora_rank = 64
 # Avoid `all` unless you truly need it (it increases overhead).
 lora_target_modules = ["o_proj", "down_proj"]
-# Required if you enable expert export above.
-# enable_lora_experts = true
+enable_lora_experts = true
+# lora_target_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
 # Keep small: base-only + 1 adapter is the common case for Heretic.
 max_loras_per_batch = 2
 # Cache a small number of adapters; increase if you reuse many adapters.
@@ -193,4 +187,3 @@ column = "text"
 dataset = "mlabonne/harmful_behaviors"
 split = "test[:100]"
 column = "text"
-
