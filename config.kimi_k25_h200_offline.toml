@@ -41,6 +41,7 @@ max_batch_size = 128
 max_response_length = 100
 
 # Use orthogonalized refusal directions (production default).
+refusal_cache = true
 orthogonalize_direction = true
 sglang_abliterate_include_projs = ["o_proj", "down_proj"]
 sglang_abliterate_include_experts = true
