@@ -413,6 +413,13 @@ class Model:
                     f"{unknown}. Supported={sorted(allowed)}"
                 )
 
+            unsupported_for_direction = sorted(norm.intersection({"qkv_proj", "gate_up_proj"}))
+            if unsupported_for_direction:
+                raise ValueError(
+                    "Unsupported ablation projections for current refusal-direction method: "
+                    f"{unsupported_for_direction}. Use ['o_proj','down_proj'] for now."
+                )
+
             out: list[str] = []
             # Stable order.
             if "qkv_proj" in norm:
@@ -510,6 +517,28 @@ class Model:
                 raise ValueError(
                     "Unsupported sglang_abliterate_include_projs entries for SGLang backends: "
                     f"{unknown}. Supported={sorted(allowed)}"
+                )
+
+            # IMPORTANT: With the current algorithm, refusal directions live in residual space
+            # (hidden_size). The LoRA update we apply requires a direction in the *output space*
+            # of the target linear weight, i.e. len(v) must equal out_features (global).
+            #
+            # For standard decoder blocks, only `o_proj` and `down_proj` have out_features == hidden_size.
+            # `qkv_proj` and `gate_up_proj` generally do not, so attempting to ablate them will error
+            # (or worse: produce NaNs/undefined behavior if the backend swallows the mismatch).
+            unsupported_for_direction = sorted(
+                set(target_modules).intersection({"qkv_proj", "gate_up_proj"})
+            )
+            if unsupported_for_direction:
+                raise ValueError(
+                    "Unsupported ablation projections for current refusal-direction method: "
+                    f"{unsupported_for_direction}.\n"
+                    "Reason: refusal directions are hidden_size vectors, but these projections have "
+                    "out_features != hidden_size, so FULL rownorm / directional LoRA cannot be constructed.\n"
+                    "Fix: set sglang_abliterate_include_projs=['o_proj','down_proj'] and "
+                    "[sglang_offline_args].lora_target_modules=['o_proj','down_proj'].\n"
+                    "If you want to ablate qkv_proj/gate_up_proj, we need a new method that computes "
+                    "directions in those projections' output spaces."
                 )
 
             # Fail fast on configuration mismatches that would silently drop targets.
