@@ -2,7 +2,9 @@
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
 
 import math
+import logging
 import os
+import signal
 import sys
 import time
 import warnings
@@ -35,6 +37,8 @@ from optuna.trial import TrialState
 from pydantic import ValidationError
 from questionary import Choice
 from rich.traceback import install
+
+logger = logging.getLogger(__name__)
 
 from .analyzer import Analyzer
 from .config import BackendType, QuantizationMethod, Settings
@@ -567,17 +571,33 @@ def run():
                 direction_index,
                 parameters,
             )
-            adapter_id = model.backend.load_adapter(
-                name=adapter_name,
-                tensors=bundle.tensors,
-                config=bundle.config_dict,
+            adapter_id = None
+            adapter_loaded = False
+            try:
+                adapter_id = model.backend.load_adapter(
+                    name=adapter_name,
+                    tensors=bundle.tensors,
+                    config=bundle.config_dict,
+                )
+                adapter_loaded = True
+                print("* Evaluating...")
+                score, kl_divergence, refusals = evaluator.get_score(
+                    adapter=adapter_id,
+                )
+            finally:
+                if adapter_loaded:
+                    # Never mask the original error (trial failure / Ctrl+C / etc.)
+                    try:
+                        model.backend.unload_adapter(name=adapter_name)
+                    except Exception as unload_error:
+                        logger.warning(
+                            f"Adapter unload failed for {adapter_name!r}: {unload_error}"
+                        )
+        if backend_type == BackendType.LOCAL:
+            print("* Evaluating...")
+            score, kl_divergence, refusals = evaluator.get_score(
+                adapter=None,
             )
-        print("* Evaluating...")
-        score, kl_divergence, refusals = evaluator.get_score(
-            adapter=(adapter_id if backend_type != BackendType.LOCAL else None),
-        )
-        if backend_type != BackendType.LOCAL:
-            model.backend.unload_adapter(name=adapter_name)
 
         elapsed_time = time.perf_counter() - start_time
         remaining_time = (elapsed_time / (trial_index - start_index)) * (
@@ -596,13 +616,55 @@ def run():
 
         return score
 
+    # Ctrl+C handling during optimization:
+    # - First Ctrl+C: request a soft-stop (finish current trial, then stop study and show menu).
+    # - Second Ctrl+C: hard-exit the program immediately.
+    stop_requested = False
+    hard_exit_requested = False
+    sigint_count = 0
+    prev_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def install_optimization_sigint_handler() -> None:
+        def _handler(signum, frame):
+            nonlocal stop_requested, hard_exit_requested, sigint_count
+            sigint_count += 1
+            if sigint_count == 1:
+                stop_requested = True
+                print("\n[yellow]Ctrl+C received: stopping after current trial...[/]")
+                return
+
+            hard_exit_requested = True
+            # Restore default behavior for any further interrupts, then exit.
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGINT, _handler)
+
+    def restore_prev_sigint_handler() -> None:
+        # Restore default Ctrl+C behavior for questionary prompts.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+
     def objective_wrapper(trial: Trial) -> tuple[float, float]:
-        try:
-            return objective(trial)
-        except KeyboardInterrupt:
-            # Stop the study gracefully on Ctrl+C.
+        nonlocal stop_requested
+        if stop_requested:
             trial.study.stop()
             raise TrialPruned()
+        try:
+            result = objective(trial)
+        except KeyboardInterrupt:
+            # If the user hit Ctrl+C twice, exit immediately.
+            if hard_exit_requested:
+                raise
+
+            # Otherwise, stop the study gracefully on Ctrl+C.
+            stop_requested = True
+            trial.study.stop()
+            raise TrialPruned()
+
+        if stop_requested:
+            trial.study.stop()
+
+        return result
 
     study = optuna.create_study(
         study_name="heretic",
@@ -628,6 +690,7 @@ def run():
         print("Resuming existing study.")
 
     try:
+        install_optimization_sigint_handler()
         study.optimize(
             objective_wrapper, n_trials=settings.n_trials - count_completed_trials()
         )
@@ -636,7 +699,12 @@ def run():
         # This additional handler takes care of the small chance that KeyboardInterrupt
         # is raised just between trials, which wouldn't be caught by the handler
         # defined in objective_wrapper above.
-        pass
+        if hard_exit_requested:
+            raise
+        stop_requested = True
+    finally:
+        # Restore default Ctrl+C behavior for the interactive menu (questionary).
+        restore_prev_sigint_handler()
 
     if count_completed_trials() == settings.n_trials:
         study.set_user_attr("finished", True)
@@ -735,12 +803,20 @@ def run():
                 study.set_user_attr("settings", settings.model_dump_json())
                 study.set_user_attr("finished", False)
                 try:
+                    stop_requested = False
+                    hard_exit_requested = False
+                    sigint_count = 0
+                    install_optimization_sigint_handler()
                     study.optimize(
                         objective_wrapper,
                         n_trials=settings.n_trials - count_completed_trials(),
                     )
                 except KeyboardInterrupt:
-                    pass
+                    if hard_exit_requested:
+                        raise
+                    stop_requested = True
+                finally:
+                    restore_prev_sigint_handler()
                 if count_completed_trials() == settings.n_trials:
                     study.set_user_attr("finished", True)
                 break
