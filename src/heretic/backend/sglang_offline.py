@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
+import logging
+import os
 import pickle
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -17,6 +20,148 @@ from .base import (
     TokenizeChatResult,
     VTWResult,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _is_num(x: Any) -> bool:
+    return isinstance(x, (int, float))
+
+
+def _is_list_of_nums(x: Any) -> bool:
+    # Empty vectors are not valid hidden states; they usually indicate an empty
+    # prompt (no tokens) or an upstream capture failure.
+    return isinstance(x, list) and len(x) > 0 and all(_is_num(v) for v in x)
+
+
+def _parse_hidden_states_last_prompt_token(
+    raw_hs: Any,
+    *,
+    meta: dict[str, Any] | None,
+    capture_layers: list[int],
+    batch_index: int | None = None,
+) -> torch.Tensor:
+    """
+    Parse SGLang `meta_info.hidden_states` into a (layers, d_model) tensor for the last prompt token.
+
+    Expected schema (preferred):
+    - meta_info.hidden_states_schema_version == "v0_steps"
+    - meta_info.hidden_states is a list of "steps" where each step is:
+      - a tokens×features tensor/list (prefill chunk), or
+      - a features vector (decode step)
+
+    When meta_info.prompt_tokens is present, this function indexes into the concatenated token stream
+    to select the last prompt token, even under chunked/mixed prefill.
+    """
+    if not isinstance(raw_hs, list) or len(raw_hs) == 0:
+        raise RuntimeError("hidden_states is empty or not a list.")
+
+    schema = meta.get("hidden_states_schema_version") if isinstance(meta, dict) else None
+    prompt_tokens = meta.get("prompt_tokens") if isinstance(meta, dict) else None
+    prompt_tokens_i = int(prompt_tokens) if isinstance(prompt_tokens, int) else None
+
+    vec_list: list[float] | None = None
+    vec_arr: np.ndarray | None = None
+
+    def _step_token_count(step: Any) -> int | None:
+        if isinstance(step, np.ndarray):
+            if step.ndim == 2:
+                return int(step.shape[0])
+            if step.ndim == 1:
+                return 1
+            return None
+        if _is_list_of_nums(step):
+            return 1
+        if isinstance(step, list):
+            # list-of-vectors (tokens x features)
+            return len(step)
+        return None
+
+    def _extract_token_vec(step: Any, token_index: int) -> tuple[np.ndarray | None, list[float] | None]:
+        # token_index is within this step (0-based)
+        if isinstance(step, np.ndarray):
+            if step.ndim == 2:
+                if 0 <= token_index < int(step.shape[0]):
+                    return step[token_index], None
+                return None, None
+            if step.ndim == 1:
+                return (step if token_index == 0 else None), None
+            return None, None
+        if _is_list_of_nums(step):
+            return None, (step if token_index == 0 else None)
+        if isinstance(step, list):
+            if 0 <= token_index < len(step) and _is_list_of_nums(step[token_index]):
+                return None, step[token_index]
+        return None, None
+
+    # Schema-driven parsing:
+    # - `v0_steps`: a list of "steps" (typically prefill chunks and/or decode steps).
+    #   Select the *last prompt token* by indexing into the concatenated token stream
+    #   using `prompt_tokens` when available.
+    if schema == "v0_steps" and prompt_tokens_i is not None and prompt_tokens_i > 0:
+        seen = 0
+        for step in raw_hs:
+            n = _step_token_count(step)
+            if n is None or n <= 0:
+                continue
+            prev = seen
+            seen += n
+            if seen >= prompt_tokens_i:
+                local_idx = (prompt_tokens_i - 1) - prev
+                vec_arr, vec_list = _extract_token_vec(step, int(local_idx))
+                break
+
+    # Fallback: use the last non-empty step's last token/vector.
+    if vec_arr is None and vec_list is None:
+        for step in reversed(raw_hs):
+            n = _step_token_count(step)
+            if n is None or n <= 0:
+                continue
+            vec_arr, vec_list = _extract_token_vec(step, n - 1)
+            if vec_arr is not None or vec_list is not None:
+                break
+
+    if vec_arr is None and vec_list is None:
+        meta_keys = sorted(list(meta.keys())) if isinstance(meta, dict) else []
+        raise RuntimeError(
+            "Unsupported hidden_states schema (no usable token vector found). "
+            f"{schema=} {prompt_tokens_i=} {batch_index=} meta_keys={meta_keys}"
+        )
+
+    if vec_arr is not None:
+        if vec_arr.ndim != 1:
+            raise RuntimeError(f"Unexpected hidden_states vector ndim: {vec_arr.ndim}")
+        t1 = torch.from_numpy(vec_arr.astype(np.float32, copy=False))
+    else:
+        if len(vec_list) == 0:
+            raise RuntimeError("hidden_states vector is empty.")
+        t1 = torch.tensor(vec_list, dtype=torch.float32)
+    if t1.ndim != 1:
+        raise RuntimeError(f"Unexpected hidden_states vector ndim: {t1.ndim}")
+
+    if len(capture_layers) <= 0:
+        return t1.view(1, -1)
+
+    d_model_meta = None
+    if isinstance(meta, dict) and isinstance(meta.get("hidden_states_d_model"), int):
+        d_model_meta = int(meta["hidden_states_d_model"])
+
+    if d_model_meta is not None:
+        expected = len(capture_layers) * d_model_meta
+        if t1.numel() != expected:
+            raise RuntimeError(
+                "Hidden-state feature dim mismatch vs meta_info.hidden_states_d_model: "
+                f"{t1.numel()} != {expected} (layers={len(capture_layers)}, d_model={d_model_meta})."
+            )
+        d_model = d_model_meta
+    else:
+        if t1.numel() % len(capture_layers) != 0:
+            raise RuntimeError(
+                f"Hidden-state feature dim {t1.numel()} is not divisible by requested layers {len(capture_layers)}."
+            )
+        d_model = t1.numel() // len(capture_layers)
+
+    return t1.view(len(capture_layers), d_model)
 
 
 def _serialize_for_sglang(obj: Any) -> str:
@@ -353,81 +498,79 @@ class SGLangOfflineBackend(HereticBackend):
 
         _ = capture_point  # currently only one capture point is supported in SGLang integration.
 
-        def _is_num(x: Any) -> bool:
-            return isinstance(x, (int, float))
+        def _env_flag(name: str) -> bool:
+            v = os.environ.get(name)
+            return v is not None and v not in ("", "0", "false", "False")
 
-        def _is_list_of_nums(x: Any) -> bool:
-            # Empty vectors are not valid hidden states; they usually indicate an empty
-            # prompt (no tokens) or an upstream capture failure.
-            return isinstance(x, list) and len(x) > 0 and all(_is_num(v) for v in x)
-
-        def _parse_hidden_states(raw_hs: Any) -> torch.Tensor:
-            if not isinstance(raw_hs, list) or len(raw_hs) == 0:
-                raise RuntimeError("hidden_states is empty or not a list.")
-
-            vec_list: list[float] | None = None
-            vec_arr: np.ndarray | None = None
-
-            # Prefer prefill step: tokens x features; take last prompt token.
-            for step in raw_hs:
+        def _summarize_hidden_states_steps(raw_hs: Any, *, max_steps: int = 8) -> dict[str, Any]:
+            if not isinstance(raw_hs, list):
+                return {"type": type(raw_hs).__name__}
+            out: dict[str, Any] = {"type": "list", "num_steps": len(raw_hs), "steps": []}
+            for step in raw_hs[:max_steps]:
                 if isinstance(step, np.ndarray):
-                    if step.ndim == 2 and step.shape[0] > 0:
-                        vec_arr = step[-1]
-                        break
-                    if step.ndim == 1 and step.shape[0] > 0:
-                        vec_arr = step
-                        break
-                elif (
-                    isinstance(step, list)
-                    and len(step) > 0
-                    and isinstance(step[-1], list)
-                    and _is_list_of_nums(step[-1])
-                ):
-                    vec_list = step[-1]
-                    break
+                    out["steps"].append(
+                        {
+                            "type": "np.ndarray",
+                            "dtype": str(step.dtype),
+                            "shape": [int(x) for x in step.shape],
+                        }
+                    )
+                elif isinstance(step, list):
+                    if len(step) == 0:
+                        out["steps"].append({"type": "list", "len": 0})
+                    else:
+                        last = step[-1]
+                        out["steps"].append(
+                            {
+                                "type": "list",
+                                "len": len(step),
+                                "last_type": type(last).__name__,
+                                "last_len": (len(last) if isinstance(last, list) else None),
+                            }
+                        )
+                else:
+                    out["steps"].append({"type": type(step).__name__})
+            if len(raw_hs) > max_steps:
+                out["truncated"] = True
+            return out
 
-            # Fall back to the last step when it's already a vector.
-            if vec_arr is None and vec_list is None:
-                last = raw_hs[-1]
-                if isinstance(last, np.ndarray):
-                    if last.ndim == 2 and last.shape[0] > 0:
-                        vec_arr = last[-1]
-                    elif last.ndim == 1 and last.shape[0] > 0:
-                        vec_arr = last
-                elif _is_list_of_nums(last):
-                    vec_list = last
-                elif (
-                    isinstance(last, list)
-                    and len(last) > 0
-                    and isinstance(last[-1], list)
-                    and _is_list_of_nums(last[-1])
-                ):
-                    vec_list = last[-1]
+        def _dump_hidden_states_debug(
+            *,
+            batch_index: int,
+            meta: dict[str, Any],
+            raw_hs: Any,
+            err: str | None,
+        ) -> None:
+            # One-shot per backend instance (avoid spamming logs on retries).
+            if getattr(self, "_hs_debug_dumped", False):
+                return
+            setattr(self, "_hs_debug_dumped", True)
 
-            if vec_arr is None and vec_list is None:
-                raise RuntimeError("Unsupported hidden_states schema (expected numeric vectors).")
+            payload = {
+                "where": "SGLangOfflineBackend.capture_residuals",
+                "batch_index": int(batch_index),
+                "error": err,
+                "meta_keys": sorted(list(meta.keys())),
+                "hidden_states_schema_version": meta.get("hidden_states_schema_version"),
+                "capture_layers_applied": meta.get("capture_layers_applied"),
+                "hidden_states_d_model": meta.get("hidden_states_d_model"),
+                "prompt_tokens": meta.get("prompt_tokens"),
+                "requested_capture_layers": [int(x) for x in capture_layers],
+                "hidden_states_summary": _summarize_hidden_states_steps(raw_hs),
+            }
 
-            if vec_arr is not None:
-                if vec_arr.ndim != 1:
-                    raise RuntimeError(f"Unexpected hidden_states vector ndim: {vec_arr.ndim}")
-                t1 = torch.from_numpy(vec_arr.astype(np.float32, copy=False))
-            else:
-                if len(vec_list) == 0:
-                    raise RuntimeError("hidden_states vector is empty.")
-                t1 = torch.tensor(vec_list, dtype=torch.float32)
-            if t1.ndim != 1:
-                raise RuntimeError(f"Unexpected hidden_states vector ndim: {t1.ndim}")
-
-            if len(capture_layers) <= 0:
-                return t1.view(1, -1)
-
-            if t1.numel() % len(capture_layers) != 0:
-                raise RuntimeError(
-                    f"Hidden-state feature dim {t1.numel()} is not divisible by requested layers {len(capture_layers)}."
-                )
-
-            d_model = t1.numel() // len(capture_layers)
-            return t1.view(len(capture_layers), d_model)
+            dump_path = os.environ.get("HERETIC_SGLANG_HIDDEN_STATES_DEBUG_PATH")
+            if dump_path:
+                try:
+                    with open(dump_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                except Exception as e:  # pragma: no cover
+                    logger.warning(
+                        "Failed writing hidden_states debug dump to %r: %s",
+                        dump_path,
+                        e,
+                    )
+            logger.warning("Hidden-states debug dump: %s", json.dumps(payload, ensure_ascii=False))
 
         obj = GenerateReqInput(
             input_ids=input_ids_batch,
@@ -440,12 +583,29 @@ class SGLangOfflineBackend(HereticBackend):
         gen = self._generate_req(obj)
 
         per_item: list[torch.Tensor] = []
-        for out in gen.outputs:
+        for i, out in enumerate(gen.outputs):
             meta = out.get("meta_info") or {}
             hs_steps = meta.get("hidden_states")
             if hs_steps is None:
                 raise RuntimeError("SGLang offline generate missing meta_info.hidden_states.")
-            per_item.append(_parse_hidden_states(hs_steps))
+            try:
+                per_item.append(
+                    _parse_hidden_states_last_prompt_token(
+                        hs_steps,
+                        meta=meta,
+                        capture_layers=capture_layers,
+                        batch_index=i,
+                    )
+                )
+            except Exception as e:
+                if _env_flag("HERETIC_SGLANG_HIDDEN_STATES_DEBUG"):
+                    _dump_hidden_states_debug(
+                        batch_index=i,
+                        meta=meta,
+                        raw_hs=hs_steps,
+                        err=str(e),
+                    )
+                raise
 
         t = torch.stack(per_item, dim=0)
         return ResidualCaptureResult(

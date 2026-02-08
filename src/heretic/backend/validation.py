@@ -359,16 +359,11 @@ def run_startup_validations(
 
     input_ids_batch = encode_prompts(sample)
     # Remote backends can have stricter per-request batch limits than Heretic's dataset slices.
-    # For startup validations we only need a small batch to validate endpoint contracts.
+    # Keep validations robust by only shrinking batches where it's sufficient to validate the contract.
     try:
         backend_name = backend.get_metadata().backend_name
     except Exception:
         backend_name = ""
-    if backend_name in ("sglang", "sglang_offline") and len(input_ids_batch) > 4:
-        notes.append(
-            f"startup validation: limiting SGLang batch from {len(input_ids_batch)} to 4 prompts"
-        )
-        input_ids_batch = input_ids_batch[:4]
 
     # If the caller didn't provide a synthetic adapter builder, try a best-effort fallback for
     # SGLang-style backends that expose module_map shapes.
@@ -444,14 +439,24 @@ def run_startup_validations(
 
     # 2) Residual mapping
     try:
+        residual_sample = sample
+        residual_input_ids_batch = input_ids_batch
+        if backend_name in ("sglang", "sglang_offline") and len(input_ids_batch) > 1:
+            # Hidden-states payloads can be large; residual mapping only needs to validate the shape/layout contract.
+            notes.append(
+                f"startup validation: limiting SGLang residual_mapping batch from {len(input_ids_batch)} to 1 prompt"
+            )
+            residual_sample = sample[:1]
+            residual_input_ids_batch = input_ids_batch[:1]
+
         baseline = None
         if baseline_residuals_fn is not None:
             # baseline is (batch, layers, d_model); select requested capture layers.
-            full = baseline_residuals_fn(sample)
+            full = baseline_residuals_fn(residual_sample)
             baseline = full[:, list(cfg.residual_capture_layers), :].contiguous()
         validate_residual_mapping(
             backend,
-            input_ids_batch=input_ids_batch,
+            input_ids_batch=residual_input_ids_batch,
             capture_layers=list(cfg.residual_capture_layers),
             baseline_residuals=baseline,
             rtol=cfg.residual_rtol,
@@ -460,6 +465,19 @@ def run_startup_validations(
     except Exception as e:
         residual_ok = False
         notes.append(f"residual_mapping failed: {e}")
+        # Extra context for debugging SGLang hidden-states schema issues.
+        # Enable one-shot dumps from the offline backend with:
+        #   HERETIC_SGLANG_HIDDEN_STATES_DEBUG=1
+        # Optionally persist dumps:
+        #   HERETIC_SGLANG_HIDDEN_STATES_DEBUG_PATH=/path/to/hs_dump.jsonl
+        try:
+            backend_name = backend.get_metadata().backend_name
+        except Exception:
+            backend_name = ""
+        if backend_name in ("sglang", "sglang_offline"):
+            notes.append(
+                "tip: set HERETIC_SGLANG_HIDDEN_STATES_DEBUG=1 to dump meta_info.hidden_states schema/shape on first failure"
+            )
 
     # 3) LoRA sanity
     try:

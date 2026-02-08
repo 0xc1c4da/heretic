@@ -4,7 +4,7 @@
 from enum import Enum
 from typing import Any, Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import (
     BaseSettings,
     CliSettingsSource,
@@ -33,6 +33,8 @@ class BackendType(str, Enum):
 
 
 class DatasetSpecification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
     )
@@ -68,6 +70,9 @@ class DatasetSpecification(BaseModel):
 
 
 class Settings(BaseSettings):
+    # Fail fast on typos / misplaced config keys (e.g. SGLang Engine args not under `sglang_offline_args`).
+    model_config = ConfigDict(extra="forbid")
+
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
     hf_revision: str | None = Field(
