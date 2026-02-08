@@ -174,6 +174,116 @@ class Model:
         else:
             raise ValueError(f"Unknown backend type: {backend_type}")
 
+        # Validate ablation target configuration early for SGLang backends.
+        # This avoids wasting hours of Optuna trials on an invalid configuration.
+        if backend_type in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
+            self._validate_sglang_ablation_targets()
+
+    def _validate_sglang_ablation_targets(self) -> None:
+        """Fail fast if requested ablation targets are incompatible with current method.
+
+        Current method: refusal directions live in residual space (hidden_size). The directional LoRA
+        updates we apply require `len(v) == out_features_global` of the target weight.
+
+        This validation is dimension-driven (architecture-agnostic): it inspects backend metadata and
+        module_map shapes rather than hardcoding projection names.
+        """
+        backend = self.backend
+
+        include_projs = getattr(self.settings, "sglang_abliterate_include_projs", None)
+        if include_projs is None:
+            include_projs = ["o_proj", "down_proj"]
+
+        def _normalize_proj(proj: str) -> str:
+            if proj in ("q_proj", "k_proj", "v_proj"):
+                return "qkv_proj"
+            if proj in ("gate_proj", "up_proj"):
+                return "gate_up_proj"
+            return proj
+
+        requested = [_normalize_proj(str(p)) for p in include_projs]
+        requested_set = set(requested)
+
+        # Get hidden_size from backend metadata when possible.
+        hidden_size = None
+        try:
+            meta = backend.get_metadata()
+            hs = getattr(meta, "hidden_size", None)
+            if isinstance(hs, int) and hs > 0:
+                hidden_size = int(hs)
+        except Exception:
+            hidden_size = None
+
+        # Probe module_map for layer 0 only; exclude experts to keep this light.
+        try:
+            descs = backend.module_map(
+                include_projs=list(requested_set),
+                include_layers=[0],
+                include_experts=[],
+                max_experts_per_layer=1,
+                expert_strategy="first",
+            )
+        except Exception as e:
+            raise ValueError(
+                "Failed to validate SGLang ablation targets via /heretic/module_map. "
+                "This likely indicates a backend connectivity or compatibility issue."
+            ) from e
+
+        # Fallback: infer hidden_size from any module with out_features that is clearly residual-sized.
+        if hidden_size is None:
+            for d in descs:
+                if not isinstance(d, dict):
+                    continue
+                out_f = d.get("out_features")
+                if isinstance(out_f, int) and out_f > 0:
+                    # This is a heuristic; if it fails, we fall back to requiring legacy config.
+                    hidden_size = int(out_f)
+                    break
+
+        if hidden_size is None:
+            raise ValueError(
+                "Cannot validate SGLang ablation targets because backend did not report hidden_size "
+                "and module_map did not provide out_features. "
+                "Set sglang_abliterate_include_projs=['o_proj','down_proj'] (legacy) and retry."
+            )
+
+        # Determine which requested targets are compatible by checking out_features.
+        out_by_proj: dict[str, set[int]] = {}
+        for d in descs:
+            if not isinstance(d, dict):
+                continue
+            proj = d.get("proj")
+            out_f = d.get("out_features")
+            if not isinstance(proj, str) or not isinstance(out_f, int):
+                continue
+            proj_n = _normalize_proj(proj)
+            out_by_proj.setdefault(proj_n, set()).add(int(out_f))
+
+        incompatible: list[str] = []
+        details: list[str] = []
+        for proj in sorted(requested_set):
+            outs = sorted(out_by_proj.get(proj, set()))
+            if not outs:
+                # If module_map didn't return anything for this proj, let downstream checks handle it.
+                continue
+            if any(o != hidden_size for o in outs):
+                incompatible.append(proj)
+                details.append(f"{proj}: out_features={outs} hidden_size={hidden_size}")
+
+        if incompatible:
+            raise ValueError(
+                "Invalid SGLang ablation target configuration for current refusal-direction method.\n"
+                "Rule: directional LoRA requires len(v)==out_features, but refusal directions are hidden_size vectors.\n"
+                f"Incompatible targets: {incompatible}\n"
+                "Details:\n"
+                + "\n".join(f"- {x}" for x in details)
+                + "\n\nFix your config:\n"
+                "- Set `sglang_abliterate_include_projs = ['o_proj','down_proj']`\n"
+                "- Set `[sglang_offline_args].lora_target_modules = ['o_proj','down_proj']`\n"
+                "If you want to ablate other projections, we need a different method that computes "
+                "directions in those projections' output spaces."
+            )
+
     def _apply_lora(self):
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PreTrainedModel)
@@ -410,13 +520,6 @@ class Model:
                     f"{unknown}. Supported={sorted(allowed)}"
                 )
 
-            unsupported_for_direction = sorted(norm.intersection({"qkv_proj", "gate_up_proj"}))
-            if unsupported_for_direction:
-                raise ValueError(
-                    "Unsupported ablation projections for current refusal-direction method: "
-                    f"{unsupported_for_direction}. Use ['o_proj','down_proj'] for now."
-                )
-
             out: list[str] = []
             # Stable order.
             if "qkv_proj" in norm:
@@ -514,28 +617,6 @@ class Model:
                 raise ValueError(
                     "Unsupported sglang_abliterate_include_projs entries for SGLang backends: "
                     f"{unknown}. Supported={sorted(allowed)}"
-                )
-
-            # IMPORTANT: With the current algorithm, refusal directions live in residual space
-            # (hidden_size). The LoRA update we apply requires a direction in the *output space*
-            # of the target linear weight, i.e. len(v) must equal out_features (global).
-            #
-            # For standard decoder blocks, only `o_proj` and `down_proj` have out_features == hidden_size.
-            # `qkv_proj` and `gate_up_proj` generally do not, so attempting to ablate them will error
-            # (or worse: produce NaNs/undefined behavior if the backend swallows the mismatch).
-            unsupported_for_direction = sorted(
-                set(target_modules).intersection({"qkv_proj", "gate_up_proj"})
-            )
-            if unsupported_for_direction:
-                raise ValueError(
-                    "Unsupported ablation projections for current refusal-direction method: "
-                    f"{unsupported_for_direction}.\n"
-                    "Reason: refusal directions are hidden_size vectors, but these projections have "
-                    "out_features != hidden_size, so FULL rownorm / directional LoRA cannot be constructed.\n"
-                    "Fix: set sglang_abliterate_include_projs=['o_proj','down_proj'] and "
-                    "[sglang_offline_args].lora_target_modules=['o_proj','down_proj'].\n"
-                    "If you want to ablate qkv_proj/gate_up_proj, we need a new method that computes "
-                    "directions in those projections' output spaces."
                 )
 
             # Fail fast on configuration mismatches that would silently drop targets.
@@ -736,6 +817,23 @@ class Model:
                     module_base = p[: -len(".weight")] if p.endswith(".weight") else p
                     exported_target_modules.add(module_base.split(".")[-1])
 
+                    # Provide a clear, local error before calling into backend primitives.
+                    info = info_by_path.get(p)
+                    if info is not None and isinstance(info.get("out_features"), int):
+                        out_f = int(info["out_features"])
+                        v_len = int(v_vec.numel())
+                        if out_f > 0 and v_len != out_f:
+                            raise RuntimeError(
+                                "Refusal-direction dimension mismatch for LoRA export.\n"
+                                f"- module_path={p}\n"
+                                f"- out_features={out_f}\n"
+                                f"- len(v)={v_len}\n"
+                                "This target weight does not live in residual (hidden_size) output space, "
+                                "so the current method cannot construct a directional/FULL rownorm LoRA for it.\n"
+                                "Fix: restrict `sglang_abliterate_include_projs` to projections with out_features==hidden_size "
+                                "(typically ['o_proj','down_proj'])."
+                            )
+
                     if self.settings.row_normalization == RowNormalization.FULL:
                         A, B = backend.build_full_rownorm_lora(
                             name=p,
@@ -753,7 +851,6 @@ class Model:
 
                     # Preflight: ensure exported shapes match backend logical dims when provided.
                     # The backend's module_map is the source of truth for (out_features, in_features).
-                    info = info_by_path.get(p)
                     if info is not None:
                         exp_in = info.get("in_features")
                         exp_out = info.get("out_features")
