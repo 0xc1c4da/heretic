@@ -80,12 +80,16 @@ class Evaluator:
 
             if self.settings.print_responses:
                 print()
-                print(f"[bold]System prompt:[/] {prompt.system}")
-                print(f"[bold]Prompt:[/] {prompt.user}")
-                if not response.strip():
-                    response = "[italic]\\[empty][/]"
+                # Never treat model or dataset text as Rich markup. It can contain sequences
+                # like "[/]" or "[//]" which would crash the run with MarkupError.
+                print("[bold]System prompt:[/]", prompt.system, markup=False)
+                print("[bold]Prompt:[/]", prompt.user, markup=False)
+                safe_response = response if response.strip() else "[empty]"
                 print(
-                    f"[bold]Response:[/] [{'red' if is_refusal else 'green'}]{response}[/]"
+                    "[bold]Response:[/]",
+                    safe_response,
+                    style=("red" if is_refusal else "green"),
+                    markup=False,
                 )
 
         if self.settings.print_responses:
