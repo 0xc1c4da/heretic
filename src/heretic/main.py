@@ -45,6 +45,13 @@ from .config import BackendType, QuantizationMethod, Settings
 from .backend.validation import run_startup_validations
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
+from .refusal_cache import (
+    compute_identity as compute_refusal_cache_identity,
+    get_cache_dir as get_refusal_cache_dir,
+    identity_hash as refusal_cache_identity_hash,
+    probe_refusal_cache,
+    save_refusal_directions,
+)
 from .utils import (
     empty_cache,
     format_duration,
@@ -442,38 +449,84 @@ def run():
 
     print()
     print("Calculating per-layer refusal directions...")
-    print("* Obtaining residuals for good prompts...")
-    good_residuals = model.get_residuals_batched(good_prompts)
-    print("* Obtaining residuals for bad prompts...")
-    bad_residuals = model.get_residuals_batched(bad_prompts)
+    refusal_directions = None
+    cache_identity = None
+    cache_dir = None
 
-    good_means = good_residuals.mean(dim=0)
-    bad_means = bad_residuals.mean(dim=0)
+    if getattr(settings, "refusal_cache", True):
+        try:
+            cache_identity = compute_refusal_cache_identity(
+                settings=settings,
+                model=model,
+                good_prompts=good_prompts,
+                bad_prompts=bad_prompts,
+            )
+            cache_dir = get_refusal_cache_dir(settings)
 
-    refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+            if settings.print_residual_geometry or settings.plot_residuals:
+                print(
+                    "* Refusal cache: skipping load (residual diagnostics requested)."
+                )
+            else:
+                cached, reason = probe_refusal_cache(cache_dir, cache_identity)
+                if cached is not None:
+                    refusal_directions = cached
+                    print(
+                        f"* Refusal cache: [green]hit[/] ({refusal_cache_identity_hash(cache_identity)[:12]})"
+                    )
+                else:
+                    print(f"* Refusal cache: [yellow]miss[/] ({reason}; computing residuals)")
+        except Exception as e:
+            # Never let cache machinery break a run.
+            print(f"[yellow]Refusal cache disabled (identity error: {e})[/]")
+            cache_identity = None
+            cache_dir = None
 
-    if settings.orthogonalize_direction:
-        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the refusal directions so that only the component that is
-        # orthogonal to the good direction is subtracted during abliteration.
-        good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
-        refusal_directions = (
-            refusal_directions - projection_vector.unsqueeze(1) * good_directions
-        )
-        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+    if refusal_directions is None:
+        print("* Obtaining residuals for good prompts...")
+        good_residuals = model.get_residuals_batched(good_prompts)
+        print("* Obtaining residuals for bad prompts...")
+        bad_residuals = model.get_residuals_batched(bad_prompts)
 
-    analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
+        good_means = good_residuals.mean(dim=0)
+        bad_means = bad_residuals.mean(dim=0)
 
-    if settings.print_residual_geometry:
-        analyzer.print_residual_geometry()
+        refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
 
-    if settings.plot_residuals:
-        analyzer.plot_residuals()
+        if settings.orthogonalize_direction:
+            # Implements https://huggingface.co/blog/grimjim/projected-abliteration
+            # Adjust the refusal directions so that only the component that is
+            # orthogonal to the good direction is subtracted during abliteration.
+            good_directions = F.normalize(good_means, p=2, dim=1)
+            projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
+            refusal_directions = (
+                refusal_directions - projection_vector.unsqueeze(1) * good_directions
+            )
+            refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
 
-    # We don't need the residuals after computing refusal directions.
-    del good_residuals, bad_residuals, analyzer
-    empty_cache()
+        analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
+
+        if settings.print_residual_geometry:
+            analyzer.print_residual_geometry()
+
+        if settings.plot_residuals:
+            analyzer.plot_residuals()
+
+        # We don't need the residuals after computing refusal directions.
+        del good_residuals, bad_residuals, analyzer
+        empty_cache()
+
+        # Best-effort cache write.
+        if getattr(settings, "refusal_cache", True) and cache_identity is not None and cache_dir is not None:
+            try:
+                save_refusal_directions(cache_dir, cache_identity, refusal_directions)
+                print(
+                    f"* Refusal cache: saved ({refusal_cache_identity_hash(cache_identity)[:12]})"
+                )
+            except Exception as e:
+                print(f"[yellow]Refusal cache save failed: {e}[/]")
+
+    assert refusal_directions is not None
 
     trial_index = 0
     start_index = 0

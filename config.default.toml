@@ -135,6 +135,15 @@ system_prompt = "You are a helpful assistant."
 # (Can also be enabled via HERETIC_VALIDATE_BACKEND=1.)
 validate_backend = false
 
+# Cache computed per-layer refusal directions to disk (recommended).
+# This makes repeated runs with the same model/prompts much faster by skipping
+# the expensive residual capture step.
+refusal_cache = true
+
+# Directory to store refusal-direction cache files.
+# Default: `${study_checkpoint_dir}/refusal_cache`
+# refusal_cache_dir = "checkpoints/refusal_cache"
+
 # Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).
 [good_prompts]
 dataset = "mlabonne/harmless_alpaca"

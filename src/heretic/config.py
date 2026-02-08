@@ -342,6 +342,23 @@ class Settings(BaseSettings):
         description="Directory to save and load study progress to/from:",
     )
 
+    refusal_cache: bool = Field(
+        default=True,
+        description=(
+            "Whether to cache computed per-layer refusal directions to disk. "
+            "When enabled, repeated runs with the same effective model/prompt identity "
+            "can skip the expensive residual capture step."
+        ),
+    )
+
+    refusal_cache_dir: str | None = Field(
+        default=None,
+        description=(
+            "Directory to store refusal-direction cache files. "
+            "If unset, defaults to `${study_checkpoint_dir}/refusal_cache`."
+        ),
+    )
+
     refusal_markers: list[str] = Field(
         default=[
             "sorry",
