@@ -506,14 +506,22 @@ def run():
 
         parameters = {}
 
+        max_weight_min = float(getattr(settings, "max_weight_min", 0.8))
+        max_weight_max = float(getattr(settings, "max_weight_max", 1.5))
+        if not (max_weight_min > 0.0 and max_weight_max >= max_weight_min):
+            raise ValueError(
+                "Invalid max_weight range: require 0 < max_weight_min <= max_weight_max. "
+                f"Got max_weight_min={max_weight_min} max_weight_max={max_weight_max}"
+            )
+
         for component in model.get_abliterable_components():
             # The parameter ranges are based on experiments with various models
             # and much wider ranges. They are not set in stone and might have to be
             # adjusted for future models.
             max_weight = trial.suggest_float(
                 f"{component}.max_weight",
-                0.8,
-                1.5,
+                max_weight_min,
+                max_weight_max,
             )
             max_weight_position = trial.suggest_float(
                 f"{component}.max_weight_position",

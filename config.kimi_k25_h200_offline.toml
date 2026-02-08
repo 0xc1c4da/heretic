@@ -71,6 +71,11 @@ kl_divergence_scale = 1.0
 kl_divergence_target = 0.01
 winsorization_quantile = 0.995
 
+# Range for max_weight parameter during optimization.
+# Higher max values (e.g., 4.0) may be beneficial with row_normalization="full".
+max_weight_min = 0.8
+max_weight_max = 4.0
+
 # Optimization budget
 n_trials = 800
 n_startup_trials = 150

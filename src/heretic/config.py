@@ -325,6 +325,20 @@ class Settings(BaseSettings):
         ),
     )
 
+    max_weight_min: float = Field(
+        default=0.8,
+        description=(
+            "Lower bound for the Optuna search range of the per-component `max_weight` parameter."
+        ),
+    )
+
+    max_weight_max: float = Field(
+        default=1.5,
+        description=(
+            "Upper bound for the Optuna search range of the per-component `max_weight` parameter."
+        ),
+    )
+
     n_trials: int = Field(
         default=200,
         description="Number of abliteration trials to run during optimization.",
