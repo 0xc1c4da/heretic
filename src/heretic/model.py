@@ -484,10 +484,17 @@ class Model:
                 )
 
             # Fetch canonical module paths from backend and group by component + layer.
+            include_experts = (
+                None if bool(getattr(self.settings, "sglang_abliterate_include_experts", False)) else []
+            )
+            max_experts_per_layer = getattr(self.settings, "sglang_abliterate_max_experts_per_layer", None)
+            expert_strategy = str(getattr(self.settings, "sglang_abliterate_expert_strategy", "first") or "first")
             module_descs = backend.module_map(
                 include_projs=["o_proj", "down_proj"],
                 # Default: exclude MoE experts to keep adapter sizes tractable.
-                include_experts=[],
+                include_experts=include_experts,
+                max_experts_per_layer=max_experts_per_layer,
+                expert_strategy=expert_strategy,
             )
             info_by_path: dict[str, dict[str, Any]] = {}
             if isinstance(module_descs, list):

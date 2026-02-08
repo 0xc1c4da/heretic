@@ -131,6 +131,31 @@ class Settings(BaseSettings):
         ),
     )
 
+    sglang_abliterate_include_experts: bool = Field(
+        default=False,
+        description=(
+            "When using backend='sglang' or 'sglang_offline', whether to include MoE expert weights "
+            "in the LoRA ablation export. Defaults to false to keep adapter sizes tractable, but MoE "
+            "models may require this for strong refusal reduction."
+        ),
+    )
+
+    sglang_abliterate_max_experts_per_layer: int | None = Field(
+        default=None,
+        description=(
+            "When including experts for SGLang ablation export, optionally cap the number of experts "
+            "included per (layer, proj) group. If unset, includes all experts."
+        ),
+    )
+
+    sglang_abliterate_expert_strategy: str = Field(
+        default="first",
+        description=(
+            "Strategy used when sglang_abliterate_max_experts_per_layer is set. "
+            "Valid values (SGLang): 'first' or 'all'."
+        ),
+    )
+
     sglang_hidden_states_dump_path: str | None = Field(
         default=None,
         description=(
