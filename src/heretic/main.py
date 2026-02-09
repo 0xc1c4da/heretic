@@ -647,7 +647,7 @@ def run():
                 )
                 adapter_loaded = True
                 print("* Evaluating...")
-                score, kl_divergence, refusals = evaluator.get_score(
+                score, damage, refusals = evaluator.get_score(
                     adapter=adapter_id,
                 )
             finally:
@@ -661,7 +661,7 @@ def run():
                         )
         if backend_type == BackendType.LOCAL:
             print("* Evaluating...")
-            score, kl_divergence, refusals = evaluator.get_score(
+            score, damage, refusals = evaluator.get_score(
                 adapter=None,
             )
 
@@ -677,7 +677,7 @@ def run():
             )
         print_memory_usage()
 
-        trial.set_user_attr("kl_divergence", kl_divergence)
+        trial.set_user_attr("damage", damage)
         trial.set_user_attr("refusals", refusals)
 
         return score
@@ -797,10 +797,10 @@ def run():
                 continue
             try:
                 r = t.user_attrs.get("refusals")
-                k = t.user_attrs.get("kl_divergence")
-                if not isinstance(r, (int, float)) or not isinstance(k, (int, float)):
+                d = t.user_attrs.get("damage")
+                if not isinstance(r, (int, float)) or not isinstance(d, (int, float)):
                     continue
-                if not math.isfinite(float(k)):
+                if not math.isfinite(float(d)):
                     continue
                 completed_trials.append(t)
             except Exception:
@@ -815,15 +815,15 @@ def run():
             completed_trials,
             key=lambda trial: (
                 trial.user_attrs["refusals"],
-                trial.user_attrs["kl_divergence"],
+                trial.user_attrs["damage"],
             ),
         )
-        min_divergence = math.inf
+        min_damage = math.inf
         best_trials = []
         for trial in sorted_trials:
-            kl_divergence = trial.user_attrs["kl_divergence"]
-            if kl_divergence < min_divergence:
-                min_divergence = kl_divergence
+            damage = trial.user_attrs["damage"]
+            if damage < min_damage:
+                min_damage = damage
                 best_trials.append(trial)
 
         choices = [
@@ -831,7 +831,7 @@ def run():
                 title=(
                     f"[Trial {trial.user_attrs['index']:>3}] "
                     f"Refusals: {trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
-                    f"KL divergence: {trial.user_attrs['kl_divergence']:.4f}"
+                    f"Damage: {trial.user_attrs['damage']:.4f}"
                 ),
                 value=trial,
             )
@@ -858,19 +858,19 @@ def run():
         if settings.backend == BackendType.LOCAL:
             print(
                 (
-                    "The following trials resulted in Pareto optimal combinations of refusals and KL divergence. "
+                    "The following trials resulted in Pareto optimal combinations of refusals and damage. "
                     "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
                     "or chat with it to test how well it works. You can return to this menu later to select a different trial. "
-                    "[yellow]Note that KL divergence values above 1 usually indicate significant damage to the original model's capabilities.[/]"
+                    "[yellow]Note that damage values above 1 usually indicate significant damage to the original model's capabilities.[/]"
                 )
             )
         else:
             print(
                 (
-                    "The following trials resulted in Pareto optimal combinations of refusals and KL divergence. "
+                    "The following trials resulted in Pareto optimal combinations of refusals and damage. "
                     "After selecting a trial, you will be able to save the LoRA adapter and chat with the model via the backend. "
                     "You can return to this menu later to select a different trial. "
-                    "[yellow]Note that KL divergence values above 1 usually indicate significant damage to the original model's capabilities.[/]"
+                    "[yellow]Note that damage values above 1 usually indicate significant damage to the original model's capabilities.[/]"
                 )
             )
 

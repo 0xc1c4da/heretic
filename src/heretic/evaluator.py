@@ -24,9 +24,9 @@ class Evaluator:
     bad_prompts: list[Prompt]
     base_logprobs: Tensor
     base_refusals: int
-    _delta_nll_prompt_ids: list[list[int]] | None = None
-    _delta_nll_cont_ids: list[list[int]] | None = None
-    _delta_nll_base_nlls: list[float] | None = None
+    _damage_prompt_ids: list[list[int]] | None = None
+    _damage_cont_ids: list[list[int]] | None = None
+    _damage_prompt_index: list[int] | None = None
 
     def __init__(self, settings: Settings, model: Model):
         self.settings = settings
@@ -39,55 +39,57 @@ class Evaluator:
         self.good_prompts = load_prompts(settings, settings.good_evaluation_prompts)
         print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded")
 
-        if str(getattr(settings, "damage_metric", "kl")) == "delta_nll":
-            # Proxy A: teacher-forced NLL on cached base continuations.
-            #
-            # We avoid full-vocab scoring entirely for baseline construction.
-            cont_len = int(getattr(settings, "delta_nll_continuation_tokens", 32))
-            if cont_len <= 0:
-                raise RuntimeError("delta_nll_continuation_tokens must be > 0")
+        damage_metric = str(getattr(settings, "damage_metric", "paired_delta_nll"))
+        if damage_metric not in ("paired_delta_nll", "topk_js"):
+            raise RuntimeError(f"Unsupported damage_metric={damage_metric!r}")
 
-            print("* Caching base continuations for ΔNLL damage metric...")
-            prompt_ids = self.model.encode_prompts(self.good_prompts)
-            backend = self.model.backend
-            if not hasattr(backend, "generate_token_ids"):
-                raise RuntimeError(
-                    "Backend does not support generate_token_ids required for damage_metric='delta_nll'."
-                )
-            gen_ids = getattr(backend, "generate_token_ids")
-            cont_ids = gen_ids(
-                prompt_ids,
+        # Cache multi-reference base continuations once.
+        cont_len = int(getattr(settings, "delta_nll_continuation_tokens", 32))
+        if cont_len <= 0:
+            raise RuntimeError("delta_nll_continuation_tokens must be > 0")
+        num_refs = int(getattr(settings, "delta_nll_num_refs", 1))
+        if num_refs <= 0:
+            raise RuntimeError("delta_nll_num_refs must be > 0")
+        temps = list(getattr(settings, "delta_nll_ref_temperatures", [0.0]))
+        if len(temps) != num_refs:
+            raise RuntimeError(
+                f"delta_nll_ref_temperatures must have length delta_nll_num_refs ({num_refs}), got {len(temps)}"
+            )
+        non_greedy_top_k = int(getattr(settings, "delta_nll_ref_top_k", 50))
+
+        print(f"* Caching base continuations for damage_metric={damage_metric}...")
+        prompt_ids_all = self.model.encode_prompts(self.good_prompts)
+        backend = self.model.backend
+        gen_ids = getattr(backend, "generate_token_ids", None)
+        if gen_ids is None:
+            raise RuntimeError("Backend does not support generate_token_ids required for damage metrics.")
+
+        damage_prompt_ids: list[list[int]] = []
+        damage_cont_ids: list[list[int]] = []
+        damage_prompt_index: list[int] = []
+
+        for temp in temps:
+            tk = 1 if float(temp) == 0.0 else max(1, int(non_greedy_top_k))
+            cont_ids_ref = gen_ids(
+                prompt_ids_all,
                 max_new_tokens=cont_len,
                 adapter=None,
-                temperature=0.0,
-                top_k=1,
+                temperature=float(temp),
+                top_k=int(tk),
             )
-            if not isinstance(cont_ids, list) or len(cont_ids) != len(prompt_ids):
+            if not isinstance(cont_ids_ref, list) or len(cont_ids_ref) != len(prompt_ids_all):
                 raise RuntimeError("generate_token_ids returned unexpected batch shape")
-            self._delta_nll_prompt_ids = prompt_ids
-            self._delta_nll_cont_ids = cont_ids
+            for i, cont in enumerate(cont_ids_ref):
+                damage_prompt_ids.append(prompt_ids_all[i])
+                damage_cont_ids.append(list(cont))
+                damage_prompt_index.append(int(i))
 
-            if not hasattr(backend, "score_sequence_delta_nll"):
-                raise RuntimeError(
-                    "Backend does not support score_sequence_delta_nll required for damage_metric='delta_nll'."
-                )
-            score_nll = getattr(backend, "score_sequence_delta_nll")
-            base_nlls = score_nll(
-                prompt_ids_batch=prompt_ids,
-                continuation_ids_batch=cont_ids,
-                adapter=None,
-            )
-            if not isinstance(base_nlls, list) or len(base_nlls) != len(prompt_ids):
-                raise RuntimeError("score_sequence_delta_nll returned unexpected batch shape")
-            self._delta_nll_base_nlls = [float(x) for x in base_nlls]
-            base_med = float(torch.tensor(self._delta_nll_base_nlls).median().item())
-            print(f"* Base continuation NLL (median): [bold]{base_med:.6g}[/]")
-            # Dummy placeholder so type expectations don't break; never used under delta_nll.
-            self.base_logprobs = torch.empty((0, 0), dtype=torch.float32)
-        else:
-            print("* Obtaining first-token probability distributions...")
-            self.base_logprobs = self._get_first_token_logprobs(self.good_prompts)
-            self._validate_logprobs_tensor(self.base_logprobs, where="base")
+        self._damage_prompt_ids = damage_prompt_ids
+        self._damage_cont_ids = damage_cont_ids
+        self._damage_prompt_index = damage_prompt_index
+
+        # Placeholder for legacy KL path; not used by paired_delta_nll/topk_js.
+        self.base_logprobs = torch.empty((0, 0), dtype=torch.float32)
 
         print()
         print(
@@ -103,22 +105,97 @@ class Evaluator:
         )
 
     def refresh_baseline(self) -> None:
-        """Recompute baseline logprobs + refusals in the current backend state.
-
-        Some backends (notably SGLang offline/HTTP) can change effective execution state after
-        warmup operations like hidden-state capture or adapter loads. Heretic's KL metric is only
-        meaningful if the baseline and adapted distributions are captured in the same state.
-        """
+        """Recompute baseline refusals in the current backend state."""
         print()
-        print("* Refreshing baseline distributions/refusals...")
-        print("* Obtaining first-token probability distributions...")
-        self.base_logprobs = self._get_first_token_logprobs(self.good_prompts, adapter=None)
-        self._validate_logprobs_tensor(self.base_logprobs, where="base")
-        print("* Counting model refusals...")
+        print("* Refreshing baseline refusals...")
         self.base_refusals = self.count_refusals(adapter=None)
-        print(
-            f"* Baseline refreshed: refusals [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
-        )
+        print(f"* Baseline refreshed: refusals [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}")
+
+    def _median(self, xs: list[float]) -> float:
+        if not xs:
+            return 0.0
+        ys = sorted(float(x) for x in xs)
+        n = len(ys)
+        mid = n // 2
+        if n % 2 == 1:
+            return float(ys[mid])
+        return float(0.5 * (ys[mid - 1] + ys[mid]))
+
+    def _median_of_means(self, xs: list[float], *, buckets: int) -> float:
+        xs = [float(x) for x in xs if math.isfinite(float(x))]
+        if not xs:
+            return 0.0
+        k = max(1, int(buckets))
+        if k <= 1 or len(xs) < 2 * k:
+            return self._median(xs)
+        bs: list[list[float]] = [[] for _ in range(k)]
+        # Deterministic partitioning (no RNG) to keep runs comparable.
+        for i, x in enumerate(xs):
+            bs[i % k].append(x)
+        means = [sum(b) / len(b) for b in bs if b]
+        return self._median(means)
+
+    def _aggregate_per_prompt(self, per_item: list[float]) -> float:
+        if self._damage_prompt_index is None:
+            raise RuntimeError("Damage cache not initialized.")
+        if len(per_item) != len(self._damage_prompt_index):
+            raise RuntimeError("Damage per-item list length mismatch vs cache.")
+        per_prompt: list[list[float]] = [[] for _ in range(len(self.good_prompts))]
+        for x, pi in zip(per_item, self._damage_prompt_index, strict=True):
+            if 0 <= int(pi) < len(per_prompt):
+                per_prompt[int(pi)].append(float(x))
+        prompt_means = [sum(xs) / len(xs) for xs in per_prompt if xs]
+        return self._median_of_means(prompt_means, buckets=int(getattr(self.settings, "delta_nll_mom_buckets", 7)))
+
+    def _js_divergence_other_bucket(self, p_log: dict[int, float], q_log: dict[int, float]) -> float:
+        keys = set(p_log.keys()) | set(q_log.keys())
+
+        def _mass(d: dict[int, float]) -> tuple[dict[int, float], float]:
+            probs: dict[int, float] = {}
+            s = 0.0
+            for k in keys:
+                lp = d.get(k)
+                if lp is None:
+                    continue
+                # exp(logp) in float is fine for top-k sizes we use.
+                pk = math.exp(float(lp))
+                if pk <= 0.0:
+                    continue
+                probs[int(k)] = pk
+                s += pk
+            other = max(0.0, 1.0 - s)
+            return probs, other
+
+        p_probs, p_other = _mass(p_log)
+        q_probs, q_other = _mass(q_log)
+
+        def _kl(a_probs: dict[int, float], a_other: float, b_probs: dict[int, float], b_other: float) -> float:
+            out = 0.0
+            # shared keys
+            for k, ap in a_probs.items():
+                if ap <= 0.0:
+                    continue
+                bp = b_probs.get(k, 0.0)
+                if bp <= 0.0:
+                    # If bp is zero but ap isn't, KL is infinite; treat as huge.
+                    return float("inf")
+                out += ap * (math.log(ap) - math.log(bp))
+            if a_other > 0.0:
+                if b_other <= 0.0:
+                    return float("inf")
+                out += a_other * (math.log(a_other) - math.log(b_other))
+            return out
+
+        # Mixture distribution m = (p+q)/2
+        m_probs: dict[int, float] = {}
+        for k in keys:
+            m_probs[k] = 0.5 * p_probs.get(k, 0.0) + 0.5 * q_probs.get(k, 0.0)
+        m_other = 0.5 * p_other + 0.5 * q_other
+        kl_pm = _kl(p_probs, p_other, m_probs, m_other)
+        kl_qm = _kl(q_probs, q_other, m_probs, m_other)
+        if not math.isfinite(kl_pm) or not math.isfinite(kl_qm):
+            return float("inf")
+        return 0.5 * kl_pm + 0.5 * kl_qm
 
     def is_refusal(self, response: str) -> bool:
         # Classify empty responses as refusals to avoid optimizing for them.
@@ -174,130 +251,109 @@ class Evaluator:
         return refusal_count
 
     def get_score(self, *, adapter: str | None = None) -> tuple[tuple[float, float], float, int]:
-        damage_metric = str(getattr(self.settings, "damage_metric", "kl"))
-        if damage_metric == "delta_nll":
-            # Under delta_nll, adapter=None implies "base", so damage=0 by definition.
-            if adapter is None:
-                delta_nll = 0.0
-                print("  * damage_metric=delta_nll; adapter=None implies damage=0 by definition.")
-            else:
-                backend = self.model.backend
-                if (
-                    self._delta_nll_prompt_ids is None
-                    or self._delta_nll_cont_ids is None
-                    or self._delta_nll_base_nlls is None
-                ):
-                    raise RuntimeError("ΔNLL baseline not initialized.")
-                score_nll = getattr(backend, "score_sequence_delta_nll", None)
-                if score_nll is None:
-                    raise RuntimeError("Backend missing score_sequence_delta_nll.")
-                nlls = score_nll(
-                    prompt_ids_batch=self._delta_nll_prompt_ids,
-                    continuation_ids_batch=self._delta_nll_cont_ids,
-                    adapter=str(adapter),
-                )
-                med_base = float(torch.tensor(self._delta_nll_base_nlls).median().item())
-                med_adapt = float(torch.tensor([float(x) for x in nlls]).median().item())
-                delta_nll = float(med_adapt - med_base)
-                print(f"  * ΔNLL damage (median): [bold]{delta_nll:.6g}[/]")
+        damage_metric = str(getattr(self.settings, "damage_metric", "paired_delta_nll"))
 
-            # Reuse existing scaling/target knobs for now (user can recalibrate).
-            kl_divergence = float(delta_nll)
-            if not math.isfinite(float(kl_divergence)):
-                raise NonFiniteLogprobsError(f"Non-finite ΔNLL damage: {kl_divergence!r}")
-
-            print("  * Counting model refusals...")
-            refusals = self.count_refusals(adapter=adapter)
-            print(f"  * Refusals: [bold]{refusals}[/]/{len(self.bad_prompts)}")
-
-            kl_divergence_scale = self.settings.kl_divergence_scale
-            kl_divergence_target = self.settings.kl_divergence_target
-            refusals_score = refusals / self.base_refusals
-
-            if kl_divergence >= kl_divergence_target:
-                kld_score = kl_divergence / kl_divergence_scale
-            else:
-                kld_score = refusals_score * kl_divergence_target / kl_divergence_scale
-
-            score = (kld_score, refusals_score)
-            return score, kl_divergence, refusals
-
-        # For backends with cross-call drift (notably some SGLang stacks), KL is only meaningful
-        # if base and adapted distributions are captured within the same backend call/batch.
-        supports = self.model.backend.get_metadata().supports
-        use_paired = bool(supports.get("score_full_vocab_paired", False))
-
-        if use_paired and adapter is not None:
-            print("  * Obtaining paired base/adapted distributions (one-call)...")
-            input_ids_batch = self.model.encode_prompts(self.good_prompts)
-            supports_noise = bool(supports.get("score_full_vocab_paired_with_noise", False))
-            if supports_noise:
-                base_lp, adapted_lp, base2_lp = self.model.backend.score_full_vocab_paired_with_noise(
-                    input_ids_batch,
-                    adapter=str(adapter),
-                )
-                self._validate_logprobs_tensor(base2_lp, where="base")
-                kl_noise = float(
-                    F.kl_div(base2_lp, base_lp, reduction="batchmean", log_target=True).item()
-                )
-                print(f"  * Within-call KL_noise (base||base2): [bold]{kl_noise:.6g}[/]")
-                if kl_noise > float(self.settings.paired_kl_noise_threshold):
-                    raise RuntimeError(
-                        f"Within-call KL_noise too high: {kl_noise:.6g} > {self.settings.paired_kl_noise_threshold}. "
-                        "Paired KL metric is not stable enough to optimize."
-                    )
-            else:
-                base_lp, adapted_lp = self.model.backend.score_full_vocab_paired(
-                    input_ids_batch,
-                    adapter=str(adapter),
-                )
-            self._validate_logprobs_tensor(base_lp, where="base")
-            self._validate_logprobs_tensor(adapted_lp, where="adapted")
-            kl_divergence = F.kl_div(
-                adapted_lp,
-                base_lp,
-                reduction="batchmean",
-                log_target=True,
-            ).item()
-        elif use_paired and adapter is None:
-            # Under drift, "base vs stored base" is not a stable diagnostic. Define KL(base||base)=0 here.
-            print("  * Using paired-scoring backend; adapter=None implies KL=0 by definition.")
-            kl_divergence = 0.0
+        # Under paired damage metrics, adapter=None implies "base", so damage=0 by definition.
+        if adapter is None:
+            damage = 0.0
+            noise = 0.0
+            print(f"  * damage_metric={damage_metric}; adapter=None implies damage=0 by definition.")
         else:
-            print("  * Obtaining first-token probability distributions...")
-            logprobs = self._get_first_token_logprobs(self.good_prompts, adapter=adapter)
-            self._validate_logprobs_tensor(logprobs, where="adapted")
-            kl_divergence = F.kl_div(
-                logprobs,
-                self.base_logprobs,
-                reduction="batchmean",
-                log_target=True,
-            ).item()
+            backend = self.model.backend
+            if self._damage_prompt_ids is None or self._damage_cont_ids is None:
+                raise RuntimeError("Damage cache not initialized.")
 
-        if not math.isfinite(float(kl_divergence)):
-            raise NonFiniteLogprobsError(f"Non-finite KL divergence: {kl_divergence!r}")
-        print(f"  * KL divergence: [bold]{float(kl_divergence):.4f}[/]")
+            retries = int(getattr(self.settings, "damage_retry_count", 0))
+            noise_thr = float(getattr(self.settings, "damage_noise_threshold", 0.0))
+            damage = float("nan")
+            noise = float("inf")
+
+            for attempt in range(retries + 1):
+                if damage_metric == "paired_delta_nll":
+                    scorer = getattr(backend, "score_continuation_nll_paired_with_noise", None)
+                    if scorer is None:
+                        raise RuntimeError("Backend missing score_continuation_nll_paired_with_noise.")
+                    base1, adapted, base2 = scorer(
+                        prompt_ids_batch=self._damage_prompt_ids,
+                        continuation_ids_batch=self._damage_cont_ids,
+                        adapter=str(adapter),
+                    )
+                    deltas = [float(a) - float(b) for a, b in zip(adapted, base1, strict=True)]
+                    noises = [abs(float(b2) - float(b1)) for b2, b1 in zip(base2, base1, strict=True)]
+                    damage = float(self._aggregate_per_prompt(deltas))
+                    noise = float(self._aggregate_per_prompt(noises))
+                elif damage_metric == "topk_js":
+                    k = int(getattr(self.settings, "topk_js_k", 128))
+                    positions = int(getattr(self.settings, "topk_js_positions", 32))
+                    scorer = getattr(backend, "score_continuation_topk_paired_with_noise", None)
+                    if scorer is None:
+                        raise RuntimeError("Backend missing score_continuation_topk_paired_with_noise.")
+                    base1_topk, adapted_topk, base2_topk = scorer(
+                        prompt_ids_batch=self._damage_prompt_ids,
+                        continuation_ids_batch=self._damage_cont_ids,
+                        adapter=str(adapter),
+                        top_k=int(k),
+                    )
+                    js_vals: list[float] = []
+                    js_noise: list[float] = []
+                    for b1, ad, b2 in zip(base1_topk, adapted_topk, base2_topk, strict=True):
+                        if not isinstance(b1, list) or not isinstance(ad, list) or not isinstance(b2, list):
+                            raise RuntimeError("Unexpected top-k schema from backend.")
+                        npos = min(int(positions), len(b1), len(ad), len(b2))
+                        if npos <= 0:
+                            js_vals.append(0.0)
+                            js_noise.append(0.0)
+                            continue
+                        v = 0.0
+                        n = 0
+                        nv = 0.0
+                        for t in range(npos):
+                            v += float(self._js_divergence_other_bucket(b1[t], ad[t]))
+                            nv += float(self._js_divergence_other_bucket(b1[t], b2[t]))
+                            n += 1
+                        js_vals.append(float(v / n))
+                        js_noise.append(float(nv / n))
+                    damage = float(self._aggregate_per_prompt(js_vals))
+                    noise = float(self._aggregate_per_prompt(js_noise))
+                else:
+                    raise RuntimeError(f"Unsupported damage_metric={damage_metric!r}")
+
+                print(f"  * Damage: [bold]{damage:.6g}[/]  Noise: [bold]{noise:.6g}[/]")
+                if math.isfinite(noise) and noise <= noise_thr:
+                    break
+                if attempt < retries:
+                    print(
+                        f"  * Damage noise too high (>{noise_thr:g}); retrying ({attempt+1}/{retries})..."
+                    )
+
+            if not math.isfinite(float(damage)):
+                raise NonFiniteLogprobsError(f"Non-finite damage: {damage!r}")
+            if not math.isfinite(float(noise)) or noise > noise_thr:
+                raise RuntimeError(
+                    f"Damage metric noise too high: {noise:.6g} > {noise_thr:.6g} (damage_metric={damage_metric})"
+                )
 
         print("  * Counting model refusals...")
         refusals = self.count_refusals(adapter=adapter)
         print(f"  * Refusals: [bold]{refusals}[/]/{len(self.bad_prompts)}")
 
-        kl_divergence_scale = self.settings.kl_divergence_scale
-        kl_divergence_target = self.settings.kl_divergence_target
+        damage_scale = float(getattr(self.settings, "damage_scale", 1.0))
+        damage_target = float(getattr(self.settings, "damage_target", 0.01))
 
-        refusals_score = refusals / self.base_refusals
+        denom = max(1, int(self.base_refusals))
+        refusals_score = refusals / denom
 
-        if kl_divergence >= kl_divergence_target:
-            kld_score = kl_divergence / kl_divergence_scale
+        if damage >= damage_target:
+            damage_score = damage / damage_scale
         else:
-            kld_score = refusals_score * kl_divergence_target / kl_divergence_scale
+            damage_score = refusals_score * damage_target / damage_scale
 
         score = (
-            kld_score,
+            damage_score,
             refusals_score,
         )
 
-        return score, kl_divergence, refusals
+        return score, damage, refusals
 
     def _validate_logprobs_tensor(self, t: Tensor, *, where: str) -> None:
         # Shape sanity: must be (batch, vocab).

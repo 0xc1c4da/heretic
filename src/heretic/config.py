@@ -2,7 +2,7 @@
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
 
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import (
@@ -288,47 +288,95 @@ class Settings(BaseSettings):
         description="Matplotlib style sheet to use for plots of residual vectors.",
     )
 
-    kl_divergence_scale: float = Field(
-        default=1.0,
+    damage_metric: Literal["paired_delta_nll", "topk_js"] = Field(
+        default="paired_delta_nll",
         description=(
-            'Assumed "typical" value of the Kullback-Leibler divergence from the original model for abliterated models. '
-            "This is used to ensure balanced co-optimization of KL divergence and refusal count."
+            "Damage metric used to preserve model capability on harmless prompts.\n"
+            "- 'paired_delta_nll': teacher-forced NLL on cached base continuations, measured base vs adapted within one call.\n"
+            "- 'topk_js': top-k renormalized Jensen–Shannon divergence (with an OTHER bucket) at continuation positions."
         ),
     )
 
-    kl_divergence_target: float = Field(
+    damage_scale: float = Field(
+        default=1.0,
+        description=(
+            'Assumed "typical" value of the selected damage metric for abliterated models. '
+            "Used to balance co-optimization of damage and refusal count."
+        ),
+    )
+
+    damage_target: float = Field(
         default=0.01,
         description=(
-            "The KL divergence to target. Below this value, an objective based on the refusal count is used."
+            "Damage target. Below this value, an objective based on the refusal count is used. "
             'This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".'
         ),
     )
 
-    paired_kl_noise_threshold: float = Field(
-        default=1e-2,
+    damage_noise_threshold: float = Field(
+        default=0.05,
         description=(
-            "When using paired KL scoring (one-call base vs adapted), optionally measure within-call drift via "
-            "KL(base1||base2). If this exceeds the threshold, the run is aborted because the KL metric is "
-            "not trustworthy for optimization."
+            "Within-call noise threshold for the selected damage metric. "
+            "If the base replicate disagreement exceeds this threshold, the trial is aborted or retried."
         ),
     )
 
-    damage_metric: str = Field(
-        default="kl",
+    damage_retry_count: int = Field(
+        default=1,
         description=(
-            "Damage metric used to preserve model capability on harmless prompts. "
-            "Options: 'kl' (full-vocab next-token KL; may be unstable on some SGLang stacks), "
-            "'delta_nll' (teacher-forced NLL on cached base continuations)."
+            "How many times to retry damage measurement when within-call noise is too high. "
+            "0 disables retries (fail fast)."
         ),
     )
 
+    # ---- paired_delta_nll knobs ----
     delta_nll_continuation_tokens: int = Field(
         default=32,
         description=(
-            "When damage_metric='delta_nll', number of greedy tokens to generate with the base model "
-            "for each harmless evaluation prompt to form the cached continuation. "
-            "This controls the sensitivity/cost tradeoff."
+            "Number of continuation tokens per reference to cache and score for paired ΔNLL."
         ),
+    )
+
+    delta_nll_num_refs: int = Field(
+        default=3,
+        description=(
+            "Number of cached base continuations per prompt (multi-reference reduces single-path bias)."
+        ),
+    )
+
+    delta_nll_ref_temperatures: list[float] = Field(
+        default_factory=lambda: [0.0, 0.2, 0.4],
+        description=(
+            "Sampling temperatures used to generate cached base continuations. "
+            "The list length should equal delta_nll_num_refs. "
+            "Include 0.0 to always have a greedy reference."
+        ),
+    )
+
+    delta_nll_ref_top_k: int = Field(
+        default=50,
+        description="Top-k used for non-greedy cached base continuation sampling.",
+    )
+
+    delta_nll_aggregation: Literal["mom"] = Field(
+        default="mom",
+        description="Aggregation across prompts for ΔNLL (currently: median-of-means).",
+    )
+
+    delta_nll_mom_buckets: int = Field(
+        default=7,
+        description="Number of buckets for median-of-means aggregation.",
+    )
+
+    # ---- topk_js knobs ----
+    topk_js_k: int = Field(
+        default=128,
+        description="Top-k size for topk_js at each continuation position.",
+    )
+
+    topk_js_positions: int = Field(
+        default=32,
+        description="Number of continuation positions (tokens) to include in topk_js.",
     )
 
     winsorization_quantile: float = Field(

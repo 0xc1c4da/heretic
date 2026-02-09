@@ -68,13 +68,35 @@ residual_plot_title = 'PaCMAP Projection of Residual Vectors for "Harmless" and 
 # Matplotlib style sheet to use for plots of residual vectors.
 residual_plot_style = "dark_background"
 
-# Assumed "typical" value of the Kullback-Leibler divergence from the original model for abliterated models.
-# This is used to ensure balanced co-optimization of KL divergence and refusal count.
-kl_divergence_scale = 1.0
+# Assumed "typical" value of the selected damage metric for abliterated models.
+# This is used to ensure balanced co-optimization of damage and refusal count.
+damage_scale = 1.0
 
-# The KL divergence to target. Below this value, an objective based on the refusal count is used.
+# Damage target. Below this value, an objective based on the refusal count is used.
 # This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".
-kl_divergence_target = 0.01
+damage_target = 0.01
+
+# Within-call noise threshold for damage metrics. If exceeded, abort/retry damage measurement.
+damage_noise_threshold = 0.05
+
+# How many times to retry damage measurement when noise is too high.
+damage_retry_count = 1
+
+# Damage metric used to preserve model capability on harmless prompts.
+# - paired_delta_nll: teacher-forced continuation NLL, measured base vs adapted within one call.
+# - topk_js: top-k renormalized Jensen–Shannon divergence (with an OTHER bucket).
+damage_metric = "paired_delta_nll"
+
+# ---- paired_delta_nll knobs ----
+delta_nll_continuation_tokens = 32
+delta_nll_num_refs = 3
+delta_nll_ref_temperatures = [0.0, 0.2, 0.4]
+delta_nll_ref_top_k = 50
+delta_nll_mom_buckets = 7
+
+# ---- topk_js knobs ----
+topk_js_k = 128
+topk_js_positions = 32
 
 # The symmetric winsorization to apply to each layer of the per-prompt residuals,
 # expressed as the quantile to clamp to (between 0 and 1). Disabled by default.
