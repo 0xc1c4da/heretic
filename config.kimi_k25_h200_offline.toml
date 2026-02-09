@@ -44,7 +44,7 @@ max_response_length = 100
 refusal_cache = true
 orthogonalize_direction = true
 sglang_abliterate_include_projs = ["o_proj", "down_proj"]
-sglang_abliterate_include_experts = true
+sglang_abliterate_include_experts = false
 
 # Exercise FULL rownorm path (server-side primitive via embedded engine).
 row_normalization = "full"
@@ -67,7 +67,7 @@ winsorization_quantile = 0.995
 
 # Range for max_weight parameter during optimization.
 # Higher max values (e.g., 2.0) may be beneficial with row_normalization enabled.
-max_weight_min = 0.05
+max_weight_min = 0.8
 max_weight_max = 6.0
 
 
@@ -140,7 +140,7 @@ enable_lora = true
 max_lora_rank = 64
 # Avoid `all` unless you truly need it (it increases overhead).
 lora_target_modules = ["o_proj", "down_proj"]
-enable_lora_experts = true
+enable_lora_experts = false
 # lora_target_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
 # Keep small: base-only + 1 adapter is the common case for Heretic.
 max_loras_per_batch = 2
