@@ -346,6 +346,8 @@ class SGLangOfflineBackend(HereticBackend):
 
         rows: list[torch.Tensor] = []
         prompt_sha256: list[str | None] = []
+        tp_rank: list[int | None] = []
+        vocab_dim: list[int | None] = []
         for out in gen.outputs:
             meta = out.get("meta_info") or {}
             b64_steps = meta.get("heretic_next_token_logprobs_full_fp16_b64")
@@ -361,6 +363,25 @@ class SGLangOfflineBackend(HereticBackend):
                 prompt_sha256.append(sha_steps[-1])
             else:
                 prompt_sha256.append(None)
+            # Debug-only per-row identity fields.
+            tr_steps = meta.get("heretic_tp_rank")
+            if isinstance(tr_steps, list) and tr_steps:
+                v = tr_steps[-1]
+                try:
+                    tp_rank.append(int(v) if v is not None else None)
+                except Exception:
+                    tp_rank.append(None)
+            else:
+                tp_rank.append(None)
+            vd_steps = meta.get("heretic_vocab_dim")
+            if isinstance(vd_steps, list) and vd_steps:
+                v = vd_steps[-1]
+                try:
+                    vocab_dim.append(int(v) if v is not None else None)
+                except Exception:
+                    vocab_dim.append(None)
+            else:
+                vocab_dim.append(None)
             # These fields are list-of-steps. Always take the last step to represent the
             # distribution after consuming the full prompt, even under multi-pass execution.
             b64 = b64_steps[-1]
@@ -380,6 +401,8 @@ class SGLangOfflineBackend(HereticBackend):
         out_t = torch.stack(rows, dim=0)
         out_meta: dict[str, Any] = {
             "heretic_input_ids_sha256": prompt_sha256,
+            "heretic_tp_rank": tp_rank,
+            "heretic_vocab_dim": vocab_dim,
         }
         # Side-channel for internal callers (tools) that need per-row meta without changing APIs.
         try:
