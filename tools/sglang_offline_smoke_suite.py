@@ -151,6 +151,19 @@ def main() -> int:
             return None
         return None
 
+    def _get_meta_int(out, *, key: str, idx: int) -> int | None:
+        try:
+            meta = getattr(out, "meta", None) or {}
+            xs = meta.get(str(key))
+            if isinstance(xs, list) and 0 <= int(idx) < len(xs):
+                v = xs[int(idx)]
+                if v is None:
+                    return None
+                return int(v)
+        except Exception:
+            return None
+        return None
+
     def _compute_refusal_directions_like_main_from_residuals(
         *, settings: Settings, good_residuals: torch.Tensor, bad_residuals: torch.Tensor
     ) -> torch.Tensor:
@@ -281,6 +294,13 @@ def main() -> int:
             # Hard invariant: duplicated prompts must have identical prompt-id hash at capture.
             sha0 = _get_last_prompt_sha(base0_pair, idx=0)
             sha1 = _get_last_prompt_sha(base0_pair, idx=1)
+            tp0 = _get_meta_int(base0_pair, key="heretic_tp_rank", idx=0)
+            tp1 = _get_meta_int(base0_pair, key="heretic_tp_rank", idx=1)
+            vd0 = _get_meta_int(base0_pair, key="heretic_vocab_dim", idx=0)
+            vd1 = _get_meta_int(base0_pair, key="heretic_vocab_dim", idx=1)
+            _log(
+                f"[smoke] duplicated meta: sha=({sha0},{sha1}) tp_rank=({tp0},{tp1}) vocab_dim=({vd0},{vd1})"
+            )
             if sha0 is not None and sha1 is not None and sha0 != sha1:
                 raise RuntimeError(
                     f"Duplicated scoring prompts have different prompt hashes: {sha0} != {sha1}"
