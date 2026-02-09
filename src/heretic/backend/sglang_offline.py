@@ -229,9 +229,20 @@ class SGLangOfflineBackend(HereticBackend):
 
     def _generate_req(self, obj) -> _OfflineGen:
         gen = self._engine.tokenizer_manager.generate_request(obj, None)
-        outputs = self._run(gen.__anext__())
+
+        async def _drain_last():
+            last = None
+            async for item in gen:
+                last = item
+            return last
+
+        outputs = self._run(_drain_last())
+        if outputs is None:
+            raise RuntimeError("Unexpected SGLang offline generate output: no yields.")
         if not isinstance(outputs, list) or any(not isinstance(x, dict) for x in outputs):
-            raise RuntimeError(f"Unexpected SGLang offline generate output: {type(outputs).__name__}")
+            raise RuntimeError(
+                f"Unexpected SGLang offline generate output: {type(outputs).__name__}"
+            )
         return _OfflineGen(outputs=outputs)
 
     def get_metadata(self) -> BackendMetadata:
