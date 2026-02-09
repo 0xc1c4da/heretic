@@ -108,6 +108,7 @@ def validate_damage_metric_repeatability(
     input_ids_batch: list[list[int]],
     damage_metric: str,
     damage_noise_threshold: float,
+    damage_retry_count: int,
     delta_nll_continuation_tokens: int,
     topk_js_k: int,
     topk_js_positions: int,
@@ -157,64 +158,94 @@ def validate_damage_metric_repeatability(
     adapter_name = "startup_validation_noop"
     adapter_id = load(name=adapter_name, tensors=tensors, config=cfg)  # type: ignore[misc]
     try:
-        if damage_metric == "paired_delta_nll":
-            scorer = getattr(backend, "score_continuation_nll_paired_with_noise", None)
-            if scorer is None:
-                raise BackendValidationError("Backend missing score_continuation_nll_paired_with_noise.")
-            base1, adapted, base2 = scorer(  # type: ignore[misc]
-                prompt_ids_batch=input_ids_batch,
-                continuation_ids_batch=cont_ids,
-                adapter=str(adapter_id),
-            )
-            if len(base1) != len(adapted) or len(base1) != len(base2):
-                raise BackendValidationError("paired_delta_nll returned unexpected batch shape.")
-            deltas = [float(a) - float(b) for a, b in zip(adapted, base1, strict=True)]
-            noises = [abs(float(b2) - float(b1)) for b2, b1 in zip(base2, base1, strict=True)]
-            damage = float(sum(deltas) / max(1, len(deltas)))
-            noise = float(sum(noises) / max(1, len(noises)))
-        else:
-            scorer = getattr(backend, "score_continuation_topk_paired_with_noise", None)
-            if scorer is None:
-                raise BackendValidationError("Backend missing score_continuation_topk_paired_with_noise.")
-            b1_topk, ad_topk, b2_topk = scorer(  # type: ignore[misc]
-                prompt_ids_batch=input_ids_batch,
-                continuation_ids_batch=cont_ids,
-                adapter=str(adapter_id),
-                top_k=int(topk_js_k),
-            )
-            if not (isinstance(b1_topk, list) and isinstance(ad_topk, list) and isinstance(b2_topk, list)):
-                raise BackendValidationError("topk_js returned unexpected schema.")
-            # Validate only the first item for startup sanity to keep cost low.
-            b1_pos = b1_topk[0]
-            ad_pos = ad_topk[0]
-            b2_pos = b2_topk[0]
-            if not (isinstance(b1_pos, list) and isinstance(ad_pos, list) and isinstance(b2_pos, list)):
-                raise BackendValidationError("topk_js returned unexpected per-item schema.")
-            npos = min(int(topk_js_positions), len(b1_pos), len(ad_pos), len(b2_pos))
-            if npos <= 0:
-                raise BackendValidationError("topk_js returned no continuation positions.")
-            dmg = 0.0
-            noi = 0.0
-            for t in range(npos):
-                dmg += float(_js_other_bucket(b1_pos[t], ad_pos[t]))
-                noi += float(_js_other_bucket(b1_pos[t], b2_pos[t]))
-            damage = float(dmg / npos)
-            noise = float(noi / npos)
+        last_damage = float("nan")
+        last_noise = float("inf")
+        attempts = max(0, int(damage_retry_count)) + 1
 
-        if not math.isfinite(float(damage)) or not math.isfinite(float(noise)):
-            raise BackendValidationError(f"Non-finite damage/noise in validation: damage={damage} noise={noise}")
+        for attempt in range(attempts):
+            if damage_metric == "paired_delta_nll":
+                scorer = getattr(backend, "score_continuation_nll_paired_with_noise", None)
+                if scorer is None:
+                    raise BackendValidationError(
+                        "Backend missing score_continuation_nll_paired_with_noise."
+                    )
+                base1, adapted, base2 = scorer(  # type: ignore[misc]
+                    prompt_ids_batch=input_ids_batch,
+                    continuation_ids_batch=cont_ids,
+                    adapter=str(adapter_id),
+                )
+                if len(base1) != len(adapted) or len(base1) != len(base2):
+                    raise BackendValidationError(
+                        "paired_delta_nll returned unexpected batch shape."
+                    )
+                deltas = [float(a) - float(b) for a, b in zip(adapted, base1, strict=True)]
+                noises = [
+                    abs(float(b2) - float(b1))
+                    for b2, b1 in zip(base2, base1, strict=True)
+                ]
+                damage = float(sum(deltas) / max(1, len(deltas)))
+                noise = float(sum(noises) / max(1, len(noises)))
+            else:
+                scorer = getattr(backend, "score_continuation_topk_paired_with_noise", None)
+                if scorer is None:
+                    raise BackendValidationError(
+                        "Backend missing score_continuation_topk_paired_with_noise."
+                    )
+                b1_topk, ad_topk, b2_topk = scorer(  # type: ignore[misc]
+                    prompt_ids_batch=input_ids_batch,
+                    continuation_ids_batch=cont_ids,
+                    adapter=str(adapter_id),
+                    top_k=int(topk_js_k),
+                )
+                if not (
+                    isinstance(b1_topk, list)
+                    and isinstance(ad_topk, list)
+                    and isinstance(b2_topk, list)
+                ):
+                    raise BackendValidationError("topk_js returned unexpected schema.")
+                # Validate only the first item for startup sanity to keep cost low.
+                b1_pos = b1_topk[0]
+                ad_pos = ad_topk[0]
+                b2_pos = b2_topk[0]
+                if not (
+                    isinstance(b1_pos, list)
+                    and isinstance(ad_pos, list)
+                    and isinstance(b2_pos, list)
+                ):
+                    raise BackendValidationError(
+                        "topk_js returned unexpected per-item schema."
+                    )
+                npos = min(int(topk_js_positions), len(b1_pos), len(ad_pos), len(b2_pos))
+                if npos <= 0:
+                    raise BackendValidationError("topk_js returned no continuation positions.")
+                dmg = 0.0
+                noi = 0.0
+                for t in range(npos):
+                    dmg += float(_js_other_bucket(b1_pos[t], ad_pos[t]))
+                    noi += float(_js_other_bucket(b1_pos[t], b2_pos[t]))
+                damage = float(dmg / npos)
+                noise = float(noi / npos)
 
-        if noise > float(damage_noise_threshold):
-            raise BackendValidationError(
-                f"Damage metric noise too high: {noise:.6g} > {damage_noise_threshold:.6g} (metric={damage_metric})"
-            )
+            last_damage = float(damage)
+            last_noise = float(noise)
+            if not math.isfinite(last_damage) or not math.isfinite(last_noise):
+                continue
 
-        # No-op adapter should not introduce damage much larger than measurement noise.
-        allowed = max(float(damage_noise_threshold), 3.0 * float(noise))
-        if abs(float(damage)) > allowed:
-            raise BackendValidationError(
-                f"No-op adapter damage too large vs noise: |{damage:.6g}| > {allowed:.6g} (noise={noise:.6g}, metric={damage_metric})"
-            )
+            if last_noise > float(damage_noise_threshold):
+                continue
+
+            # No-op adapter should not introduce damage much larger than measurement noise.
+            allowed = max(float(damage_noise_threshold), 3.0 * float(last_noise))
+            if abs(float(last_damage)) > allowed:
+                continue
+
+            # Passed.
+            return
+
+        raise BackendValidationError(
+            f"Damage metric noise too high: {last_noise:.6g} > {damage_noise_threshold:.6g} "
+            f"(metric={damage_metric}, retries={attempts-1}, last_damage={last_damage:.6g})"
+        )
     finally:
         try:
             unload(name=adapter_name)  # type: ignore[misc]
@@ -811,6 +842,7 @@ def run_startup_validations(
             input_ids_batch=input_ids_batch[:1],
             damage_metric=damage_metric,
             damage_noise_threshold=float(getattr(settings, "damage_noise_threshold", 0.05) if settings is not None else 0.05),
+            damage_retry_count=int(getattr(settings, "damage_retry_count", 0) if settings is not None else 0),
             delta_nll_continuation_tokens=int(getattr(settings, "delta_nll_continuation_tokens", 32) if settings is not None else 32),
             topk_js_k=int(getattr(settings, "topk_js_k", 128) if settings is not None else 128),
             topk_js_positions=int(getattr(settings, "topk_js_positions", 32) if settings is not None else 32),
