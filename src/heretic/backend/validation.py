@@ -138,6 +138,27 @@ def validate_full_vocab_score_repeatability(
         doubled = list(input_ids_batch) + list(input_ids_batch)
         r = backend.score(doubled, adapter=None)
         t = r.logprobs_full
+        # Hard prompt-identity invariant (best-effort).
+        #
+        # If the backend provides per-row prompt hashes at the scoring boundary, assert that the
+        # duplicated halves refer to identical prompt token ids. This catches batch/row mixups even
+        # when KL might coincidentally be small.
+        try:
+            sha_list = (r.meta or {}).get("heretic_input_ids_sha256")
+            if isinstance(sha_list, list) and len(sha_list) == 2 * b:
+                a = sha_list[:b]
+                c = sha_list[b:]
+                if all(isinstance(x, str) for x in a) and all(isinstance(x, str) for x in c):
+                    for i, (ha, hc) in enumerate(zip(a, c, strict=True)):
+                        if ha != hc:
+                            raise BackendValidationError(
+                                f"Within-call prompt-hash mismatch at {i}: {ha} != {hc}"
+                            )
+        except BackendValidationError:
+            raise
+        except Exception:
+            # If hashes are absent or malformed, do not fail repeatability purely on that basis.
+            pass
         if t is None:
             raise BackendValidationError("Backend score returned no logprobs_full (required for KL).")
         if t.ndim != 2 or t.shape[0] != 2 * b:
