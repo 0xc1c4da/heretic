@@ -132,13 +132,24 @@ def main() -> int:
     def _mk_prompt(*, system: str, user: str) -> Prompt:
         return Prompt(system=str(system), user=str(user))
 
-    def _score_full_vocab(model: Model, prompts: list[Prompt], *, adapter: str | None) -> torch.Tensor:
+    def _score_full_vocab(model: Model, prompts: list[Prompt], *, adapter: str | None):
         input_ids_batch = model.encode_prompts(prompts)
         out = model.backend.score(input_ids_batch, adapter=adapter)
         t = out.logprobs_full
         if t is None:
             raise RuntimeError("Backend did not return logprobs_full (required).")
-        return t
+        return out
+
+    def _get_last_prompt_sha(out, *, idx: int) -> str | None:
+        try:
+            meta = getattr(out, "meta", None) or {}
+            sha_list = meta.get("heretic_input_ids_sha256")
+            if isinstance(sha_list, list) and 0 <= int(idx) < len(sha_list):
+                v = sha_list[int(idx)]
+                return str(v) if isinstance(v, str) else None
+        except Exception:
+            return None
+        return None
 
     def _compute_refusal_directions_like_main_from_residuals(
         *, settings: Settings, good_residuals: torch.Tensor, bad_residuals: torch.Tensor
@@ -250,8 +261,10 @@ def main() -> int:
             failed = True
 
     # Check 0: base score repeat (cross-call; may be meaningless under drift).
-    base0, _ = _time_call("score(base) #1", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
-    base0b, _ = _time_call("score(base) #2", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
+    base0r, _ = _time_call("score(base) #1", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
+    base0br, _ = _time_call("score(base) #2", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
+    base0 = base0r.logprobs_full
+    base0b = base0br.logprobs_full
     kl_00 = _kl_base_vs_other(base_logprobs=base0, other_logprobs=base0b)
     md_00 = float((base0b - base0).abs().max().item())
     _record("base_repeat", kl=kl_00, maxdiff=md_00, counts_for_fail=not supports_paired)
@@ -263,9 +276,17 @@ def main() -> int:
             "score(base) within-call (duplicated batch)",
             lambda: _score_full_vocab(model, eval_prompts + eval_prompts, adapter=None),
         )
-        if base0_pair.ndim == 2 and base0_pair.shape[0] == 2:
-            base0a = base0_pair[:1]
-            base0c = base0_pair[1:]
+        base0_pair_t = base0_pair.logprobs_full
+        if base0_pair_t is not None and base0_pair_t.ndim == 2 and base0_pair_t.shape[0] == 2:
+            # Hard invariant: duplicated prompts must have identical prompt-id hash at capture.
+            sha0 = _get_last_prompt_sha(base0_pair, idx=0)
+            sha1 = _get_last_prompt_sha(base0_pair, idx=1)
+            if sha0 is not None and sha1 is not None and sha0 != sha1:
+                raise RuntimeError(
+                    f"Duplicated scoring prompts have different prompt hashes: {sha0} != {sha1}"
+                )
+            base0a = base0_pair_t[:1]
+            base0c = base0_pair_t[1:]
             kl_00w = _kl_base_vs_other(base_logprobs=base0a, other_logprobs=base0c)
             md_00w = float((base0c - base0a).abs().max().item())
             _record("base_repeat_within_call", kl=kl_00w, maxdiff=md_00w, counts_for_fail=True)
@@ -283,7 +304,8 @@ def main() -> int:
         lambda: model.get_residuals_batched(bad_prompts),
     )
 
-    base1, _ = _time_call("score(base after residuals)", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
+    base1r, _ = _time_call("score(base after residuals)", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
+    base1 = base1r.logprobs_full
     kl_01 = _kl_base_vs_other(base_logprobs=base0, other_logprobs=base1)
     md_01 = float((base1 - base0).abs().max().item())
     _record("after_residual_capture", kl=kl_01, maxdiff=md_01, counts_for_fail=not supports_paired)
@@ -359,10 +381,11 @@ def main() -> int:
             f"load_adapter({name})",
             lambda: model.backend.load_adapter(name=name, tensors=tensors, config=config_dict),
         )
-        lp_ad, _ = _time_call(
+        lp_adr, _ = _time_call(
             f"score(adapter {name})",
             lambda: _score_full_vocab(model, eval_prompts, adapter=adapter_id),
         )
+        lp_ad = lp_adr.logprobs_full
         kl = _kl_base_vs_other(base_logprobs=base1, other_logprobs=lp_ad)
         md = float((lp_ad - base1).abs().max().item())
         _record(f"{name}_kl", kl=kl, maxdiff=md, note=note, counts_for_fail=not supports_paired)
@@ -374,6 +397,22 @@ def main() -> int:
             base_p, adapted_p, base2_p = model.backend.score_full_vocab_paired_with_noise(
                 ids, adapter=str(adapter_id)
             )
+            # Hard invariant: all rows in the paired call must share the same prompt hash.
+            # We read it from the backend side-channel set during scoring calls.
+            sha_list = getattr(model.backend, "_last_score_prompt_sha256", None)
+            if isinstance(sha_list, list) and len(sha_list) >= 3:
+                sha_base1 = sha_list[0]
+                sha_ad = sha_list[len(ids)] if len(ids) < len(sha_list) else None
+                sha_base2 = sha_list[2 * len(ids)] if 2 * len(ids) < len(sha_list) else None
+                if (
+                    isinstance(sha_base1, str)
+                    and isinstance(sha_ad, str)
+                    and isinstance(sha_base2, str)
+                    and not (sha_base1 == sha_ad == sha_base2)
+                ):
+                    raise RuntimeError(
+                        f"Paired scoring prompt hash mismatch: base1={sha_base1} adapted={sha_ad} base2={sha_base2}"
+                    )
             kl_p = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=adapted_p)
             md_p = float((adapted_p - base_p).abs().max().item())
             kl_noise = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=base2_p)
@@ -405,10 +444,11 @@ def main() -> int:
             f"unload_adapter({name})",
             lambda: model.backend.unload_adapter(name=name),
         )
-        base_post, _ = _time_call(
+        base_postr, _ = _time_call(
             f"score(post-unload {name})",
             lambda: _score_full_vocab(model, eval_prompts, adapter=None),
         )
+        base_post = base_postr.logprobs_full
         kl_post = _kl_base_vs_other(base_logprobs=base1, other_logprobs=base_post)
         md_post = float((base_post - base1).abs().max().item())
         _record(f"{name}_post_unload", kl=kl_post, maxdiff=md_post, note=note, counts_for_fail=not supports_paired)

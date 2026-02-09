@@ -288,6 +288,23 @@ class SGLangOfflineBackend(HereticBackend):
         lora_id: str | list[str | None] | None,
     ) -> torch.Tensor:
         """One-call full-vocab scoring with scalar or per-item LoRA ids."""
+        t, _meta = self._score_full_vocab_with_lora_ids_and_meta(
+            input_ids_batch, lora_id=lora_id
+        )
+        return t
+
+    def _score_full_vocab_with_lora_ids_and_meta(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        lora_id: str | list[str | None] | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """One-call full-vocab scoring plus per-row meta.
+
+        Returns:
+          - logprobs_full: (batch, vocab) float32 tensor
+          - meta: dict with per-row fields (e.g. prompt hash) aligned to rows
+        """
         from sglang.srt.managers.io_struct import GenerateReqInput
 
         # IMPORTANT: use per-item extra_key values.
@@ -330,6 +347,7 @@ class SGLangOfflineBackend(HereticBackend):
         gen = self._generate_req(obj)
 
         rows: list[torch.Tensor] = []
+        prompt_sha256: list[str | None] = []
         for out in gen.outputs:
             meta = out.get("meta_info") or {}
             b64_steps = meta.get("heretic_next_token_logprobs_full_fp16_b64")
@@ -339,6 +357,12 @@ class SGLangOfflineBackend(HereticBackend):
                 raise RuntimeError(
                     f"Missing full-vocab logprobs in offline response meta_info: keys={list(meta.keys())}"
                 )
+            # Optional prompt identity (stable hash at scoring boundary).
+            sha_steps = meta.get("heretic_input_ids_sha256")
+            if isinstance(sha_steps, list) and sha_steps and isinstance(sha_steps[-1], str):
+                prompt_sha256.append(sha_steps[-1])
+            else:
+                prompt_sha256.append(None)
             # These fields are list-of-steps. Always take the last step to represent the
             # distribution after consuming the full prompt, even under multi-pass execution.
             b64 = b64_steps[-1]
@@ -355,7 +379,16 @@ class SGLangOfflineBackend(HereticBackend):
                 raise RuntimeError(f"Decoded fp16 size mismatch: {arr.size=} {vocab=}")
             rows.append(torch.from_numpy(arr.astype(np.float32, copy=False)))
 
-        return torch.stack(rows, dim=0)
+        out_t = torch.stack(rows, dim=0)
+        out_meta: dict[str, Any] = {
+            "heretic_input_ids_sha256": prompt_sha256,
+        }
+        # Side-channel for internal callers (tools) that need per-row meta without changing APIs.
+        try:
+            setattr(self, "_last_score_prompt_sha256", list(prompt_sha256))
+        except Exception:
+            pass
+        return out_t, out_meta
 
     def lora_status(self) -> list[dict[str, Any]]:
         """Offline equivalent of `GET /heretic/lora_status` (observability)."""
@@ -525,8 +558,12 @@ class SGLangOfflineBackend(HereticBackend):
         return A, B
 
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
-        logprobs_full = self._score_full_vocab_with_lora_ids(input_ids_batch, lora_id=adapter)
-        return ScoreResult(logprobs_full=logprobs_full, meta={"transport": "offline"})
+        logprobs_full, per_row_meta = self._score_full_vocab_with_lora_ids_and_meta(
+            input_ids_batch, lora_id=adapter
+        )
+        meta = {"transport": "offline"}
+        meta.update(per_row_meta)
+        return ScoreResult(logprobs_full=logprobs_full, meta=meta)
 
     def score_full_vocab_paired(
         self,

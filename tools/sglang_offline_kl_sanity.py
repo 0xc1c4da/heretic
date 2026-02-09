@@ -466,8 +466,26 @@ def main() -> int:
     if bool(supports.get("score_full_vocab_paired", False)):
         try:
             doubled = list(input_ids_batch) + list(input_ids_batch)
-            lp2 = backend.score(doubled, adapter=None).logprobs_full
+            sr2 = backend.score(doubled, adapter=None)
+            lp2 = sr2.logprobs_full
             if lp2 is not None and lp2.ndim == 2 and lp2.shape[0] == 2 * len(input_ids_batch):
+                # Hard invariant: duplicated prompts must have identical prompt-id hash at capture.
+                try:
+                    meta = sr2.meta or {}
+                    sha_list = meta.get("heretic_input_ids_sha256")
+                    if (
+                        isinstance(sha_list, list)
+                        and len(sha_list) == 2 * len(input_ids_batch)
+                        and len(input_ids_batch) == 1
+                    ):
+                        sha0 = sha_list[0]
+                        sha1 = sha_list[1]
+                        if isinstance(sha0, str) and isinstance(sha1, str) and sha0 != sha1:
+                            raise RuntimeError(
+                                f"Duplicated scoring prompts have different prompt hashes: {sha0} != {sha1}"
+                            )
+                except Exception as e:
+                    print(f"[warn] prompt-hash invariant check failed: {e}")
                 lp_a = lp2[: len(input_ids_batch)]
                 lp_b = lp2[len(input_ids_batch) :]
                 kl_within = _kl_base_vs_other(base_logprobs=lp_a, other_logprobs=lp_b)
