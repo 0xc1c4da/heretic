@@ -12,13 +12,9 @@
 model = "moonshotai/Kimi-K2.5"
 backend = "sglang_offline"
 trust_remote_code = true
+validate_backend = true
 detect_response_prefix = false
 
-# We intentionally disable startup validation for this SGLang+TP8 stack.
-# The legacy validator includes a full-vocab KL repeatability check which is known to fail
-# under dynamic batching / TP reduction order, even when our chosen damage metric (topk_js)
-# is stable enough for optimization.
-validate_backend = false
 
 # Optional: pin an exact revision for fully reproducible runs.
 # hf_revision = "<commit-hash-or-tag>"
