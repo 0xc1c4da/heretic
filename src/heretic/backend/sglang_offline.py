@@ -448,7 +448,14 @@ class SGLangOfflineBackend(HereticBackend):
 
         obj = GenerateReqInput(
             input_ids=input_ids_batch,
-            sampling_params={"max_new_tokens": 0, "temperature": 1.0},
+            # IMPORTANT: force greedy sampling semantics for scoring.
+            #
+            # Heretic expects full-vocab logprobs derived from next-token *logits* at the prompt boundary.
+            # SGLang's non-greedy sampling path can mutate next_token_logits in-place (e.g. softmax),
+            # which would make log_softmax(logits) incorrect and non-repeatable under chunked/multi-pass prefill.
+            #
+            # In SGLang, temperature ~ 0 normalizes to `top_k=1` (greedy) while keeping stable execution.
+            sampling_params={"max_new_tokens": 0, "temperature": 0.0},
             stream=False,
             return_logprob=False,
             return_next_token_logprobs_full=True,
