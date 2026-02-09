@@ -304,7 +304,10 @@ class SGLangOfflineBackend(HereticBackend):
             # which would make log_softmax(logits) incorrect and non-repeatable under chunked/multi-pass prefill.
             #
             # In SGLang, temperature ~ 0 normalizes to `top_k=1` (greedy) while keeping stable execution.
-            sampling_params={"max_new_tokens": 0, "temperature": 0.0},
+            # IMPORTANT: request 1 decode token so the prompt-boundary distribution is captured
+            # during decode (see vendored SGLang capture hook). This avoids ambiguity under
+            # chunked/mixed prefill, where prefill passes may yield intermediate logits.
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
             stream=False,
             return_logprob=False,
             return_next_token_logprobs_full=True,
@@ -645,7 +648,7 @@ class SGLangOfflineBackend(HereticBackend):
 
         obj = GenerateReqInput(
             input_ids=input_ids_batch,
-            sampling_params={"max_new_tokens": 0, "temperature": 0.0},
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
             stream=False,
             return_hidden_states=True,
             capture_layers=capture_layers,
