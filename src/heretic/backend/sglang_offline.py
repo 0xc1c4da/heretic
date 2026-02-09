@@ -332,13 +332,11 @@ class SGLangOfflineBackend(HereticBackend):
             # distribution exists at the end of EXTEND/prefill. Decode is not guaranteed to run.
             sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
             stream=False,
-            # Prevent mixed-chunk batching with decode requests.
+            # For Heretic full-vocab scoring, we do NOT need input logprobs and should avoid the
+            # return_logprob=True path (it changes pruning/padding behavior in logits processing).
             #
-            # SGLang's mixed-chunk path can combine prefill and decode reqs in one forward,
-            # which complicates row alignment for next_token_logits. Setting return_logprob=True
-            # disables mixed-chunk (see scheduler) while still allowing us to skip expensive
-            # input-logprob computation for prefill-only requests.
-            return_logprob=True,
+            # Mixed-chunk batching is disabled separately via the `is_heretic_scoring` scheduler guard.
+            return_logprob=False,
             return_next_token_logprobs_full=True,
             lora_id=lora_id,
             # Ensure scoring does not hit/poison prefix cache (cache namespace salt).
