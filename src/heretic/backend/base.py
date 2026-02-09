@@ -124,6 +124,24 @@ class HereticBackend(ABC):
         adapted = self.score_full_vocab(input_ids_batch, adapter=adapter)
         return base, adapted
 
+    def score_full_vocab_paired_with_noise(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        adapter: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (base1, adapted, base2) full-vocab logprobs for paired KL + noise.
+
+        The intent is to let callers measure within-call drift via:
+          KL_noise = KL(base1 || base2)
+
+        Backends with cross-call drift MUST override this with a one-call/batch implementation
+        and advertise support via `BackendMetadata.supports["score_full_vocab_paired_with_noise"]=True`.
+        """
+        base1, adapted = self.score_full_vocab_paired(input_ids_batch, adapter=adapter)
+        base2 = self.score_full_vocab(input_ids_batch, adapter=None)
+        return base1, adapted, base2
+
     @abstractmethod
     def generate_text(
         self,

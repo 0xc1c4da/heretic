@@ -126,6 +126,12 @@ class SGLangBackend(HereticBackend):
                 "prompt_ids_sha256": False,
                 "capture_layers": True,
                 "logprobs_full": True,
+                # This client can implement within-call noise measurement by tripling a batched
+                # full-vocab score request; no new server endpoint is required. If the server
+                # supports paired scoring, we treat noise measurement as supported as well.
+                "score_full_vocab_paired_with_noise": bool(
+                    supports.get("score_full_vocab_paired", False)
+                ),
                 "compute_vtw": True,
                 "lora_hot_swap": True,
                 "tokenize_chat": True,
@@ -270,6 +276,28 @@ class SGLangBackend(HereticBackend):
         base = both[:b]
         adapted = both[b:]
         return base, adapted
+
+    def score_full_vocab_paired_with_noise(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        adapter: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute (base1, adapted, base2) within one server request/batch."""
+        if not input_ids_batch:
+            raise ValueError("input_ids_batch must be non-empty")
+        b = len(input_ids_batch)
+        tripled_ids = list(input_ids_batch) + list(input_ids_batch) + list(input_ids_batch)
+        tripled_loras: list[str | None] = ([None] * b) + ([str(adapter)] * b) + ([None] * b)
+        all3, _meta = self._score_full_vocab_with_lora_ids(tripled_ids, lora_id=tripled_loras)
+        if all3.ndim != 2 or all3.shape[0] != 3 * b:
+            raise RuntimeError(
+                f"Unexpected tripled score shape: {tuple(all3.shape)} for batch {b}"
+            )
+        base1 = all3[:b]
+        adapted = all3[b : 2 * b]
+        base2 = all3[2 * b :]
+        return base1, adapted, base2
 
     def generate_text(
         self,

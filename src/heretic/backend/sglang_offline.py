@@ -269,6 +269,8 @@ class SGLangOfflineBackend(HereticBackend):
                 "logprobs_full": True,
                 # Paired base-vs-adapted scoring in one engine call/batch.
                 "score_full_vocab_paired": True,
+                # Paired scoring plus within-call base/base noise measurement.
+                "score_full_vocab_paired_with_noise": True,
                 "compute_vtw": True,
                 "lora_hot_swap": True,
                 "tokenize_chat": True,
@@ -304,10 +306,10 @@ class SGLangOfflineBackend(HereticBackend):
             # which would make log_softmax(logits) incorrect and non-repeatable under chunked/multi-pass prefill.
             #
             # In SGLang, temperature ~ 0 normalizes to `top_k=1` (greedy) while keeping stable execution.
-            # IMPORTANT: request 1 decode token so the prompt-boundary distribution is captured
-            # during decode (see vendored SGLang capture hook). This avoids ambiguity under
-            # chunked/mixed prefill, where prefill passes may yield intermediate logits.
-            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+            #
+            # IMPORTANT: use prefill-only scoring (max_new_tokens=0). The prompt-boundary next-token
+            # distribution exists at the end of EXTEND/prefill. Decode is not guaranteed to run.
+            sampling_params={"max_new_tokens": 0, "temperature": 0.0},
             stream=False,
             return_logprob=False,
             return_next_token_logprobs_full=True,
@@ -536,6 +538,33 @@ class SGLangOfflineBackend(HereticBackend):
         base = both[:b]
         adapted = both[b:]
         return base, adapted
+
+    def score_full_vocab_paired_with_noise(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        adapter: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute (base1, adapted, base2) within one engine call/batch.
+
+        This enables a within-call diagnostic:
+          KL_noise = KL(base1 || base2)
+        which should be ~0 when the backend capture is stable.
+        """
+        if not input_ids_batch:
+            raise ValueError("input_ids_batch must be non-empty")
+        b = len(input_ids_batch)
+        tripled_ids = list(input_ids_batch) + list(input_ids_batch) + list(input_ids_batch)
+        tripled_loras: list[str | None] = ([None] * b) + ([str(adapter)] * b) + ([None] * b)
+        all3 = self._score_full_vocab_with_lora_ids(tripled_ids, lora_id=tripled_loras)
+        if all3.ndim != 2 or all3.shape[0] != 3 * b:
+            raise RuntimeError(
+                f"Unexpected tripled score shape: {tuple(all3.shape)} for batch {b}"
+            )
+        base1 = all3[:b]
+        adapted = all3[b : 2 * b]
+        base2 = all3[2 * b :]
+        return base1, adapted, base2
 
     def generate_text(
         self,
