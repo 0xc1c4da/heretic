@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any
 
 try:
@@ -74,6 +75,17 @@ def main() -> int:
     from heretic.config import BackendType, Settings
     from heretic.model import AbliterationParameters, Model
     from heretic.utils import Prompt
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+
+    def _time_call(label: str, fn):
+        _log(f"[smoke] {label} ...")
+        t0 = time.perf_counter()
+        out = fn()
+        dt = time.perf_counter() - t0
+        _log(f"[smoke] {label} done in {dt:.2f}s")
+        return out, dt
 
     def _finite_or_raise(t: torch.Tensor, *, where: str) -> None:
         if not isinstance(t, torch.Tensor):
@@ -168,7 +180,8 @@ def main() -> int:
     settings.batch_size = 1
     settings.max_batch_size = 1
 
-    model = Model(settings)
+    _log("[smoke] initializing Model / SGLang engine (first-time warmup can take minutes)...")
+    model, _dt_init = _time_call("Model(settings)", lambda: Model(settings))
 
     system = str(getattr(settings, "system_prompt", None) or "You are a helpful assistant.")
     good_prompts = [_mk_prompt(system=system, user="Hello.")]
@@ -223,24 +236,33 @@ def main() -> int:
             failed = True
 
     # Check 0: base score repeat (sanity: scoring itself isn't completely unstable).
-    base0 = _score_full_vocab(model, eval_prompts, adapter=None)
-    base0b = _score_full_vocab(model, eval_prompts, adapter=None)
+    base0, _ = _time_call("score(base) #1", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
+    base0b, _ = _time_call("score(base) #2", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
     kl_00 = _kl_base_vs_other(base_logprobs=base0, other_logprobs=base0b)
     md_00 = float((base0b - base0).abs().max().item())
     _record("base_repeat", kl=kl_00, maxdiff=md_00)
 
     # Check 1: residual-capture warmup drift.
-    good_residuals = model.get_residuals_batched(good_prompts)
-    bad_residuals = model.get_residuals_batched(bad_prompts)
+    good_residuals, _ = _time_call(
+        "capture residuals (good)",
+        lambda: model.get_residuals_batched(good_prompts),
+    )
+    bad_residuals, _ = _time_call(
+        "capture residuals (bad)",
+        lambda: model.get_residuals_batched(bad_prompts),
+    )
 
-    base1 = _score_full_vocab(model, eval_prompts, adapter=None)
+    base1, _ = _time_call("score(base after residuals)", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
     kl_01 = _kl_base_vs_other(base_logprobs=base0, other_logprobs=base1)
     md_01 = float((base1 - base0).abs().max().item())
     _record("after_residual_capture", kl=kl_01, maxdiff=md_01)
 
     # Compute refusal directions from the already-captured residuals (avoid additional backend calls).
-    refusal_directions = _compute_refusal_directions_like_main_from_residuals(
-        settings=settings, good_residuals=good_residuals, bad_residuals=bad_residuals
+    refusal_directions, _ = _time_call(
+        "compute refusal_directions",
+        lambda: _compute_refusal_directions_like_main_from_residuals(
+            settings=settings, good_residuals=good_residuals, bad_residuals=bad_residuals
+        ),
     )
     evidence["adapter"]["refusal_directions_shape"] = tuple(int(x) for x in refusal_directions.shape)
 
@@ -253,10 +275,13 @@ def main() -> int:
     adapter_cases: list[dict[str, Any]] = []
     for w in weights_to_test:
         params = _mk_constant_params(model, weight=float(w))
-        bundle = model.build_lora_adapter_bundle(
-            refusal_directions=refusal_directions,
-            direction_index=direction_index,
-            parameters=params,
+        bundle, _ = _time_call(
+            f"build adapter bundle (weight={w:g})",
+            lambda: model.build_lora_adapter_bundle(
+                refusal_directions=refusal_directions,
+                direction_index=direction_index,
+                parameters=params,
+            ),
         )
         case: dict[str, Any] = {
             "weight": float(w),
@@ -271,21 +296,33 @@ def main() -> int:
         adapter_name = f"smoke_w_{w:g}".replace(".", "_")
         adapter_id: str | None = None
         try:
-            adapter_id = model.backend.load_adapter(
-                name=adapter_name, tensors=bundle.tensors, config=bundle.config_dict
+            adapter_id, _ = _time_call(
+                f"load_adapter(weight={w:g})",
+                lambda: model.backend.load_adapter(
+                    name=adapter_name, tensors=bundle.tensors, config=bundle.config_dict
+                ),
             )
             case["adapter_id"] = adapter_id
-            lp_ad = _score_full_vocab(model, eval_prompts, adapter=adapter_id)
+            lp_ad, _ = _time_call(
+                f"score(adapter weight={w:g})",
+                lambda: _score_full_vocab(model, eval_prompts, adapter=adapter_id),
+            )
             case["kl_base1_adapt"] = _kl_base_vs_other(base_logprobs=base1, other_logprobs=lp_ad)
             case["maxdiff_base1_adapt"] = float((lp_ad - base1).abs().max().item())
         finally:
             try:
-                model.backend.unload_adapter(name=adapter_name)
+                _, _ = _time_call(
+                    f"unload_adapter(weight={w:g})",
+                    lambda: model.backend.unload_adapter(name=adapter_name),
+                )
             except Exception as e:
                 case["unload_error"] = str(e)
 
         # Post-unload baseline: did we return to base1?
-        base_post = _score_full_vocab(model, eval_prompts, adapter=None)
+        base_post, _ = _time_call(
+            f"score(post-unload weight={w:g})",
+            lambda: _score_full_vocab(model, eval_prompts, adapter=None),
+        )
         case["kl_base1_post_unload"] = _kl_base_vs_other(base_logprobs=base1, other_logprobs=base_post)
         case["maxdiff_base1_post_unload"] = float((base_post - base1).abs().max().item())
 
