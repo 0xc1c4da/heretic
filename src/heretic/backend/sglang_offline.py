@@ -719,7 +719,11 @@ class SGLangOfflineBackend(HereticBackend):
             if not isinstance(p, list) or not isinstance(c, list):
                 raise ValueError("prompt/continuation must be list[int]")
             full_ids.append(list(p) + list(c))
-            start_lens.append(int(len(p)))
+            # SGLang's input-logprob slicing uses `origin_input_ids[logprob_start_len+1: ...]`
+            # (see `ScheduleBatch.prepare_for_extend`). Therefore, to receive logprobs starting at
+            # the first continuation token (absolute index = len(prompt)), we must set:
+            #   logprob_start_len = len(prompt) - 1
+            start_lens.append(max(0, int(len(p) - 1)))
 
         # Cache-isolate each row.
         extra_key = [uuid.uuid4().hex for _ in range(b)]
