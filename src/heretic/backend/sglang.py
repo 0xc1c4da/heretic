@@ -5,6 +5,7 @@ import json
 import pickle
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -299,6 +300,202 @@ class SGLangBackend(HereticBackend):
         base2 = all3[2 * b :]
         return base1, adapted, base2
 
+    def score_continuation_nll_paired(
+        self,
+        *,
+        prompt_ids_batch: list[list[int]],
+        continuation_ids_batch: list[list[int]],
+        adapter: str,
+    ) -> tuple[list[float], list[float]]:
+        base1, adapted, _base2 = self.score_continuation_nll_paired_with_noise(
+            prompt_ids_batch=prompt_ids_batch,
+            continuation_ids_batch=continuation_ids_batch,
+            adapter=adapter,
+        )
+        return base1, adapted
+
+    def score_continuation_nll_paired_with_noise(
+        self,
+        *,
+        prompt_ids_batch: list[list[int]],
+        continuation_ids_batch: list[list[int]],
+        adapter: str,
+    ) -> tuple[list[float], list[float], list[float]]:
+        """Paired teacher-forced continuation NLL, within one server /generate call."""
+        if len(prompt_ids_batch) != len(continuation_ids_batch):
+            raise ValueError("prompt_ids_batch and continuation_ids_batch must have same length")
+        b = len(prompt_ids_batch)
+        if b == 0:
+            return ([], [], [])
+        if not adapter:
+            raise ValueError("adapter must be a non-empty string")
+
+        full_ids: list[list[int]] = []
+        start_lens: list[int] = []
+        cont_lens: list[int] = []
+        for p, c in zip(prompt_ids_batch, continuation_ids_batch, strict=True):
+            if len(c) <= 0:
+                raise ValueError("continuation must be non-empty")
+            full_ids.append(list(p) + list(c))
+            start_lens.append(max(0, int(len(p) - 1)))
+            cont_lens.append(int(len(c)))
+
+        tripled_ids = list(full_ids) + list(full_ids) + list(full_ids)
+        tripled_starts = list(start_lens) + list(start_lens) + list(start_lens)
+        tripled_loras: list[str | None] = ([None] * b) + ([str(adapter)] * b) + ([None] * b)
+
+        # Force cache isolation per row.
+        extra_key = [uuid.uuid4().hex for _ in range(3 * b)]
+
+        resp = _post_json(
+            f"{self.base_url}/generate",
+            {
+                "input_ids": tripled_ids,
+                "sampling_params": {"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
+                "stream": False,
+                "return_logprob": True,
+                "logprob_start_len": tripled_starts,
+                "top_logprobs_num": 0,
+                "token_ids_logprob": None,
+                "return_text_in_logprobs": False,
+                "lora_id": tripled_loras,
+                "extra_key": extra_key,
+            },
+            timeout_s=300.0,
+        )
+        outs = resp.data
+        if not isinstance(outs, list) or len(outs) != 3 * b:
+            raise RuntimeError(f"Unexpected /generate logprob response: type={type(outs).__name__} len={getattr(outs,'__len__',lambda:None)()}")
+
+        def _mean_nll(out: dict[str, Any], *, cont_len: int, item: int) -> float:
+            if not isinstance(out, dict):
+                raise RuntimeError(f"Unexpected /generate item: {out}")
+            meta = out.get("meta_info") or {}
+            itlp = meta.get("input_token_logprobs")
+            if not isinstance(itlp, list) or not itlp:
+                raise RuntimeError(
+                    "Missing input_token_logprobs in /generate response meta_info. "
+                    f"keys={list(meta.keys())}"
+                )
+            vals: list[float] = []
+            for tup in itlp:
+                if (
+                    isinstance(tup, (list, tuple))
+                    and len(tup) >= 1
+                    and isinstance(tup[0], (float, int))
+                ):
+                    vals.append(float(tup[0]))
+            if len(vals) < cont_len:
+                raise RuntimeError(
+                    f"input_token_logprobs too short for continuation: got {len(vals)} need {cont_len} (item={item})"
+                )
+            vals_suf = vals[-cont_len:]
+            return float((-torch.tensor(vals_suf, dtype=torch.float32)).mean().item())
+
+        all_mean_nll: list[float] = []
+        for i, out in enumerate(outs):
+            cont_len = cont_lens[i % b]
+            all_mean_nll.append(_mean_nll(out, cont_len=cont_len, item=i))
+
+        base1 = all_mean_nll[:b]
+        adapted = all_mean_nll[b : 2 * b]
+        base2 = all_mean_nll[2 * b :]
+        return base1, adapted, base2
+
+    def score_continuation_topk_paired_with_noise(
+        self,
+        *,
+        prompt_ids_batch: list[list[int]],
+        continuation_ids_batch: list[list[int]],
+        adapter: str,
+        top_k: int,
+    ) -> tuple[list[Any], list[Any], list[Any]]:
+        """Paired top-k logprob distributions for continuation positions (within one /generate call)."""
+        if len(prompt_ids_batch) != len(continuation_ids_batch):
+            raise ValueError("prompt_ids_batch and continuation_ids_batch must have same length")
+        b = len(prompt_ids_batch)
+        if b == 0:
+            return ([], [], [])
+        if not adapter:
+            raise ValueError("adapter must be a non-empty string")
+        if int(top_k) <= 0:
+            raise ValueError("top_k must be positive")
+
+        full_ids: list[list[int]] = []
+        start_lens: list[int] = []
+        cont_lens: list[int] = []
+        for p, c in zip(prompt_ids_batch, continuation_ids_batch, strict=True):
+            if len(c) <= 0:
+                raise ValueError("continuation must be non-empty")
+            full_ids.append(list(p) + list(c))
+            start_lens.append(max(0, int(len(p) - 1)))
+            cont_lens.append(int(len(c)))
+
+        tripled_ids = list(full_ids) + list(full_ids) + list(full_ids)
+        tripled_starts = list(start_lens) + list(start_lens) + list(start_lens)
+        tripled_loras: list[str | None] = ([None] * b) + ([str(adapter)] * b) + ([None] * b)
+        extra_key = [uuid.uuid4().hex for _ in range(3 * b)]
+
+        resp = _post_json(
+            f"{self.base_url}/generate",
+            {
+                "input_ids": tripled_ids,
+                "sampling_params": {"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
+                "stream": False,
+                "return_logprob": True,
+                "logprob_start_len": tripled_starts,
+                "top_logprobs_num": int(top_k),
+                "token_ids_logprob": None,
+                "return_text_in_logprobs": False,
+                "lora_id": tripled_loras,
+                "extra_key": extra_key,
+            },
+            timeout_s=300.0,
+        )
+        outs = resp.data
+        if not isinstance(outs, list) or len(outs) != 3 * b:
+            raise RuntimeError(f"Unexpected /generate topk response: {type(outs).__name__}")
+
+        def _parse_topk(out: dict[str, Any], *, cont_len: int, item: int) -> list[dict[int, float]]:
+            if not isinstance(out, dict):
+                raise RuntimeError(f"Unexpected /generate item: {out}")
+            meta = out.get("meta_info") or {}
+            xtop = meta.get("input_top_logprobs")
+            if not isinstance(xtop, list) or not xtop:
+                raise RuntimeError(
+                    "Missing input_top_logprobs in /generate response meta_info. "
+                    f"keys={list(meta.keys())}"
+                )
+            pos_dicts: list[dict[int, float]] = []
+            for pos in xtop:
+                if not isinstance(pos, list):
+                    continue
+                d: dict[int, float] = {}
+                for tup in pos:
+                    if (
+                        isinstance(tup, (list, tuple))
+                        and len(tup) >= 2
+                        and isinstance(tup[0], (float, int))
+                        and isinstance(tup[1], int)
+                    ):
+                        d[int(tup[1])] = float(tup[0])
+                pos_dicts.append(d)
+            if len(pos_dicts) < cont_len:
+                raise RuntimeError(
+                    f"input_top_logprobs too short for continuation: got {len(pos_dicts)} need {cont_len} (item={item})"
+                )
+            return pos_dicts[-cont_len:]
+
+        all_topk: list[list[dict[int, float]]] = []
+        for i, out in enumerate(outs):
+            cont_len = cont_lens[i % b]
+            all_topk.append(_parse_topk(out, cont_len=cont_len, item=i))
+
+        base1 = all_topk[:b]
+        adapted = all_topk[b : 2 * b]
+        base2 = all_topk[2 * b :]
+        return base1, adapted, base2
+
     def generate_text(
         self,
         input_ids_batch: list[list[int]],
@@ -339,6 +536,50 @@ class SGLangBackend(HereticBackend):
                 t = ""
             texts.append(t)
         return texts
+
+    def generate_token_ids(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        max_new_tokens: int,
+        adapter: str | None = None,
+        temperature: float = 0.0,
+        top_k: int | None = 1,
+    ) -> list[list[int]]:
+        """Generate token IDs (no detokenization) via /generate.
+
+        This is used to cache base continuations for paired damage metrics.
+        """
+        sp: dict[str, Any] = {"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)}
+        if top_k is not None:
+            sp["top_k"] = int(top_k)
+        extra_key = [uuid.uuid4().hex for _ in range(len(input_ids_batch))]
+        resp = _post_json(
+            f"{self.base_url}/generate",
+            {
+                "input_ids": input_ids_batch,
+                "sampling_params": sp,
+                "stream": False,
+                "return_logprob": False,
+                "lora_id": adapter,
+                "extra_key": extra_key,
+            },
+            timeout_s=300.0,
+        )
+        outputs = resp.data
+        if not isinstance(outputs, list):
+            raise RuntimeError(f"Unexpected /generate response: {outputs}")
+        outs: list[list[int]] = []
+        for out in outputs:
+            if not isinstance(out, dict):
+                raise RuntimeError(f"Unexpected /generate item: {out}")
+            ids = out.get("output_ids")
+            if not isinstance(ids, list) or not all(isinstance(x, int) for x in ids):
+                raise RuntimeError(
+                    f"Unexpected /generate token-id schema: keys={list(out.keys())}"
+                )
+            outs.append(list(ids))
+        return outs
 
     def module_map(
         self,

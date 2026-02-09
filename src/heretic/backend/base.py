@@ -142,6 +142,46 @@ class HereticBackend(ABC):
         base2 = self.score_full_vocab(input_ids_batch, adapter=None)
         return base1, adapted, base2
 
+    # ---- Damage-metric (capability preservation) helpers ----
+    #
+    # These are designed to be robust on backends where full-vocab KL is unstable:
+    # - teacher-forced continuation NLL (paired within-call)
+    # - top-k distribution drift metrics (paired within-call)
+
+    def score_continuation_nll_paired(
+        self,
+        *,
+        prompt_ids_batch: list[list[int]],
+        continuation_ids_batch: list[list[int]],
+        adapter: str,
+    ) -> tuple[list[float], list[float]]:
+        """Return (base_nlls, adapted_nlls) for cached continuations."""
+        raise NotImplementedError
+
+    def score_continuation_nll_paired_with_noise(
+        self,
+        *,
+        prompt_ids_batch: list[list[int]],
+        continuation_ids_batch: list[list[int]],
+        adapter: str,
+    ) -> tuple[list[float], list[float], list[float]]:
+        """Return (base1_nlls, adapted_nlls, base2_nlls) within one call/batch."""
+        raise NotImplementedError
+
+    def score_continuation_topk_paired_with_noise(
+        self,
+        *,
+        prompt_ids_batch: list[list[int]],
+        continuation_ids_batch: list[list[int]],
+        adapter: str,
+        top_k: int,
+    ) -> tuple[list[Any], list[Any], list[Any]]:
+        """Return (base1_topk, adapted_topk, base2_topk) for continuation positions.
+
+        Each element is backend-defined but should be aligned to (batch, positions).
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def generate_text(
         self,
