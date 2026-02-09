@@ -660,6 +660,123 @@ class SGLangOfflineBackend(HereticBackend):
             texts.append(t)
         return texts
 
+    def generate_token_ids(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        max_new_tokens: int,
+        adapter: str | None = None,
+        temperature: float = 0.0,
+        top_k: int | None = 1,
+    ) -> list[list[int]]:
+        """Generate token IDs (no detokenization), SGLang offline only."""
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        sp: dict[str, Any] = {"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)}
+        if top_k is not None:
+            sp["top_k"] = int(top_k)
+        obj = GenerateReqInput(
+            input_ids=input_ids_batch,
+            sampling_params=sp,
+            stream=False,
+            return_logprob=False,
+            lora_id=adapter,
+        )
+        gen = self._generate_req(obj)
+        outs: list[list[int]] = []
+        for out in gen.outputs:
+            ids = out.get("output_ids")
+            if not isinstance(ids, list) or not all(isinstance(x, int) for x in ids):
+                raise RuntimeError(f"Unexpected offline generate token-id schema: keys={list(out.keys())}")
+            outs.append(list(ids))
+        return outs
+
+    def score_sequence_delta_nll(
+        self,
+        *,
+        prompt_ids_batch: list[list[int]],
+        continuation_ids_batch: list[list[int]],
+        adapter: str | None,
+    ) -> list[float]:
+        """Teacher-forced ΔNLL proxy on cached base continuations.
+
+        For each item i, we score the provided continuation token IDs under the model
+        conditioned on prompt_ids + continuation_ids[:t-1]. This uses SGLang's standard
+        return_logprob path (input token logprobs).
+        """
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        if len(prompt_ids_batch) != len(continuation_ids_batch):
+            raise ValueError("prompt_ids_batch and continuation_ids_batch must have same length")
+        b = len(prompt_ids_batch)
+        if b == 0:
+            return []
+
+        # Build full sequences (prompt + frozen continuation).
+        full_ids: list[list[int]] = []
+        start_lens: list[int] = []
+        for p, c in zip(prompt_ids_batch, continuation_ids_batch, strict=True):
+            if not isinstance(p, list) or not isinstance(c, list):
+                raise ValueError("prompt/continuation must be list[int]")
+            full_ids.append(list(p) + list(c))
+            start_lens.append(int(len(p)))
+
+        # Cache-isolate each row.
+        extra_key = [uuid.uuid4().hex for _ in range(b)]
+
+        obj = GenerateReqInput(
+            input_ids=full_ids,
+            sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
+            stream=False,
+            return_logprob=True,
+            logprob_start_len=start_lens,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            return_text_in_logprobs=False,
+            lora_id=adapter,
+            extra_key=extra_key,
+        )
+        gen = self._generate_req(obj)
+
+        # Extract per-sequence continuation logprobs.
+        out: list[float] = []
+        for i, (resp, cont) in enumerate(zip(gen.outputs, continuation_ids_batch, strict=True)):
+            meta = resp.get("meta_info") or {}
+            itlp = meta.get("input_token_logprobs")
+            if not isinstance(itlp, list) or not itlp:
+                raise RuntimeError(
+                    "Missing input_token_logprobs in offline response meta_info. "
+                    f"keys={list(meta.keys())}"
+                )
+            # SGLang stores list of (logprob, token_id, text_or_none).
+            vals: list[float] = []
+            tids: list[int] = []
+            for tup in itlp:
+                if (
+                    isinstance(tup, (list, tuple))
+                    and len(tup) >= 2
+                    and isinstance(tup[0], (float, int))
+                    and isinstance(tup[1], int)
+                ):
+                    vals.append(float(tup[0]))
+                    tids.append(int(tup[1]))
+            if len(vals) < len(cont):
+                raise RuntimeError(
+                    f"input_token_logprobs too short for continuation: got {len(vals)} need {len(cont)}"
+                )
+            # Take a suffix and verify it matches the continuation token IDs.
+            vals_suf = vals[-len(cont) :]
+            tids_suf = tids[-len(cont) :]
+            if tids_suf != list(cont):
+                raise RuntimeError(
+                    "Continuation token-id mismatch in input_token_logprobs suffix. "
+                    f"item={i} suffix_match={tids_suf[:8]}... expected={list(cont)[:8]}..."
+                )
+            # Return mean NLL (positive scalar) for stability across lengths.
+            mean_nll = float((-torch.tensor(vals_suf, dtype=torch.float32)).mean().item())
+            out.append(mean_nll)
+        return out
+
     def capture_residuals(
         self,
         input_ids_batch: list[list[int]],

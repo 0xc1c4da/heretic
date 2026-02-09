@@ -6,6 +6,7 @@ import math
 import torch.nn.functional as F
 import torch
 from torch import Tensor
+from typing import Any
 
 from .config import Settings
 from .model import Model
@@ -23,6 +24,9 @@ class Evaluator:
     bad_prompts: list[Prompt]
     base_logprobs: Tensor
     base_refusals: int
+    _delta_nll_prompt_ids: list[list[int]] | None = None
+    _delta_nll_cont_ids: list[list[int]] | None = None
+    _delta_nll_base_nlls: list[float] | None = None
 
     def __init__(self, settings: Settings, model: Model):
         self.settings = settings
@@ -35,9 +39,55 @@ class Evaluator:
         self.good_prompts = load_prompts(settings, settings.good_evaluation_prompts)
         print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded")
 
-        print("* Obtaining first-token probability distributions...")
-        self.base_logprobs = self._get_first_token_logprobs(self.good_prompts)
-        self._validate_logprobs_tensor(self.base_logprobs, where="base")
+        if str(getattr(settings, "damage_metric", "kl")) == "delta_nll":
+            # Proxy A: teacher-forced NLL on cached base continuations.
+            #
+            # We avoid full-vocab scoring entirely for baseline construction.
+            cont_len = int(getattr(settings, "delta_nll_continuation_tokens", 32))
+            if cont_len <= 0:
+                raise RuntimeError("delta_nll_continuation_tokens must be > 0")
+
+            print("* Caching base continuations for ΔNLL damage metric...")
+            prompt_ids = self.model.encode_prompts(self.good_prompts)
+            backend = self.model.backend
+            if not hasattr(backend, "generate_token_ids"):
+                raise RuntimeError(
+                    "Backend does not support generate_token_ids required for damage_metric='delta_nll'."
+                )
+            gen_ids = getattr(backend, "generate_token_ids")
+            cont_ids = gen_ids(
+                prompt_ids,
+                max_new_tokens=cont_len,
+                adapter=None,
+                temperature=0.0,
+                top_k=1,
+            )
+            if not isinstance(cont_ids, list) or len(cont_ids) != len(prompt_ids):
+                raise RuntimeError("generate_token_ids returned unexpected batch shape")
+            self._delta_nll_prompt_ids = prompt_ids
+            self._delta_nll_cont_ids = cont_ids
+
+            if not hasattr(backend, "score_sequence_delta_nll"):
+                raise RuntimeError(
+                    "Backend does not support score_sequence_delta_nll required for damage_metric='delta_nll'."
+                )
+            score_nll = getattr(backend, "score_sequence_delta_nll")
+            base_nlls = score_nll(
+                prompt_ids_batch=prompt_ids,
+                continuation_ids_batch=cont_ids,
+                adapter=None,
+            )
+            if not isinstance(base_nlls, list) or len(base_nlls) != len(prompt_ids):
+                raise RuntimeError("score_sequence_delta_nll returned unexpected batch shape")
+            self._delta_nll_base_nlls = [float(x) for x in base_nlls]
+            base_med = float(torch.tensor(self._delta_nll_base_nlls).median().item())
+            print(f"* Base continuation NLL (median): [bold]{base_med:.6g}[/]")
+            # Dummy placeholder so type expectations don't break; never used under delta_nll.
+            self.base_logprobs = torch.empty((0, 0), dtype=torch.float32)
+        else:
+            print("* Obtaining first-token probability distributions...")
+            self.base_logprobs = self._get_first_token_logprobs(self.good_prompts)
+            self._validate_logprobs_tensor(self.base_logprobs, where="base")
 
         print()
         print(
@@ -124,6 +174,54 @@ class Evaluator:
         return refusal_count
 
     def get_score(self, *, adapter: str | None = None) -> tuple[tuple[float, float], float, int]:
+        damage_metric = str(getattr(self.settings, "damage_metric", "kl"))
+        if damage_metric == "delta_nll":
+            # Under delta_nll, adapter=None implies "base", so damage=0 by definition.
+            if adapter is None:
+                delta_nll = 0.0
+                print("  * damage_metric=delta_nll; adapter=None implies damage=0 by definition.")
+            else:
+                backend = self.model.backend
+                if (
+                    self._delta_nll_prompt_ids is None
+                    or self._delta_nll_cont_ids is None
+                    or self._delta_nll_base_nlls is None
+                ):
+                    raise RuntimeError("ΔNLL baseline not initialized.")
+                score_nll = getattr(backend, "score_sequence_delta_nll", None)
+                if score_nll is None:
+                    raise RuntimeError("Backend missing score_sequence_delta_nll.")
+                nlls = score_nll(
+                    prompt_ids_batch=self._delta_nll_prompt_ids,
+                    continuation_ids_batch=self._delta_nll_cont_ids,
+                    adapter=str(adapter),
+                )
+                med_base = float(torch.tensor(self._delta_nll_base_nlls).median().item())
+                med_adapt = float(torch.tensor([float(x) for x in nlls]).median().item())
+                delta_nll = float(med_adapt - med_base)
+                print(f"  * ΔNLL damage (median): [bold]{delta_nll:.6g}[/]")
+
+            # Reuse existing scaling/target knobs for now (user can recalibrate).
+            kl_divergence = float(delta_nll)
+            if not math.isfinite(float(kl_divergence)):
+                raise NonFiniteLogprobsError(f"Non-finite ΔNLL damage: {kl_divergence!r}")
+
+            print("  * Counting model refusals...")
+            refusals = self.count_refusals(adapter=adapter)
+            print(f"  * Refusals: [bold]{refusals}[/]/{len(self.bad_prompts)}")
+
+            kl_divergence_scale = self.settings.kl_divergence_scale
+            kl_divergence_target = self.settings.kl_divergence_target
+            refusals_score = refusals / self.base_refusals
+
+            if kl_divergence >= kl_divergence_target:
+                kld_score = kl_divergence / kl_divergence_scale
+            else:
+                kld_score = refusals_score * kl_divergence_target / kl_divergence_scale
+
+            score = (kld_score, refusals_score)
+            return score, kl_divergence, refusals
+
         # For backends with cross-call drift (notably some SGLang stacks), KL is only meaningful
         # if base and adapted distributions are captured within the same backend call/batch.
         supports = self.model.backend.get_metadata().supports

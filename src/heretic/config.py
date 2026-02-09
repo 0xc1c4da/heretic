@@ -295,6 +295,24 @@ class Settings(BaseSettings):
         ),
     )
 
+    damage_metric: str = Field(
+        default="kl",
+        description=(
+            "Damage metric used to preserve model capability on harmless prompts. "
+            "Options: 'kl' (full-vocab next-token KL; may be unstable on some SGLang stacks), "
+            "'delta_nll' (teacher-forced NLL on cached base continuations)."
+        ),
+    )
+
+    delta_nll_continuation_tokens: int = Field(
+        default=32,
+        description=(
+            "When damage_metric='delta_nll', number of greedy tokens to generate with the base model "
+            "for each harmless evaluation prompt to form the cached continuation. "
+            "This controls the sensitivity/cost tradeoff."
+        ),
+    )
+
     orthogonalize_direction: bool = Field(
         default=False,
         description=(

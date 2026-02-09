@@ -65,6 +65,12 @@ kl_divergence_scale = 1.0
 kl_divergence_target = 0.01
 winsorization_quantile = 0.995
 
+# Damage metric
+# For this SGLang offline stack, full-vocab KL can be unstable even within-call.
+# Use the ΔNLL proxy (teacher-forced NLL on cached base continuations).
+damage_metric = "delta_nll"
+delta_nll_continuation_tokens = 32
+
 # Range for max_weight parameter during optimization.
 # Higher max values (e.g., 2.0) may be beneficial with row_normalization enabled.
 max_weight_min = 0.8
