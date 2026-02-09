@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, cast
 
 import torch
+import math
 
 from ..utils import Prompt, sha256_token_ids
 from .base import HereticBackend, ModuleRef
@@ -48,7 +49,177 @@ class StartupValidationReport:
     residual_mapping_ok: bool
     lora_sanity_ok: bool
     compute_vtw_ok: bool
+    damage_metric_ok: bool
     notes: list[str]
+
+
+def _js_other_bucket(p_log: dict[int, float], q_log: dict[int, float]) -> float:
+    """Top-k JS divergence with an OTHER bucket (prob-mass outside union top-k)."""
+    keys = set(p_log.keys()) | set(q_log.keys())
+
+    def _collect(d: dict[int, float]) -> tuple[dict[int, float], float]:
+        probs: dict[int, float] = {}
+        s = 0.0
+        for k in keys:
+            lp = d.get(k)
+            if lp is None:
+                continue
+            pk = math.exp(float(lp))
+            if pk <= 0.0:
+                continue
+            probs[int(k)] = pk
+            s += pk
+        other = max(0.0, 1.0 - s)
+        return probs, other
+
+    p_probs, p_other = _collect(p_log)
+    q_probs, q_other = _collect(q_log)
+
+    def _kl(a: dict[int, float], a_other: float, b: dict[int, float], b_other: float) -> float:
+        out = 0.0
+        for k, ap in a.items():
+            if ap <= 0.0:
+                continue
+            bp = b.get(k, 0.0)
+            if bp <= 0.0:
+                return float("inf")
+            out += ap * (math.log(ap) - math.log(bp))
+        if a_other > 0.0:
+            if b_other <= 0.0:
+                return float("inf")
+            out += a_other * (math.log(a_other) - math.log(b_other))
+        return out
+
+    m: dict[int, float] = {}
+    for k in keys:
+        m[k] = 0.5 * p_probs.get(k, 0.0) + 0.5 * q_probs.get(k, 0.0)
+    m_other = 0.5 * p_other + 0.5 * q_other
+
+    kl_pm = _kl(p_probs, p_other, m, m_other)
+    kl_qm = _kl(q_probs, q_other, m, m_other)
+    if not math.isfinite(kl_pm) or not math.isfinite(kl_qm):
+        return float("inf")
+    return 0.5 * kl_pm + 0.5 * kl_qm
+
+
+def validate_damage_metric_repeatability(
+    backend: HereticBackend,
+    *,
+    input_ids_batch: list[list[int]],
+    damage_metric: str,
+    damage_noise_threshold: float,
+    delta_nll_continuation_tokens: int,
+    topk_js_k: int,
+    topk_js_positions: int,
+    build_synthetic_adapter: Callable[[], tuple[dict[str, torch.Tensor], dict[str, Any]]] | None,
+) -> None:
+    """Validate the startup repeatability contract for the configured damage metric.
+
+    Contract:
+    - Build a synthetic *no-op* adapter (A=B=0) and load it.
+    - Measure paired-within-call (base1, adapted, base2) on cached base continuations.
+    - Require within-call noise <= threshold.
+    - Require no-op adapter damage to be commensurate with noise (i.e. not a large systematic shift).
+    """
+    if damage_metric not in ("paired_delta_nll", "topk_js"):
+        raise BackendValidationError(f"Unknown damage_metric={damage_metric!r} for validation.")
+
+    if not input_ids_batch:
+        raise BackendValidationError("Damage validation requires non-empty input_ids_batch.")
+
+    gen_ids = getattr(backend, "generate_token_ids", None)
+    if gen_ids is None:
+        raise BackendValidationError("Backend missing generate_token_ids required for damage validation.")
+
+    cont_len = int(delta_nll_continuation_tokens)
+    if cont_len <= 0:
+        raise BackendValidationError("delta_nll_continuation_tokens must be > 0 for damage validation.")
+
+    cont_ids = gen_ids(  # type: ignore[misc]
+        input_ids_batch,
+        max_new_tokens=cont_len,
+        adapter=None,
+        temperature=0.0,
+        top_k=1,
+    )
+    if not isinstance(cont_ids, list) or len(cont_ids) != len(input_ids_batch):
+        raise BackendValidationError("generate_token_ids returned unexpected batch shape.")
+
+    if build_synthetic_adapter is None:
+        raise BackendValidationError("Damage validation requires build_synthetic_adapter (LoRA hot-swap supported).")
+
+    tensors, cfg = build_synthetic_adapter()
+    load = getattr(backend, "load_adapter", None)
+    unload = getattr(backend, "unload_adapter", None)
+    if load is None or unload is None:
+        raise BackendValidationError("Backend missing load_adapter/unload_adapter required for damage validation.")
+
+    adapter_name = "startup_validation_noop"
+    adapter_id = load(name=adapter_name, tensors=tensors, config=cfg)  # type: ignore[misc]
+    try:
+        if damage_metric == "paired_delta_nll":
+            scorer = getattr(backend, "score_continuation_nll_paired_with_noise", None)
+            if scorer is None:
+                raise BackendValidationError("Backend missing score_continuation_nll_paired_with_noise.")
+            base1, adapted, base2 = scorer(  # type: ignore[misc]
+                prompt_ids_batch=input_ids_batch,
+                continuation_ids_batch=cont_ids,
+                adapter=str(adapter_id),
+            )
+            if len(base1) != len(adapted) or len(base1) != len(base2):
+                raise BackendValidationError("paired_delta_nll returned unexpected batch shape.")
+            deltas = [float(a) - float(b) for a, b in zip(adapted, base1, strict=True)]
+            noises = [abs(float(b2) - float(b1)) for b2, b1 in zip(base2, base1, strict=True)]
+            damage = float(sum(deltas) / max(1, len(deltas)))
+            noise = float(sum(noises) / max(1, len(noises)))
+        else:
+            scorer = getattr(backend, "score_continuation_topk_paired_with_noise", None)
+            if scorer is None:
+                raise BackendValidationError("Backend missing score_continuation_topk_paired_with_noise.")
+            b1_topk, ad_topk, b2_topk = scorer(  # type: ignore[misc]
+                prompt_ids_batch=input_ids_batch,
+                continuation_ids_batch=cont_ids,
+                adapter=str(adapter_id),
+                top_k=int(topk_js_k),
+            )
+            if not (isinstance(b1_topk, list) and isinstance(ad_topk, list) and isinstance(b2_topk, list)):
+                raise BackendValidationError("topk_js returned unexpected schema.")
+            # Validate only the first item for startup sanity to keep cost low.
+            b1_pos = b1_topk[0]
+            ad_pos = ad_topk[0]
+            b2_pos = b2_topk[0]
+            if not (isinstance(b1_pos, list) and isinstance(ad_pos, list) and isinstance(b2_pos, list)):
+                raise BackendValidationError("topk_js returned unexpected per-item schema.")
+            npos = min(int(topk_js_positions), len(b1_pos), len(ad_pos), len(b2_pos))
+            if npos <= 0:
+                raise BackendValidationError("topk_js returned no continuation positions.")
+            dmg = 0.0
+            noi = 0.0
+            for t in range(npos):
+                dmg += float(_js_other_bucket(b1_pos[t], ad_pos[t]))
+                noi += float(_js_other_bucket(b1_pos[t], b2_pos[t]))
+            damage = float(dmg / npos)
+            noise = float(noi / npos)
+
+        if not math.isfinite(float(damage)) or not math.isfinite(float(noise)):
+            raise BackendValidationError(f"Non-finite damage/noise in validation: damage={damage} noise={noise}")
+
+        if noise > float(damage_noise_threshold):
+            raise BackendValidationError(
+                f"Damage metric noise too high: {noise:.6g} > {damage_noise_threshold:.6g} (metric={damage_metric})"
+            )
+
+        # No-op adapter should not introduce damage much larger than measurement noise.
+        allowed = max(float(damage_noise_threshold), 3.0 * float(noise))
+        if abs(float(damage)) > allowed:
+            raise BackendValidationError(
+                f"No-op adapter damage too large vs noise: |{damage:.6g}| > {allowed:.6g} (noise={noise:.6g}, metric={damage_metric})"
+            )
+    finally:
+        try:
+            unload(name=adapter_name)  # type: ignore[misc]
+        except Exception:
+            pass
 
 
 def _take_prompts(prompts: list[Prompt], *, min_n: int, max_n: int) -> list[Prompt]:
@@ -409,6 +580,7 @@ def run_startup_validations(
     backend: HereticBackend,
     prompts: list[Prompt],
     encode_prompts: Callable[[list[Prompt]], list[list[int]]],
+    settings: Any | None = None,
     baseline_residuals_fn: Callable[[list[Prompt]], torch.Tensor] | None = None,
     build_synthetic_adapter: Callable[[], tuple[dict[str, torch.Tensor], dict[str, Any]]] | None = None,
     vtw_case: tuple[torch.Tensor, ModuleRef, torch.Tensor] | None = None,
@@ -429,6 +601,7 @@ def run_startup_validations(
             residual_mapping_ok=True,
             lora_sanity_ok=True,
             compute_vtw_ok=True,
+            damage_metric_ok=True,
             notes=["No prompts available for validation; skipped."],
         )
 
@@ -504,6 +677,7 @@ def run_startup_validations(
     residual_ok = True
     lora_ok = True
     vtw_ok = True
+    damage_ok = True
 
     # 1) Prompt equivalence
     try:
@@ -629,23 +803,26 @@ def run_startup_validations(
         vtw_ok = False
         notes.append(f"compute_vtw failed: {e}")
 
-    # 5) full-vocab scoring (KL prerequisite)
+    # 5) Damage metric repeatability (startup contract)
     try:
-        validate_full_vocab_score(backend, input_ids_batch=input_ids_batch[: min(4, len(input_ids_batch))])
-        # Repeatability check: if base vs base is unstable, KL-based optimization is meaningless.
-        validate_full_vocab_score_repeatability(
+        damage_metric = str(getattr(settings, "damage_metric", "paired_delta_nll") if settings is not None else "paired_delta_nll")
+        validate_damage_metric_repeatability(
             backend,
             input_ids_batch=input_ids_batch[:1],
-            kl_threshold=1e-2,
+            damage_metric=damage_metric,
+            damage_noise_threshold=float(getattr(settings, "damage_noise_threshold", 0.05) if settings is not None else 0.05),
+            delta_nll_continuation_tokens=int(getattr(settings, "delta_nll_continuation_tokens", 32) if settings is not None else 32),
+            topk_js_k=int(getattr(settings, "topk_js_k", 128) if settings is not None else 128),
+            topk_js_positions=int(getattr(settings, "topk_js_positions", 32) if settings is not None else 32),
+            build_synthetic_adapter=build_synthetic_adapter,
         )
     except Exception as e:
-        notes.append(f"full_vocab_score failed: {e}")
-        # Treat as a hard failure in strict mode.
-        prompt_ok = False
+        damage_ok = False
+        notes.append(f"damage_metric failed: {e}")
 
     # Allow disabling failures in emergency debug sessions.
     if os.environ.get("HERETIC_VALIDATION_STRICT", "1") not in ("0", "false", "False"):
-        if not (prompt_ok and residual_ok and lora_ok and vtw_ok):
+        if not (prompt_ok and residual_ok and lora_ok and vtw_ok and damage_ok):
             raise BackendValidationError("; ".join(notes) if notes else "Backend validation failed.")
 
     return StartupValidationReport(
@@ -653,6 +830,7 @@ def run_startup_validations(
         residual_mapping_ok=residual_ok,
         lora_sanity_ok=lora_ok,
         compute_vtw_ok=vtw_ok,
+        damage_metric_ok=damage_ok,
         notes=notes,
     )
 
