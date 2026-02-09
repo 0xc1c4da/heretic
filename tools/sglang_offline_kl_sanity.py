@@ -265,9 +265,10 @@ def _run_adapter_case(
     adapter_id: str | None = None
     try:
         adapter_id = backend.load_adapter(name=adapter_name, tensors=tensors, config=config_dict)
-        lp_ad = backend.score(input_ids_batch, adapter=adapter_id).logprobs_full
-
         out: dict[str, Any] = {"adapter_id": adapter_id}
+
+        # Cross-call diagnostic (may be meaningless under drift).
+        lp_ad = backend.score(input_ids_batch, adapter=adapter_id).logprobs_full
 
         if not bool(torch.isfinite(lp_ad).all().item()):
             out["ok"] = False
@@ -278,6 +279,15 @@ def _run_adapter_case(
         kl = _kl_base_vs_other(base_logprobs=base_logprobs, other_logprobs=lp_ad)
         max_diff = float((lp_ad - base_logprobs).abs().max().item())
         out.update({"ok": True, "kl": float(kl), "max_diff": float(max_diff)})
+
+        # Within-call paired diagnostic (architecturally meaningful on drift-y backends).
+        supports = backend.get_metadata().supports
+        if bool(supports.get("score_full_vocab_paired", False)) and adapter_id is not None:
+            base_p, adapted_p = backend.score_full_vocab_paired(input_ids_batch, adapter=str(adapter_id))
+            if bool(torch.isfinite(base_p).all().item()) and bool(torch.isfinite(adapted_p).all().item()):
+                kl_p = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=adapted_p)
+                max_diff_p = float((adapted_p - base_p).abs().max().item())
+                out.update({"kl_paired": float(kl_p), "max_diff_paired": float(max_diff_p)})
         return out
     finally:
         # Always attempt unload; don't mask the real failure if unload fails.
@@ -428,6 +438,23 @@ def main() -> int:
         worst_kl = 0.0
     print(f"KL(base||base): {worst_kl:.8f}")
     print(f"max|diff|     : {worst_maxdiff:.8e}")
+    # Within-call repeatability (single request, duplicated batch).
+    supports = backend.get_metadata().supports
+    if bool(supports.get("score_full_vocab_paired", False)):
+        try:
+            doubled = list(input_ids_batch) + list(input_ids_batch)
+            lp2 = backend.score(doubled, adapter=None).logprobs_full
+            if lp2 is not None and lp2.ndim == 2 and lp2.shape[0] == 2 * len(input_ids_batch):
+                lp_a = lp2[: len(input_ids_batch)]
+                lp_b = lp2[len(input_ids_batch) :]
+                kl_within = _kl_base_vs_other(base_logprobs=lp_a, other_logprobs=lp_b)
+                md_within = float((lp_b - lp_a).abs().max().item())
+                if kl_within < 0 and abs(kl_within) < 1e-6:
+                    kl_within = 0.0
+                print(f"KL(base||base) within-call: {float(kl_within):.8f}")
+                print(f"max|diff| within-call     : {float(md_within):.8e}")
+        except Exception as e:
+            print(f"[warn] within-call repeatability check failed: {e}")
 
     print("\n== KL(base || zero-adapter) correctness check ==")
     meta = backend.get_metadata()
@@ -477,6 +504,9 @@ def main() -> int:
             raise RuntimeError("Adapted logprobs contain non-finite values; cannot compute KL reliably.")
         print(f"KL(base||case): {float(result['kl']):.8f}")
         print(f"max|diff|     : {float(result['max_diff']):.8e}")
+        if "kl_paired" in result:
+            print(f"KL(base||case) within-call: {float(result['kl_paired']):.8f}")
+            print(f"max|diff| within-call     : {float(result['max_diff_paired']):.8e}")
 
         # Post-unload base parity check: ensure returning to adapter=None doesn't drift badly.
         lp_post = backend.score(input_ids_batch, adapter=None).logprobs_full
