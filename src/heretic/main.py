@@ -528,6 +528,11 @@ def run():
 
     assert refusal_directions is not None
 
+    # For SGLang backends, scoring can drift across heavy warmup phases (e.g. residual capture).
+    # Ensure the KL baseline is captured in the same backend state as trials.
+    if settings.backend in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
+        evaluator.refresh_baseline()
+
     trial_index = 0
     start_index = 0
     start_time = time.perf_counter()

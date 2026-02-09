@@ -115,6 +115,38 @@ def validate_full_vocab_score(
         )
 
 
+def validate_full_vocab_score_repeatability(
+    backend: HereticBackend,
+    *,
+    input_ids_batch: list[list[int]],
+    kl_threshold: float = 1e-2,
+) -> None:
+    """Ensure full-vocab score is repeatable for identical inputs.
+
+    Heretic's KL objective assumes (base vs adapted) is meaningful. If the backend's full-vocab
+    scoring is not self-consistent (base vs base has large KL), optimization becomes nonsense.
+    """
+    import torch.nn.functional as F
+
+    r1 = backend.score(input_ids_batch)
+    r2 = backend.score(input_ids_batch)
+    t1 = r1.logprobs_full
+    t2 = r2.logprobs_full
+    if t1 is None or t2 is None:
+        raise BackendValidationError("Backend score returned no logprobs_full (required for KL).")
+    if tuple(t1.shape) != tuple(t2.shape):
+        raise BackendValidationError(f"Repeatability shape mismatch: {tuple(t1.shape)} != {tuple(t2.shape)}")
+    # KL(base||base2) using Heretic evaluator semantics: input=t2, target=t1, log_target=True
+    kl = float(F.kl_div(t2, t1, reduction="batchmean", log_target=True).item())
+    if not (kl == kl):  # NaN check without importing math
+        raise BackendValidationError("Non-finite KL in repeatability check (NaN).")
+    if kl > float(kl_threshold):
+        raise BackendValidationError(
+            f"Backend full-vocab scoring is not repeatable: KL(base||base2)={kl:.6g} > {kl_threshold}. "
+            "This often indicates multi-pass prefill capture selecting inconsistent steps."
+        )
+
+
 def validate_prompt_equivalence(
     backend: HereticBackend,
     *,
@@ -557,6 +589,12 @@ def run_startup_validations(
     # 5) full-vocab scoring (KL prerequisite)
     try:
         validate_full_vocab_score(backend, input_ids_batch=input_ids_batch[: min(4, len(input_ids_batch))])
+        # Repeatability check: if base vs base is unstable, KL-based optimization is meaningless.
+        validate_full_vocab_score_repeatability(
+            backend,
+            input_ids_batch=input_ids_batch[:1],
+            kl_threshold=1e-2,
+        )
     except Exception as e:
         notes.append(f"full_vocab_score failed: {e}")
         # Treat as a hard failure in strict mode.
