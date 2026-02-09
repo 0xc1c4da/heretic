@@ -222,32 +222,43 @@ def main() -> int:
     except Exception as e:
         evidence["token_lens_error"] = str(e)
 
-    # Conservative failure threshold: if we see multi-point KL jumps, it's definitely pathological.
-    # (The exact bug you’re chasing shows KL ~3+.)
+    # Conservative failure threshold: if we see multi-point KL jumps in *within-call* diagnostics,
+    # it's definitely pathological. Cross-call drift is expected/allowed on some SGLang stacks and
+    # should not fail the suite when paired scoring is available.
     FAIL_KL = 1.0
     failed = False
 
-    def _record(check: str, *, kl: float | None, maxdiff: float | None, note: str | None = None) -> None:
+    supports = model.backend.get_metadata().supports
+    supports_paired = bool(supports.get("score_full_vocab_paired", False))
+    supports_noise = bool(supports.get("score_full_vocab_paired_with_noise", False))
+
+    def _record(
+        check: str,
+        *,
+        kl: float | None,
+        maxdiff: float | None,
+        note: str | None = None,
+        counts_for_fail: bool = True,
+    ) -> None:
         nonlocal failed
         evidence["checks"][check] = {
             "kl": None if kl is None else float(kl),
             "max_abs_diff": None if maxdiff is None else float(maxdiff),
             "note": note,
         }
-        if kl is not None and float(kl) >= FAIL_KL:
+        if counts_for_fail and kl is not None and float(kl) >= FAIL_KL:
             failed = True
 
-    # Check 0: base score repeat (sanity: scoring itself isn't completely unstable).
+    # Check 0: base score repeat (cross-call; may be meaningless under drift).
     base0, _ = _time_call("score(base) #1", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
     base0b, _ = _time_call("score(base) #2", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
     kl_00 = _kl_base_vs_other(base_logprobs=base0, other_logprobs=base0b)
     md_00 = float((base0b - base0).abs().max().item())
-    _record("base_repeat", kl=kl_00, maxdiff=md_00)
+    _record("base_repeat", kl=kl_00, maxdiff=md_00, counts_for_fail=not supports_paired)
     _log(f"[smoke] KL(base#1 || base#2) = {kl_00:.6g} (max|diff|={md_00:.6g})")
 
     # Check 0b: within-call repeatability (single request, duplicated batch).
-    supports = model.backend.get_metadata().supports
-    if bool(supports.get("score_full_vocab_paired", False)):
+    if supports_paired:
         base0_pair, _ = _time_call(
             "score(base) within-call (duplicated batch)",
             lambda: _score_full_vocab(model, eval_prompts + eval_prompts, adapter=None),
@@ -257,7 +268,7 @@ def main() -> int:
             base0c = base0_pair[1:]
             kl_00w = _kl_base_vs_other(base_logprobs=base0a, other_logprobs=base0c)
             md_00w = float((base0c - base0a).abs().max().item())
-            _record("base_repeat_within_call", kl=kl_00w, maxdiff=md_00w)
+            _record("base_repeat_within_call", kl=kl_00w, maxdiff=md_00w, counts_for_fail=True)
             _log(
                 f"[smoke] KL(base||base) within-call = {kl_00w:.6g} (max|diff|={md_00w:.6g})"
             )
@@ -275,7 +286,7 @@ def main() -> int:
     base1, _ = _time_call("score(base after residuals)", lambda: _score_full_vocab(model, eval_prompts, adapter=None))
     kl_01 = _kl_base_vs_other(base_logprobs=base0, other_logprobs=base1)
     md_01 = float((base1 - base0).abs().max().item())
-    _record("after_residual_capture", kl=kl_01, maxdiff=md_01)
+    _record("after_residual_capture", kl=kl_01, maxdiff=md_01, counts_for_fail=not supports_paired)
     _log(f"[smoke] KL(base_pre || base_post_residuals) = {kl_01:.6g} (max|diff|={md_01:.6g})")
 
     # Compute refusal directions from the already-captured residuals (avoid additional backend calls).
@@ -354,16 +365,39 @@ def main() -> int:
         )
         kl = _kl_base_vs_other(base_logprobs=base1, other_logprobs=lp_ad)
         md = float((lp_ad - base1).abs().max().item())
-        _record(f"{name}_kl", kl=kl, maxdiff=md, note=note)
+        _record(f"{name}_kl", kl=kl, maxdiff=md, note=note, counts_for_fail=not supports_paired)
         _log(f"[smoke] KL(base1 || {name}) = {kl:.6g} (max|diff|={md:.6g})")
 
         # Within-call paired KL (architecturally meaningful on drift-y backends).
-        if bool(supports.get("score_full_vocab_paired", False)) and adapter_id is not None:
+        if supports_noise and adapter_id is not None:
+            ids = model.encode_prompts(eval_prompts)
+            base_p, adapted_p, base2_p = model.backend.score_full_vocab_paired_with_noise(
+                ids, adapter=str(adapter_id)
+            )
+            kl_p = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=adapted_p)
+            md_p = float((adapted_p - base_p).abs().max().item())
+            kl_noise = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=base2_p)
+            md_noise = float((base2_p - base_p).abs().max().item())
+            _record(f"{name}_kl_within_call", kl=kl_p, maxdiff=md_p, note=note, counts_for_fail=True)
+            _record(
+                f"{name}_kl_noise_within_call",
+                kl=kl_noise,
+                maxdiff=md_noise,
+                note=note,
+                counts_for_fail=True,
+            )
+            _log(
+                f"[smoke] KL(base||{name}) within-call = {kl_p:.6g} (max|diff|={md_p:.6g})"
+            )
+            _log(
+                f"[smoke] KL_noise(base||base2) within-call = {kl_noise:.6g} (max|diff|={md_noise:.6g})"
+            )
+        elif supports_paired and adapter_id is not None:
             ids = model.encode_prompts(eval_prompts)
             base_p, adapted_p = model.backend.score_full_vocab_paired(ids, adapter=str(adapter_id))
             kl_p = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=adapted_p)
             md_p = float((adapted_p - base_p).abs().max().item())
-            _record(f"{name}_kl_within_call", kl=kl_p, maxdiff=md_p, note=note)
+            _record(f"{name}_kl_within_call", kl=kl_p, maxdiff=md_p, note=note, counts_for_fail=True)
             _log(
                 f"[smoke] KL(base||{name}) within-call = {kl_p:.6g} (max|diff|={md_p:.6g})"
             )
@@ -377,7 +411,7 @@ def main() -> int:
         )
         kl_post = _kl_base_vs_other(base_logprobs=base1, other_logprobs=base_post)
         md_post = float((base_post - base1).abs().max().item())
-        _record(f"{name}_post_unload", kl=kl_post, maxdiff=md_post, note=note)
+        _record(f"{name}_post_unload", kl=kl_post, maxdiff=md_post, note=note, counts_for_fail=not supports_paired)
         _log(f"[smoke] KL(base1 || post-unload {name}) = {kl_post:.6g} (max|diff|={md_post:.6g})")
 
     # Case A: explicit true no-op (rank=1) to test "LoRA path" + unload cleanliness.

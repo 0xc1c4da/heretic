@@ -132,10 +132,27 @@ class Evaluator:
         if use_paired and adapter is not None:
             print("  * Obtaining paired base/adapted distributions (one-call)...")
             input_ids_batch = self.model.encode_prompts(self.good_prompts)
-            base_lp, adapted_lp = self.model.backend.score_full_vocab_paired(
-                input_ids_batch,
-                adapter=str(adapter),
-            )
+            supports_noise = bool(supports.get("score_full_vocab_paired_with_noise", False))
+            if supports_noise:
+                base_lp, adapted_lp, base2_lp = self.model.backend.score_full_vocab_paired_with_noise(
+                    input_ids_batch,
+                    adapter=str(adapter),
+                )
+                self._validate_logprobs_tensor(base2_lp, where="base")
+                kl_noise = float(
+                    F.kl_div(base2_lp, base_lp, reduction="batchmean", log_target=True).item()
+                )
+                print(f"  * Within-call KL_noise (base||base2): [bold]{kl_noise:.6g}[/]")
+                if kl_noise > float(self.settings.paired_kl_noise_threshold):
+                    raise RuntimeError(
+                        f"Within-call KL_noise too high: {kl_noise:.6g} > {self.settings.paired_kl_noise_threshold}. "
+                        "Paired KL metric is not stable enough to optimize."
+                    )
+            else:
+                base_lp, adapted_lp = self.model.backend.score_full_vocab_paired(
+                    input_ids_batch,
+                    adapter=str(adapter),
+                )
             self._validate_logprobs_tensor(base_lp, where="base")
             self._validate_logprobs_tensor(adapted_lp, where="adapted")
             kl_divergence = F.kl_div(

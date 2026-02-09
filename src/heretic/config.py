@@ -304,6 +304,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    paired_kl_noise_threshold: float = Field(
+        default=1e-2,
+        description=(
+            "When using paired KL scoring (one-call base vs adapted), optionally measure within-call drift via "
+            "KL(base1||base2). If this exceeds the threshold, the run is aborted because the KL metric is "
+            "not trustworthy for optimization."
+        ),
+    )
+
     winsorization_quantile: float = Field(
         default=1.0,
         description=(

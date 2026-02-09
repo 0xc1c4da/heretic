@@ -282,8 +282,31 @@ def _run_adapter_case(
 
         # Within-call paired diagnostic (architecturally meaningful on drift-y backends).
         supports = backend.get_metadata().supports
-        if bool(supports.get("score_full_vocab_paired", False)) and adapter_id is not None:
-            base_p, adapted_p = backend.score_full_vocab_paired(input_ids_batch, adapter=str(adapter_id))
+        if bool(supports.get("score_full_vocab_paired_with_noise", False)) and adapter_id is not None:
+            base_p, adapted_p, base2_p = backend.score_full_vocab_paired_with_noise(
+                input_ids_batch, adapter=str(adapter_id)
+            )
+            if (
+                bool(torch.isfinite(base_p).all().item())
+                and bool(torch.isfinite(adapted_p).all().item())
+                and bool(torch.isfinite(base2_p).all().item())
+            ):
+                kl_p = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=adapted_p)
+                max_diff_p = float((adapted_p - base_p).abs().max().item())
+                kl_noise = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=base2_p)
+                max_diff_noise = float((base2_p - base_p).abs().max().item())
+                out.update(
+                    {
+                        "kl_paired": float(kl_p),
+                        "max_diff_paired": float(max_diff_p),
+                        "kl_noise_within_call": float(kl_noise),
+                        "max_diff_noise_within_call": float(max_diff_noise),
+                    }
+                )
+        elif bool(supports.get("score_full_vocab_paired", False)) and adapter_id is not None:
+            base_p, adapted_p = backend.score_full_vocab_paired(
+                input_ids_batch, adapter=str(adapter_id)
+            )
             if bool(torch.isfinite(base_p).all().item()) and bool(torch.isfinite(adapted_p).all().item()):
                 kl_p = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=adapted_p)
                 max_diff_p = float((adapted_p - base_p).abs().max().item())
@@ -507,6 +530,11 @@ def main() -> int:
         if "kl_paired" in result:
             print(f"KL(base||case) within-call: {float(result['kl_paired']):.8f}")
             print(f"max|diff| within-call     : {float(result['max_diff_paired']):.8e}")
+        if "kl_noise_within_call" in result:
+            print(f"KL_noise(base||base2) within-call: {float(result['kl_noise_within_call']):.8f}")
+            print(
+                f"max|diff| noise within-call     : {float(result['max_diff_noise_within_call']):.8e}"
+            )
 
         # Post-unload base parity check: ensure returning to adapter=None doesn't drift badly.
         lp_post = backend.score(input_ids_batch, adapter=None).logprobs_full
