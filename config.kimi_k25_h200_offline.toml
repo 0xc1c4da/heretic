@@ -63,22 +63,22 @@ residual_plot_style = "dark_background"
 # Damage tuning
 damage_scale = 1.0
 damage_target = 0.01
-damage_noise_threshold = 0.05
-damage_retry_count = 1
+# topk_js noise observed near ~0.05 on TP8; allow a bit of slack and retry once.
+damage_noise_threshold = 0.07
+damage_retry_count = 2
 winsorization_quantile = 0.995
 
 # Damage metric
 # For this SGLang offline stack, full-vocab KL can be unstable even within-call.
-# Use paired ΔNLL (teacher-forced NLL on cached base continuations; base vs adapted within-call).
-damage_metric = "paired_delta_nll"
+# Use top-k Jensen–Shannon (paired within-call with noise gating).
+damage_metric = "topk_js"
 delta_nll_continuation_tokens = 32
-delta_nll_num_refs = 3
-delta_nll_ref_temperatures = [0.0, 0.2, 0.4]
-delta_nll_ref_top_k = 50
+# Keep continuation caching simple/cheap for trials; topk_js uses these cached continuations.
+delta_nll_num_refs = 1
+delta_nll_ref_temperatures = [0.0]
+delta_nll_ref_top_k = 1
 delta_nll_mom_buckets = 7
 
-# Optional alternative:
-# damage_metric = "topk_js"
 topk_js_k = 128
 topk_js_positions = 32
 
@@ -144,7 +144,7 @@ tp_size = 8
 attention_backend = "flashinfer"
 
 # Optional: stronger determinism at a performance cost (SGLang batch-invariant ops).
-# enable_deterministic_inference = true
+enable_deterministic_inference = true
 # Memory/scheduling (tune to your workload)
 # mem_fraction_static = 0.96
 max_total_tokens = 50000
