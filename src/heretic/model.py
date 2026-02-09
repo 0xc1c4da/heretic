@@ -1133,14 +1133,32 @@ class Model:
             for prompt in prompts
         ]
 
-        ids = cast(
-            list[list[int]],
-            self.tokenizer.apply_chat_template(
-                chats,
-                add_generation_prompt=True,
-                tokenize=True,
-            ),
-        )
+        # For SGLang backends, use the backend's canonical chat templating/tokenizer when
+        # available. This keeps scoring/generation aligned with the backend's true prompt identity
+        # and avoids subtle mismatches between HF-local templates and SGLang templates.
+        if self._backend_type in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
+            supports = self.backend.get_metadata().supports
+            if bool(supports.get("tokenize_chat", False)):
+                out = self.backend.tokenize_chat(chats, continue_final_message=False)
+                ids = out.token_ids
+            else:
+                ids = cast(
+                    list[list[int]],
+                    self.tokenizer.apply_chat_template(
+                        chats,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                    ),
+                )
+        else:
+            ids = cast(
+                list[list[int]],
+                self.tokenizer.apply_chat_template(
+                    chats,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                ),
+            )
 
         if self.response_prefix:
             prefix_ids = cast(
