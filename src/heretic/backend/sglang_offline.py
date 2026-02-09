@@ -288,6 +288,13 @@ class SGLangOfflineBackend(HereticBackend):
         """One-call full-vocab scoring with scalar or per-item LoRA ids."""
         from sglang.srt.managers.io_struct import GenerateReqInput
 
+        # IMPORTANT: use per-item extra_key values.
+        #
+        # Some SGLang cache paths can cause within-batch interactions for identical prompts if they
+        # share the same (token_ids, extra_key) namespace. Using unique per-item keys keeps each
+        # request cache-isolated even within a single batched call (critical for paired scoring).
+        extra_key = [uuid.uuid4().hex for _ in range(len(input_ids_batch))]
+
         obj = GenerateReqInput(
             input_ids=input_ids_batch,
             # IMPORTANT: force greedy sampling semantics for scoring.
@@ -303,7 +310,7 @@ class SGLangOfflineBackend(HereticBackend):
             return_next_token_logprobs_full=True,
             lora_id=lora_id,
             # Ensure scoring does not hit/poison prefix cache (cache namespace salt).
-            extra_key=str(uuid.uuid4().hex),
+            extra_key=extra_key,
         )
         gen = self._generate_req(obj)
 
