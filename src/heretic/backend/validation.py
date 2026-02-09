@@ -123,19 +123,41 @@ def validate_full_vocab_score_repeatability(
 ) -> None:
     """Ensure full-vocab score is repeatable for identical inputs.
 
-    Heretic's KL objective assumes (base vs adapted) is meaningful. If the backend's full-vocab
-    scoring is not self-consistent (base vs base has large KL), optimization becomes nonsense.
+    For backends that support paired scoring (one-call semantics), we validate *within-call*
+    repeatability by scoring a duplicated batch in a single request.
+
+    For all other backends, we fall back to a stricter *cross-call* repeatability check.
     """
     import torch.nn.functional as F
 
-    r1 = backend.score(input_ids_batch)
-    r2 = backend.score(input_ids_batch)
-    t1 = r1.logprobs_full
-    t2 = r2.logprobs_full
-    if t1 is None or t2 is None:
-        raise BackendValidationError("Backend score returned no logprobs_full (required for KL).")
-    if tuple(t1.shape) != tuple(t2.shape):
-        raise BackendValidationError(f"Repeatability shape mismatch: {tuple(t1.shape)} != {tuple(t2.shape)}")
+    supports = backend.get_metadata().supports
+    if supports.get("score_full_vocab_paired", False):
+        if not input_ids_batch:
+            raise BackendValidationError("Repeatability check requires non-empty input_ids_batch.")
+        b = len(input_ids_batch)
+        doubled = list(input_ids_batch) + list(input_ids_batch)
+        r = backend.score(doubled, adapter=None)
+        t = r.logprobs_full
+        if t is None:
+            raise BackendValidationError("Backend score returned no logprobs_full (required for KL).")
+        if t.ndim != 2 or t.shape[0] != 2 * b:
+            raise BackendValidationError(
+                f"Within-call repeatability unexpected shape: {tuple(t.shape)} for batch {b}"
+            )
+        t1 = t[:b]
+        t2 = t[b:]
+    else:
+        r1 = backend.score(input_ids_batch)
+        r2 = backend.score(input_ids_batch)
+        t1 = r1.logprobs_full
+        t2 = r2.logprobs_full
+        if t1 is None or t2 is None:
+            raise BackendValidationError("Backend score returned no logprobs_full (required for KL).")
+        if tuple(t1.shape) != tuple(t2.shape):
+            raise BackendValidationError(
+                f"Repeatability shape mismatch: {tuple(t1.shape)} != {tuple(t2.shape)}"
+            )
+
     # KL(base||base2) using Heretic evaluator semantics: input=t2, target=t1, log_target=True
     kl = float(F.kl_div(t2, t1, reduction="batchmean", log_target=True).item())
     if not (kl == kl):  # NaN check without importing math
@@ -143,7 +165,7 @@ def validate_full_vocab_score_repeatability(
     if kl > float(kl_threshold):
         raise BackendValidationError(
             f"Backend full-vocab scoring is not repeatable: KL(base||base2)={kl:.6g} > {kl_threshold}. "
-            "This often indicates multi-pass prefill capture selecting inconsistent steps."
+            "If this is SGLang, it often indicates drift or multi-pass capture selecting inconsistent steps."
         )
 
 

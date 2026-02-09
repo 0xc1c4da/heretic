@@ -267,6 +267,8 @@ class SGLangOfflineBackend(HereticBackend):
                 "prompt_ids_sha256": False,
                 "capture_layers": True,
                 "logprobs_full": True,
+                # Paired base-vs-adapted scoring in one engine call/batch.
+                "score_full_vocab_paired": True,
                 "compute_vtw": True,
                 "lora_hot_swap": True,
                 "tokenize_chat": True,
@@ -276,6 +278,62 @@ class SGLangOfflineBackend(HereticBackend):
             hidden_size=int(hidden_size) if isinstance(hidden_size, int) else None,
             vocab_size=int(vocab_size) if isinstance(vocab_size, int) else None,
         )
+
+    def _score_full_vocab_with_lora_ids(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        lora_id: str | list[str | None] | None,
+    ) -> torch.Tensor:
+        """One-call full-vocab scoring with scalar or per-item LoRA ids."""
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        obj = GenerateReqInput(
+            input_ids=input_ids_batch,
+            # IMPORTANT: force greedy sampling semantics for scoring.
+            #
+            # Heretic expects full-vocab logprobs derived from next-token *logits* at the prompt boundary.
+            # SGLang's non-greedy sampling path can mutate next_token_logits in-place (e.g. softmax),
+            # which would make log_softmax(logits) incorrect and non-repeatable under chunked/multi-pass prefill.
+            #
+            # In SGLang, temperature ~ 0 normalizes to `top_k=1` (greedy) while keeping stable execution.
+            sampling_params={"max_new_tokens": 0, "temperature": 0.0},
+            stream=False,
+            return_logprob=False,
+            return_next_token_logprobs_full=True,
+            lora_id=lora_id,
+            # Ensure scoring does not hit/poison prefix cache (cache namespace salt).
+            extra_key=str(uuid.uuid4().hex),
+        )
+        gen = self._generate_req(obj)
+
+        rows: list[torch.Tensor] = []
+        for out in gen.outputs:
+            meta = out.get("meta_info") or {}
+            b64_steps = meta.get("heretic_next_token_logprobs_full_fp16_b64")
+            shape_steps = meta.get("heretic_next_token_logprobs_full_shape")
+            dtype_steps = meta.get("heretic_next_token_logprobs_full_dtype")
+            if not b64_steps or not shape_steps or not dtype_steps:
+                raise RuntimeError(
+                    f"Missing full-vocab logprobs in offline response meta_info: keys={list(meta.keys())}"
+                )
+            # These fields are list-of-steps. Always take the last step to represent the
+            # distribution after consuming the full prompt, even under multi-pass execution.
+            b64 = b64_steps[-1]
+            shape = shape_steps[-1]
+            dtype = dtype_steps[-1]
+            if dtype != "float16" or not isinstance(shape, list) or len(shape) != 1:
+                raise RuntimeError(
+                    f"Unexpected full-vocab dtype/shape in offline response: {dtype=} {shape=}"
+                )
+            vocab = int(shape[0])
+            raw = base64.b64decode(b64.encode("ascii"))
+            arr = np.frombuffer(raw, dtype=np.float16)
+            if arr.size != vocab:
+                raise RuntimeError(f"Decoded fp16 size mismatch: {arr.size=} {vocab=}")
+            rows.append(torch.from_numpy(arr.astype(np.float32, copy=False)))
+
+        return torch.stack(rows, dim=0)
 
     def lora_status(self) -> list[dict[str, Any]]:
         """Offline equivalent of `GET /heretic/lora_status` (observability)."""
@@ -445,53 +503,29 @@ class SGLangOfflineBackend(HereticBackend):
         return A, B
 
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
-        from sglang.srt.managers.io_struct import GenerateReqInput
-
-        obj = GenerateReqInput(
-            input_ids=input_ids_batch,
-            # IMPORTANT: force greedy sampling semantics for scoring.
-            #
-            # Heretic expects full-vocab logprobs derived from next-token *logits* at the prompt boundary.
-            # SGLang's non-greedy sampling path can mutate next_token_logits in-place (e.g. softmax),
-            # which would make log_softmax(logits) incorrect and non-repeatable under chunked/multi-pass prefill.
-            #
-            # In SGLang, temperature ~ 0 normalizes to `top_k=1` (greedy) while keeping stable execution.
-            sampling_params={"max_new_tokens": 0, "temperature": 0.0},
-            stream=False,
-            return_logprob=False,
-            return_next_token_logprobs_full=True,
-            lora_id=adapter,
-            # Ensure scoring does not hit/poison prefix cache (cache namespace salt).
-            extra_key=str(uuid.uuid4().hex),
-        )
-        gen = self._generate_req(obj)
-
-        rows: list[torch.Tensor] = []
-        for out in gen.outputs:
-            meta = out.get("meta_info") or {}
-            b64_steps = meta.get("heretic_next_token_logprobs_full_fp16_b64")
-            shape_steps = meta.get("heretic_next_token_logprobs_full_shape")
-            dtype_steps = meta.get("heretic_next_token_logprobs_full_dtype")
-            if not b64_steps or not shape_steps or not dtype_steps:
-                raise RuntimeError(
-                    f"Missing full-vocab logprobs in offline response meta_info: keys={list(meta.keys())}"
-                )
-            # These fields are list-of-steps. Always take the last step to represent the
-            # distribution after consuming the full prompt, even under multi-pass execution.
-            b64 = b64_steps[-1]
-            shape = shape_steps[-1]
-            dtype = dtype_steps[-1]
-            if dtype != "float16" or not isinstance(shape, list) or len(shape) != 1:
-                raise RuntimeError(f"Unexpected full-vocab dtype/shape in offline response: {dtype=} {shape=}")
-            vocab = int(shape[0])
-            raw = base64.b64decode(b64.encode("ascii"))
-            arr = np.frombuffer(raw, dtype=np.float16)
-            if arr.size != vocab:
-                raise RuntimeError(f"Decoded fp16 size mismatch: {arr.size=} {vocab=}")
-            rows.append(torch.from_numpy(arr.astype(np.float32, copy=False)))
-
-        logprobs_full = torch.stack(rows, dim=0)
+        logprobs_full = self._score_full_vocab_with_lora_ids(input_ids_batch, lora_id=adapter)
         return ScoreResult(logprobs_full=logprobs_full, meta={"transport": "offline"})
+
+    def score_full_vocab_paired(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        adapter: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute base and adapted distributions within one engine call/batch."""
+        if not input_ids_batch:
+            raise ValueError("input_ids_batch must be non-empty")
+        b = len(input_ids_batch)
+        paired_ids = list(input_ids_batch) + list(input_ids_batch)
+        paired_loras: list[str | None] = ([None] * b) + ([str(adapter)] * b)
+        both = self._score_full_vocab_with_lora_ids(paired_ids, lora_id=paired_loras)
+        if both.ndim != 2 or both.shape[0] != 2 * b:
+            raise RuntimeError(
+                f"Unexpected paired score shape: {tuple(both.shape)} for batch {b}"
+            )
+        base = both[:b]
+        adapted = both[b:]
+        return base, adapted
 
     def generate_text(
         self,

@@ -174,11 +174,21 @@ class SGLangBackend(HereticBackend):
         )
 
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
+        logprobs_full, meta = self._score_full_vocab_with_lora_ids(input_ids_batch, lora_id=adapter)
+        return ScoreResult(logprobs_full=logprobs_full, logprobs_topk=None, meta=meta)
+
+    def _score_full_vocab_with_lora_ids(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        lora_id: str | list[str | None] | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """One-call full-vocab scoring with scalar or per-item LoRA ids."""
         # Prefer compact binary transport when available; fall back to JSON.
         try:
             status, raw, ctype = _post_bytes(
                 f"{self.base_url}/heretic/score_full_vocab_bin",
-                {"input_ids": input_ids_batch, "lora_id": adapter},
+                {"input_ids": input_ids_batch, "lora_id": lora_id},
                 timeout_s=300.0,
             )
             if status == 200 and (ctype is None or "application/octet-stream" in ctype):
@@ -198,11 +208,7 @@ class SGLangBackend(HereticBackend):
                     )
                 arr = np.frombuffer(payload, dtype=np.float16).reshape(bs, vocab)
                 logprobs_full = torch.from_numpy(arr.astype(np.float32, copy=False))
-                return ScoreResult(
-                    logprobs_full=logprobs_full,
-                    logprobs_topk=None,
-                    meta={"transport": "bin"},
-                )
+                return logprobs_full, {"transport": "bin"}
         except Exception as e:
             # Fall back only when the binary endpoint is missing.
             msg = str(e)
@@ -211,7 +217,7 @@ class SGLangBackend(HereticBackend):
 
         resp = _post_json(
             f"{self.base_url}/heretic/score_full_vocab",
-            {"input_ids": input_ids_batch, "lora_id": adapter},
+            {"input_ids": input_ids_batch, "lora_id": lora_id},
             timeout_s=300.0,
         )
 
@@ -242,11 +248,28 @@ class SGLangBackend(HereticBackend):
             rows.append(torch.from_numpy(arr.astype(np.float32, copy=False)))
 
         logprobs_full = torch.stack(rows, dim=0)
-        return ScoreResult(
-            logprobs_full=logprobs_full,
-            logprobs_topk=None,
-            meta={"transport": "json", "raw": data},
-        )
+        return logprobs_full, {"transport": "json", "raw": data}
+
+    def score_full_vocab_paired(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        adapter: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute base and adapted distributions within one server request/batch."""
+        if not input_ids_batch:
+            raise ValueError("input_ids_batch must be non-empty")
+        b = len(input_ids_batch)
+        paired_ids = list(input_ids_batch) + list(input_ids_batch)
+        paired_loras: list[str | None] = ([None] * b) + ([str(adapter)] * b)
+        both, _meta = self._score_full_vocab_with_lora_ids(paired_ids, lora_id=paired_loras)
+        if both.ndim != 2 or both.shape[0] != 2 * b:
+            raise RuntimeError(
+                f"Unexpected paired score shape: {tuple(both.shape)} for batch {b}"
+            )
+        base = both[:b]
+        adapted = both[b:]
+        return base, adapted
 
     def generate_text(
         self,

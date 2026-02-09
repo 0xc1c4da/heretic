@@ -124,18 +124,44 @@ class Evaluator:
         return refusal_count
 
     def get_score(self, *, adapter: str | None = None) -> tuple[tuple[float, float], float, int]:
-        print("  * Obtaining first-token probability distributions...")
-        logprobs = self._get_first_token_logprobs(self.good_prompts, adapter=adapter)
-        self._validate_logprobs_tensor(logprobs, where="adapted")
-        kl_divergence = F.kl_div(
-            logprobs,
-            self.base_logprobs,
-            reduction="batchmean",
-            log_target=True,
-        ).item()
+        # For backends with cross-call drift (notably some SGLang stacks), KL is only meaningful
+        # if base and adapted distributions are captured within the same backend call/batch.
+        supports = self.model.backend.get_metadata().supports
+        use_paired = bool(supports.get("score_full_vocab_paired", False))
+
+        if use_paired and adapter is not None:
+            print("  * Obtaining paired base/adapted distributions (one-call)...")
+            input_ids_batch = self.model.encode_prompts(self.good_prompts)
+            base_lp, adapted_lp = self.model.backend.score_full_vocab_paired(
+                input_ids_batch,
+                adapter=str(adapter),
+            )
+            self._validate_logprobs_tensor(base_lp, where="base")
+            self._validate_logprobs_tensor(adapted_lp, where="adapted")
+            kl_divergence = F.kl_div(
+                adapted_lp,
+                base_lp,
+                reduction="batchmean",
+                log_target=True,
+            ).item()
+        elif use_paired and adapter is None:
+            # Under drift, "base vs stored base" is not a stable diagnostic. Define KL(base||base)=0 here.
+            print("  * Using paired-scoring backend; adapter=None implies KL=0 by definition.")
+            kl_divergence = 0.0
+        else:
+            print("  * Obtaining first-token probability distributions...")
+            logprobs = self._get_first_token_logprobs(self.good_prompts, adapter=adapter)
+            self._validate_logprobs_tensor(logprobs, where="adapted")
+            kl_divergence = F.kl_div(
+                logprobs,
+                self.base_logprobs,
+                reduction="batchmean",
+                log_target=True,
+            ).item()
+
         if not math.isfinite(float(kl_divergence)):
             raise NonFiniteLogprobsError(f"Non-finite KL divergence: {kl_divergence!r}")
-        print(f"  * KL divergence: [bold]{kl_divergence:.4f}[/]")
+        print(f"  * KL divergence: [bold]{float(kl_divergence):.4f}[/]")
 
         print("  * Counting model refusals...")
         refusals = self.count_refusals(adapter=adapter)

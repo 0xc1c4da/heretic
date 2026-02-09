@@ -103,6 +103,27 @@ class HereticBackend(ABC):
             raise NotImplementedError("Backend does not provide full-vocab logprobs.")
         return result.logprobs_full
 
+    def score_full_vocab_paired(
+        self,
+        input_ids_batch: list[list[int]],
+        *,
+        adapter: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (base, adapted) full-vocab logprobs for KL computation.
+
+        Semantics (source of truth: local/HF backend):
+        - base:   log P_theta(· | x)
+        - adapted: log P_{theta+adapter}(· | x)
+
+        Default implementation falls back to two separate calls. Backends with
+        cross-call drift (e.g. some SGLang stacks) MUST override this method and
+        advertise support via `BackendMetadata.supports["score_full_vocab_paired"]=True`,
+        so callers can rely on one-call paired semantics.
+        """
+        base = self.score_full_vocab(input_ids_batch, adapter=None)
+        adapted = self.score_full_vocab(input_ids_batch, adapter=adapter)
+        return base, adapted
+
     @abstractmethod
     def generate_text(
         self,

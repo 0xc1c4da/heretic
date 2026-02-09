@@ -245,6 +245,23 @@ def main() -> int:
     _record("base_repeat", kl=kl_00, maxdiff=md_00)
     _log(f"[smoke] KL(base#1 || base#2) = {kl_00:.6g} (max|diff|={md_00:.6g})")
 
+    # Check 0b: within-call repeatability (single request, duplicated batch).
+    supports = model.backend.get_metadata().supports
+    if bool(supports.get("score_full_vocab_paired", False)):
+        base0_pair, _ = _time_call(
+            "score(base) within-call (duplicated batch)",
+            lambda: _score_full_vocab(model, eval_prompts + eval_prompts, adapter=None),
+        )
+        if base0_pair.ndim == 2 and base0_pair.shape[0] == 2:
+            base0a = base0_pair[:1]
+            base0c = base0_pair[1:]
+            kl_00w = _kl_base_vs_other(base_logprobs=base0a, other_logprobs=base0c)
+            md_00w = float((base0c - base0a).abs().max().item())
+            _record("base_repeat_within_call", kl=kl_00w, maxdiff=md_00w)
+            _log(
+                f"[smoke] KL(base||base) within-call = {kl_00w:.6g} (max|diff|={md_00w:.6g})"
+            )
+
     # Check 1: residual-capture warmup drift.
     good_residuals, _ = _time_call(
         "capture residuals (good)",
@@ -339,6 +356,17 @@ def main() -> int:
         md = float((lp_ad - base1).abs().max().item())
         _record(f"{name}_kl", kl=kl, maxdiff=md, note=note)
         _log(f"[smoke] KL(base1 || {name}) = {kl:.6g} (max|diff|={md:.6g})")
+
+        # Within-call paired KL (architecturally meaningful on drift-y backends).
+        if bool(supports.get("score_full_vocab_paired", False)) and adapter_id is not None:
+            ids = model.encode_prompts(eval_prompts)
+            base_p, adapted_p = model.backend.score_full_vocab_paired(ids, adapter=str(adapter_id))
+            kl_p = _kl_base_vs_other(base_logprobs=base_p, other_logprobs=adapted_p)
+            md_p = float((adapted_p - base_p).abs().max().item())
+            _record(f"{name}_kl_within_call", kl=kl_p, maxdiff=md_p, note=note)
+            _log(
+                f"[smoke] KL(base||{name}) within-call = {kl_p:.6g} (max|diff|={md_p:.6g})"
+            )
         _, _ = _time_call(
             f"unload_adapter({name})",
             lambda: model.backend.unload_adapter(name=name),
