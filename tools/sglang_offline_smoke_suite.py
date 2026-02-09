@@ -23,53 +23,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from typing import Any
-
-import torch
-import torch.nn.functional as F
 
 try:
     import tomllib  # py>=3.11
 except Exception:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
-
-from heretic.config import BackendType, Settings
-from heretic.model import AbliterationParameters, Model
-from heretic.utils import Prompt
-
-
-def _finite_or_raise(t: torch.Tensor, *, where: str) -> None:
-    if not isinstance(t, torch.Tensor):
-        raise RuntimeError(f"{where}: expected torch.Tensor, got {type(t)}")
-    finite = torch.isfinite(t)
-    if not bool(finite.all().item()):
-        bad = int((~finite).sum().item())
-        t_min = float(t[finite].min().item()) if bool(finite.any().item()) else float("nan")
-        t_max = float(t[finite].max().item()) if bool(finite.any().item()) else float("nan")
-        raise RuntimeError(
-            f"{where}: non-finite tensor values (bad={bad} of {t.numel()}) "
-            f"(finite_min={t_min:.4g} finite_max={t_max:.4g})"
-        )
-
-
-def _kl_base_vs_other(*, base_logprobs: torch.Tensor, other_logprobs: torch.Tensor) -> float:
-    """
-    Match Heretic evaluator semantics:
-      F.kl_div(input=other, target=base, log_target=True) == KL(base || other)
-    """
-    _finite_or_raise(base_logprobs, where="base_logprobs")
-    _finite_or_raise(other_logprobs, where="other_logprobs")
-    if base_logprobs.shape != other_logprobs.shape:
-        raise RuntimeError(f"shape mismatch: base={tuple(base_logprobs.shape)} other={tuple(other_logprobs.shape)}")
-    return float(
-        F.kl_div(
-            other_logprobs,
-            base_logprobs,
-            reduction="batchmean",
-            log_target=True,
-        ).item()
-    )
-
 
 def _load_toml(path: str) -> dict[str, Any]:
     if tomllib is None:
@@ -81,75 +42,127 @@ def _load_toml(path: str) -> dict[str, Any]:
     return dict(data)
 
 
-def _merge_settings_from_toml(*, data: dict[str, Any]) -> Settings:
-    # Settings is a BaseSettings, but model_validate() works fine for dict input.
-    s = Settings.model_validate(data)
-    # Force offline backend for this script.
-    s.backend = BackendType.SGLANG_OFFLINE
-    # Don't run heavy validations inside the smoke suite unless the user explicitly wants it.
-    s.validate_backend = False
-    return s
-
-
-def _mk_prompt(*, system: str, user: str) -> Prompt:
-    return Prompt(system=str(system), user=str(user))
-
-
-def _score_full_vocab(model: Model, prompts: list[Prompt], *, adapter: str | None) -> torch.Tensor:
-    input_ids_batch = model.encode_prompts(prompts)
-    out = model.backend.score(input_ids_batch, adapter=adapter)
-    t = out.logprobs_full
-    if t is None:
-        raise RuntimeError("Backend did not return logprobs_full (required).")
-    return t
-
-
-def _compute_refusal_directions_like_main_from_residuals(
-    *, settings: Settings, good_residuals: torch.Tensor, bad_residuals: torch.Tensor
-) -> torch.Tensor:
-    good_means = good_residuals.mean(dim=0)
-    bad_means = bad_residuals.mean(dim=0)
-
-    refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
-
-    if bool(getattr(settings, "orthogonalize_direction", False)):
-        good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
-        refusal_directions = refusal_directions - projection_vector.unsqueeze(1) * good_directions
-        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
-
-    return refusal_directions
-
-
-def _mk_constant_params(model: Model, *, weight: float) -> dict[str, AbliterationParameters]:
-    # Use constant weight for all layers by setting min_weight == max_weight.
-    # Include (almost) all layers by setting min_weight_distance very large.
-    n_layers = int(model.num_layers)
-    pos = float(0.5 * max(0, n_layers - 1))
-    dist = float(max(1, n_layers))  # include all layers
-    params: dict[str, AbliterationParameters] = {}
-    for component in model.get_abliterable_components():
-        params[component] = AbliterationParameters(
-            max_weight=float(weight),
-            max_weight_position=pos,
-            min_weight=float(weight),
-            min_weight_distance=dist,
-        )
-    return params
-
-
-def main() -> int:
+def _parse_args() -> argparse.Namespace:
+    # IMPORTANT: do this before importing Heretic/SGLang modules.
+    # Some dependencies (or older versions of this script) may instantiate `Settings()`,
+    # which uses Pydantic's CLI source and can choke on unknown args.
     ap = argparse.ArgumentParser(
         description="SGLang offline smoke suite for Heretic KL issues (one-command, minimal knobs)."
     )
     ap.add_argument(
         "--config-toml",
-        required=True,
-        help="Path to a Heretic TOML config (e.g. config.kimi_k25_h200_offline.toml).",
+        default=None,
+        help="Path to a Heretic TOML config. If omitted, uses ./config.toml.",
     )
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    cfg = _load_toml(str(args.config_toml))
+
+def main() -> int:
+    args = _parse_args()
+    config_path = str(args.config_toml) if args.config_toml else "config.toml"
+    if not os.path.exists(config_path):
+        raise SystemExit(
+            f"config not found: {config_path!r}. Pass --config-toml PATH or create ./config.toml"
+        )
+
+    # After parsing our args, strip argv so no other CLI-parsing layers see our flags.
+    sys.argv = [sys.argv[0]]
+
+    import torch
+    import torch.nn.functional as F
+
+    from heretic.config import BackendType, Settings
+    from heretic.model import AbliterationParameters, Model
+    from heretic.utils import Prompt
+
+    def _finite_or_raise(t: torch.Tensor, *, where: str) -> None:
+        if not isinstance(t, torch.Tensor):
+            raise RuntimeError(f"{where}: expected torch.Tensor, got {type(t)}")
+        finite = torch.isfinite(t)
+        if not bool(finite.all().item()):
+            bad = int((~finite).sum().item())
+            t_min = float(t[finite].min().item()) if bool(finite.any().item()) else float("nan")
+            t_max = float(t[finite].max().item()) if bool(finite.any().item()) else float("nan")
+            raise RuntimeError(
+                f"{where}: non-finite tensor values (bad={bad} of {t.numel()}) "
+                f"(finite_min={t_min:.4g} finite_max={t_max:.4g})"
+            )
+
+    def _kl_base_vs_other(*, base_logprobs: torch.Tensor, other_logprobs: torch.Tensor) -> float:
+        """
+        Match Heretic evaluator semantics:
+          F.kl_div(input=other, target=base, log_target=True) == KL(base || other)
+        """
+        _finite_or_raise(base_logprobs, where="base_logprobs")
+        _finite_or_raise(other_logprobs, where="other_logprobs")
+        if base_logprobs.shape != other_logprobs.shape:
+            raise RuntimeError(
+                f"shape mismatch: base={tuple(base_logprobs.shape)} other={tuple(other_logprobs.shape)}"
+            )
+        return float(
+            F.kl_div(
+                other_logprobs,
+                base_logprobs,
+                reduction="batchmean",
+                log_target=True,
+            ).item()
+        )
+
+    def _merge_settings_from_toml(*, data: dict[str, Any]) -> Settings:
+        # Settings is a BaseSettings, but model_validate() works fine for dict input.
+        s = Settings.model_validate(data)
+        # Force offline backend for this script.
+        s.backend = BackendType.SGLANG_OFFLINE
+        # Don't run heavy validations inside the smoke suite unless the user explicitly wants it.
+        s.validate_backend = False
+        return s
+
+    def _mk_prompt(*, system: str, user: str) -> Prompt:
+        return Prompt(system=str(system), user=str(user))
+
+    def _score_full_vocab(model: Model, prompts: list[Prompt], *, adapter: str | None) -> torch.Tensor:
+        input_ids_batch = model.encode_prompts(prompts)
+        out = model.backend.score(input_ids_batch, adapter=adapter)
+        t = out.logprobs_full
+        if t is None:
+            raise RuntimeError("Backend did not return logprobs_full (required).")
+        return t
+
+    def _compute_refusal_directions_like_main_from_residuals(
+        *, settings: Settings, good_residuals: torch.Tensor, bad_residuals: torch.Tensor
+    ) -> torch.Tensor:
+        good_means = good_residuals.mean(dim=0)
+        bad_means = bad_residuals.mean(dim=0)
+
+        refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+
+        if bool(getattr(settings, "orthogonalize_direction", False)):
+            good_directions = F.normalize(good_means, p=2, dim=1)
+            projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
+            refusal_directions = (
+                refusal_directions - projection_vector.unsqueeze(1) * good_directions
+            )
+            refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+
+        return refusal_directions
+
+    def _mk_constant_params(model: Model, *, weight: float) -> dict[str, AbliterationParameters]:
+        # Use constant weight for all layers by setting min_weight == max_weight.
+        # Include (almost) all layers by setting min_weight_distance very large.
+        n_layers = int(model.num_layers)
+        pos = float(0.5 * max(0, n_layers - 1))
+        dist = float(max(1, n_layers))  # include all layers
+        params: dict[str, AbliterationParameters] = {}
+        for component in model.get_abliterable_components():
+            params[component] = AbliterationParameters(
+                max_weight=float(weight),
+                max_weight_position=pos,
+                min_weight=float(weight),
+                min_weight_distance=dist,
+            )
+        return params
+
+    cfg = _load_toml(config_path)
     settings = _merge_settings_from_toml(data=cfg)
     # Keep this fast-ish.
     settings.batch_size = 1
@@ -167,7 +180,7 @@ def main() -> int:
 
     # Evidence bundle (always printed at the end).
     evidence: dict[str, Any] = {
-        "config_toml": str(args.config_toml),
+        "config_toml": str(config_path),
         "backend": "sglang_offline",
         "model": str(getattr(settings, "model", "")),
         "row_normalization": str(getattr(settings, "row_normalization", "")),
