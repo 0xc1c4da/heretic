@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import pickle
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -460,6 +461,8 @@ class SGLangOfflineBackend(HereticBackend):
             return_logprob=False,
             return_next_token_logprobs_full=True,
             lora_id=adapter,
+            # Ensure scoring does not hit/poison prefix cache (cache namespace salt).
+            extra_key=str(uuid.uuid4().hex),
         )
         gen = self._generate_req(obj)
 
