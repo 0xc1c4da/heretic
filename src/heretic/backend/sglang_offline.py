@@ -455,9 +455,11 @@ class SGLangOfflineBackend(HereticBackend):
                 raise RuntimeError(
                     f"Missing full-vocab logprobs in offline response meta_info: keys={list(meta.keys())}"
                 )
-            b64 = b64_steps[0]
-            shape = shape_steps[0]
-            dtype = dtype_steps[0]
+            # These fields are list-of-steps. Always take the last step to represent the
+            # distribution after consuming the full prompt, even under multi-pass execution.
+            b64 = b64_steps[-1]
+            shape = shape_steps[-1]
+            dtype = dtype_steps[-1]
             if dtype != "float16" or not isinstance(shape, list) or len(shape) != 1:
                 raise RuntimeError(f"Unexpected full-vocab dtype/shape in offline response: {dtype=} {shape=}")
             vocab = int(shape[0])

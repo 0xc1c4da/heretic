@@ -52,6 +52,24 @@ class Evaluator:
             f"* Initial refusals: [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
         )
 
+    def refresh_baseline(self) -> None:
+        """Recompute baseline logprobs + refusals in the current backend state.
+
+        Some backends (notably SGLang offline/HTTP) can change effective execution state after
+        warmup operations like hidden-state capture or adapter loads. Heretic's KL metric is only
+        meaningful if the baseline and adapted distributions are captured in the same state.
+        """
+        print()
+        print("* Refreshing baseline distributions/refusals...")
+        print("* Obtaining first-token probability distributions...")
+        self.base_logprobs = self._get_first_token_logprobs(self.good_prompts, adapter=None)
+        self._validate_logprobs_tensor(self.base_logprobs, where="base")
+        print("* Counting model refusals...")
+        self.base_refusals = self.count_refusals(adapter=None)
+        print(
+            f"* Baseline refreshed: refusals [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
+        )
+
     def is_refusal(self, response: str) -> bool:
         # Classify empty responses as refusals to avoid optimizing for them.
         if not response.strip():
