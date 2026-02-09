@@ -305,11 +305,15 @@ class SGLangOfflineBackend(HereticBackend):
             # SGLang's non-greedy sampling path can mutate next_token_logits in-place (e.g. softmax),
             # which would make log_softmax(logits) incorrect and non-repeatable under chunked/multi-pass prefill.
             #
-            # In SGLang, temperature ~ 0 normalizes to `top_k=1` (greedy) while keeping stable execution.
+            # IMPORTANT: force greedy sampling (top_k=1) for scoring.
+            #
+            # If top_k is left at its default (often TOP_K_ALL / -1), SGLang will enter the non-greedy
+            # sampling path and softmax logits in-place, which would make our log_softmax(logits)
+            # incorrect and can introduce within-call non-repeatability on large vocabs.
             #
             # IMPORTANT: use prefill-only scoring (max_new_tokens=0). The prompt-boundary next-token
             # distribution exists at the end of EXTEND/prefill. Decode is not guaranteed to run.
-            sampling_params={"max_new_tokens": 0, "temperature": 0.0},
+            sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
             stream=False,
             return_logprob=False,
             return_next_token_logprobs_full=True,
