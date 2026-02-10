@@ -1,0 +1,152 @@
+# DeepSeek-V3.2 on 8×H200 — embedded SGLang (offline) backend
+#
+# Usage:
+#   cp config.deepseek_v32_h200_offline.toml config.toml
+#   uv run heretic
+#
+# Notes:
+# - DeepSeek-V3.2 is a DSA/NSA model in SGLang. For best stability/perf on 8×H200,
+#   the recommended setup is DP attention with dp_size=8.
+# - `validate_backend=true` runs Heretic's backend startup validations, including a LoRA hot-swap
+#   sanity check. (This repo includes a non-zero synthetic adapter for sanity, while the damage
+#   repeatability validation still enforces a strict no-op adapter.)
+
+model = "deepseek-ai/DeepSeek-V3.2"
+backend = "sglang_offline"
+trust_remote_code = true
+
+# Validate backend startup invariants (LoRA hot-swap, residual capture, etc.).
+validate_backend = true
+
+# Optional: helps suppress any consistent leading reasoning blocks if present.
+detect_response_prefix = true
+
+# Production: store studies on persistent disk.
+study_checkpoint_dir = "/mnt/vdb/studies"
+
+# These are kept for parity with other backends (SGLang loads weights itself).
+dtypes = ["auto", "bfloat16", "float16", "float32"]
+device_map = "auto"
+quantization = "none"
+
+# Throughput-oriented batching.
+batch_size = 128
+max_batch_size = 128
+max_response_length = 100
+
+# Use orthogonalized refusal directions (production default).
+refusal_cache = true
+orthogonalize_direction = true
+
+# For DeepSeek (MoE), including experts often matters for strong refusal reduction.
+sglang_abliterate_include_projs = ["o_proj", "down_proj"]
+sglang_abliterate_include_experts = true
+
+# Exercise FULL rownorm path (server-side primitive via embedded engine).
+row_normalization = "full"
+full_normalization_lora_rank = 64
+
+# Refusal evaluation / verbosity
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+# Plot configuration (kept for parity; plots are disabled above).
+residual_plot_path = "/workspace/plots"
+residual_plot_title = "PaCMAP Projection of Residual Vectors for \"Harmless\" and \"Harmful\" Prompts"
+residual_plot_style = "dark_background"
+
+# Damage tuning
+damage_scale = 1.0
+damage_target = 0.01
+damage_noise_threshold = 0.075
+damage_retry_count = 5
+winsorization_quantile = 0.995
+
+# Damage metric
+damage_metric = "topk_js"
+delta_nll_continuation_tokens = 32
+delta_nll_num_refs = 1
+delta_nll_ref_temperatures = [0.0]
+delta_nll_ref_top_k = 1
+delta_nll_mom_buckets = 7
+
+topk_js_k = 128
+topk_js_positions = 32
+
+# Range for max_weight parameter during optimization.
+max_weight_min = 0.8
+max_weight_max = 5.0
+
+# Optimization budget
+n_trials = 800
+n_startup_trials = 150
+
+# System prompt to use when prompting the model.
+system_prompt = "You are a helpful assistant."
+
+# All SGLang Engine/ServerArgs kwargs go here.
+# Keys match `sglang.srt.server_args.ServerArgs` fields.
+#
+# IMPORTANT: this must be a TOML table (NOT an inline `{ ... }` table),
+# because TOML inline tables cannot span multiple lines.
+[sglang_offline_args]
+# Parallelism: DeepSeek-V3.2 DSA kernels are tuned for dp_size=8.
+tp_size = 8
+dp_size = 8
+enable_dp_attention = true
+
+# Let SGLang use the DeepSeek-V3.2 NSA backend.
+attention_backend = "nsa"
+
+# Hopper-friendly NSA kernel choices (bf16 KV cache + fa3 decode).
+kv_cache_dtype = "bfloat16"
+nsa_prefill_backend = "flashmla_sparse"
+nsa_decode_backend = "fa3"
+
+# Deterministic mode installs batch-invariant matmul/bmm overrides that can be brittle
+# on mixed/FP8 code paths. Prefer off unless you need it.
+enable_deterministic_inference = false
+
+# Memory/scheduling (tune to your workload)
+max_total_tokens = 50000
+enable_mixed_chunk = true
+
+# Required features for Heretic
+enable_return_hidden_states = true
+enable_lora = true
+
+# LoRA knobs (important for Heretic)
+max_lora_rank = 64
+lora_target_modules = ["o_proj", "down_proj"]
+enable_lora_experts = true
+max_loras_per_batch = 2
+max_loaded_loras = 4
+lora_backend = "csgmv"
+max_lora_chunk_size = 64
+enable_lora_overlap_loading = true
+
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+residual_plot_label = "\"Harmless\" prompts"
+residual_plot_color = "royalblue"
+
+[bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:400]"
+column = "text"
+residual_plot_label = "\"Harmful\" prompts"
+residual_plot_color = "darkorange"
+
+[good_evaluation_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+[bad_evaluation_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
+
