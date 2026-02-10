@@ -150,6 +150,9 @@ def validate_damage_metric_repeatability(
         raise BackendValidationError("Damage validation requires build_synthetic_adapter (LoRA hot-swap supported).")
 
     tensors, cfg = build_synthetic_adapter()
+    # Contract: this must be a *no-op* adapter (A=B=0), regardless of how the backend-specific
+    # adapter ABI is produced. (The LoRA sanity check uses a non-zero adapter; this check must not.)
+    tensors = {k: torch.zeros_like(v) for k, v in (tensors or {}).items()}
     load = getattr(backend, "load_adapter", None)
     unload = getattr(backend, "unload_adapter", None)
     if load is None or unload is None:
@@ -690,14 +693,23 @@ def run_startup_validations(
 
                 def _builder():
                     r = 1
+                    # Build a *non-zero* adapter for LoRA hot-swap sanity.
+                    #
+                    # We intentionally keep this deterministic and modest in magnitude so it:
+                    # - reliably changes outputs (max_abs_delta > ~1e-4),
+                    # - but does not destabilize the backend or saturate logits.
+                    g = torch.Generator()
+                    g.manual_seed(0)
+                    scale = 0.05
                     tensors = {
-                        key_a: torch.zeros((r, in_f), dtype=torch.float16),
-                        key_b: torch.zeros((out_f, r), dtype=torch.float16),
+                        key_a: (scale * torch.randn((r, in_f), generator=g)).to(torch.float16),
+                        key_b: (scale * torch.randn((out_f, r), generator=g)).to(torch.float16),
                     }
                     config = {
                         "peft_type": "LORA",
                         "r": r,
-                        "lora_alpha": r,
+                        # Amplify slightly to make the effect robust on very large models.
+                        "lora_alpha": 16,
                         "target_modules": target_modules,
                     }
                     return tensors, config
