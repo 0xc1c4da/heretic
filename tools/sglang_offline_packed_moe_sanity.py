@@ -251,6 +251,23 @@ def main() -> int:
     )
     packed = None
     if isinstance(mm, list):
+        # Record quick stats for debugging.
+        try:
+            evidence["runtime"]["down_proj_module_map_count"] = int(len(mm))
+            sample_paths = [
+                str(d.get("module_path"))
+                for d in mm
+                if isinstance(d, dict) and isinstance(d.get("module_path"), str)
+            ][:10]
+            evidence["runtime"]["down_proj_module_map_sample_paths"] = sample_paths
+            kinds: dict[str, int] = {}
+            for d in mm:
+                if isinstance(d, dict) and isinstance(d.get("kind"), str):
+                    kinds[str(d["kind"])] = int(kinds.get(str(d["kind"]), 0)) + 1
+            evidence["runtime"]["down_proj_module_map_kinds"] = dict(sorted(kinds.items()))
+        except Exception:
+            pass
+
         packed = next(
             (
                 d
