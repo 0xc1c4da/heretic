@@ -390,17 +390,52 @@ def main() -> int:
     evidence["adapter"]["picked_module_path"] = mp
     evidence["adapter"]["picked_dims"] = {"out_features": out_f, "in_features": in_f}
 
+    # Optional: discover packed MoE w2 targets (truthful fused expert weights).
+    packed_mm, _ = _time_call(
+        "module_map (discover packed w2_weight)",
+        lambda: model.backend.module_map(
+            include_projs=["down_proj"],
+            include_layers=[int(round(direction_index))],
+            include_experts=None,
+            max_experts_per_layer=None,
+            expert_strategy="first",
+        ),
+    )
+    if isinstance(packed_mm, list) and packed_mm and isinstance(packed_mm[0], list):
+        packed_mm = packed_mm[0]
+    packed_w2 = None
+    if isinstance(packed_mm, list):
+        packed_w2 = next(
+            (
+                d
+                for d in packed_mm
+                if isinstance(d, dict)
+                and d.get("kind") == "moe_packed_w2"
+                and isinstance(d.get("module_path"), str)
+            ),
+            None,
+        )
+    evidence["adapter"]["packed_w2_found"] = bool(packed_w2 is not None)
+    if packed_w2 is not None:
+        evidence["adapter"]["packed_w2_module_path"] = str(packed_w2["module_path"])
+
     def _run_adapter_case(
         *,
         name: str,
         tensors: dict[str, torch.Tensor],
         config_dict: dict[str, Any],
         note: str,
+        post_load_fn=None,
     ) -> None:
         adapter_id, _ = _time_call(
             f"load_adapter({name})",
             lambda: model.backend.load_adapter(name=name, tensors=tensors, config=config_dict),
         )
+        if post_load_fn is not None and adapter_id is not None:
+            _time_call(
+                f"{name}: post_load_fn",
+                lambda: post_load_fn(str(adapter_id)),
+            )
         lp_adr, _ = _time_call(
             f"score(adapter {name})",
             lambda: _score_full_vocab(model, eval_prompts, adapter=adapter_id),
@@ -499,6 +534,32 @@ def main() -> int:
         config_dict=cfg0,
         note=f"module_path={mp} rank=1",
     )
+
+    # Case A2: packed-w2 FULL builder + injection, registered under a standard lora_id.
+    if packed_w2 is not None:
+        packed_name = str(packed_w2["module_path"])
+        packed_layer = packed_w2.get("layer")
+        if not isinstance(packed_layer, int):
+            packed_layer = int(round(direction_index))
+
+        def _register_packed(adapter_id: str) -> None:
+            v_local = refusal_directions[int(packed_layer)].detach().to(torch.float32).cpu()
+            model.backend.build_packed_w2_full_rownorm(
+                lora_id=str(adapter_id),
+                name=str(packed_name),
+                v=v_local,
+                weight=1e-3,
+                rank=1,
+                out_dtype="float16",
+            )
+
+        _run_adapter_case(
+            name="packed_w2_full_rank1",
+            tensors=tensors0,
+            config_dict=cfg0,
+            note=f"packed_name={packed_name} rank=1 weight=1e-3",
+            post_load_fn=_register_packed,
+        )
 
     # Case B: FULL rownorm builder for one module (rank reduced for smoke speed).
     # This exercises the same SGLang primitive Heretic uses under row_normalization=full,

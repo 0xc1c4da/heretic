@@ -25,6 +25,14 @@ class LoraAdapterBundle:
     config_dict: dict[str, Any]
     base_model_name_or_path: str
     stats: dict[str, Any] | None = None
+    # Optional Heretic extension: packed-MoE w2 FULL-build registration requests.
+    # Each item should contain:
+    #   - name: str (packed param path, e.g. "...experts.w2_weight")
+    #   - v: torch.Tensor (float32, shape [out_features])
+    #   - weight: float
+    #   - rank: int
+    #   - out_dtype: str (e.g. "float16")
+    packed_w2_full_builds: list[dict[str, Any]] | None = None
 
     def assert_valid(self) -> None:
         if not isinstance(self.tensors, dict) or not self.tensors:
@@ -82,6 +90,23 @@ class LoraAdapterBundle:
             raise ValueError(
                 "LoRA bundle tensor keys contain no `layers.<idx>.` segments; SGLang will treat them as non-layer weights."
             )
+
+        # Packed build requests (optional).
+        if self.packed_w2_full_builds is not None:
+            if not isinstance(self.packed_w2_full_builds, list):
+                raise ValueError("packed_w2_full_builds must be a list when provided.")
+            for it in self.packed_w2_full_builds:
+                if not isinstance(it, dict):
+                    raise ValueError("packed_w2_full_builds items must be dicts.")
+                if not isinstance(it.get("name"), str):
+                    raise ValueError("packed_w2_full_builds item missing string 'name'.")
+                v = it.get("v")
+                if not isinstance(v, torch.Tensor) or v.ndim != 1:
+                    raise ValueError("packed_w2_full_builds item 'v' must be a 1D torch.Tensor.")
+                if not isinstance(it.get("weight"), (int, float)):
+                    raise ValueError("packed_w2_full_builds item missing numeric 'weight'.")
+                if not isinstance(it.get("rank"), int):
+                    raise ValueError("packed_w2_full_builds item missing int 'rank'.")
 
         # Config sanity: require keys used by both PEFT and SGLang.
         cfg = self.config_dict

@@ -561,6 +561,7 @@ class Model:
             export_tensors=True,
         )
         assert tensors is not None
+        packed_w2_full_builds = getattr(self, "_sglang_last_packed_w2_full_builds", None)
 
         # PEFT + SGLang compatible config.
         cfg = {
@@ -582,6 +583,9 @@ class Model:
                 "exported_tensors": int(len(tensors)),
                 "backend": str(self._backend_type),
             },
+            packed_w2_full_builds=(
+                list(packed_w2_full_builds) if isinstance(packed_w2_full_builds, list) else None
+            ),
         )
         bundle.assert_valid()
         return bundle
@@ -774,6 +778,9 @@ class Model:
                 kept += 1
 
             exported: dict[str, Tensor] = {}
+            packed_w2_full_builds: list[dict[str, Any]] = []
+            # Stash for the caller (used by `build_lora_adapter_bundle`).
+            self._sglang_last_packed_w2_full_builds = packed_w2_full_builds
 
             # Precompute v^T W for all rank-1 modules in one batch call when possible.
             vtw_by_name: dict[str, list[float]] = {}
@@ -824,10 +831,28 @@ class Model:
 
                 for p in paths:
                     module_base = p[: -len(".weight")] if p.endswith(".weight") else p
+                    info = info_by_path.get(p)
+                    kind = info.get("kind") if isinstance(info, dict) else None
+
+                    # Packed MoE down-projection weights are not exported as PEFT tensors.
+                    # Instead, we register per-local-expert factors in the SGLang engine after the
+                    # adapter is loaded (keyed by lora_id).
+                    if kind == "moe_packed_w2":
+                        exported_target_modules.add("down_proj")
+                        packed_w2_full_builds.append(
+                            {
+                                "name": p,
+                                "v": v_vec.detach().to(torch.float32).cpu(),
+                                "weight": float(w),
+                                "rank": int(self.settings.full_normalization_lora_rank),
+                                "out_dtype": "float16",
+                            }
+                        )
+                        continue
+
                     exported_target_modules.add(module_base.split(".")[-1])
 
                     # Provide a clear, local error before calling into backend primitives.
-                    info = info_by_path.get(p)
                     if info is not None and isinstance(info.get("out_features"), int):
                         out_f = int(info["out_features"])
                         v_len = int(v_vec.numel())

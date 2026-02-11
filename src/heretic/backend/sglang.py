@@ -685,6 +685,42 @@ class SGLangBackend(HereticBackend):
         B = torch.from_numpy(arr_b.astype(np.float32, copy=False))
         return A, B
 
+    def build_packed_w2_full_rownorm(
+        self,
+        *,
+        lora_id: str,
+        name: str,
+        v: torch.Tensor,
+        weight: float,
+        rank: int,
+        out_dtype: str = "float16",
+        svd_q: int | None = None,
+        svd_niter: int = 6,
+        clear_existing: bool = True,
+        timeout_s: float = 1800.0,
+    ) -> dict[str, Any]:
+        """Build+register packed MoE w2 FULL factors via HTTP endpoint."""
+        payload = {
+            "lora_id": str(lora_id),
+            "name": str(name),
+            "v": [float(x) for x in v.detach().to(torch.float32).cpu().tolist()],
+            "weight": float(weight),
+            "rank": int(rank),
+            "svd_q": int(svd_q) if svd_q is not None else None,
+            "svd_niter": int(svd_niter),
+            "out_dtype": str(out_dtype),
+            "clear_existing": bool(clear_existing),
+        }
+        resp = _post_json(
+            f"{self.base_url}/heretic/build_packed_w2_full_rownorm",
+            payload,
+            timeout_s=timeout_s,
+        )
+        data = resp.data
+        if not isinstance(data, dict) or not bool(data.get("success", False)):
+            raise RuntimeError(f"Unexpected /heretic/build_packed_w2_full_rownorm response: {data}")
+        return data
+
     def capture_residuals(
         self,
         input_ids_batch: list[list[int]],
@@ -957,6 +993,16 @@ class SGLangBackend(HereticBackend):
             {"lora_name": name, "lora_id": lora_id},
             timeout_s=60.0,
         )
+        if lora_id is not None:
+            # Best-effort cleanup for packed-MoE payload associated with this adapter id.
+            try:
+                _post_json(
+                    f"{self.base_url}/heretic/unload_packed_moe_adapter",
+                    {"lora_id": str(lora_id)},
+                    timeout_s=60.0,
+                )
+            except Exception:
+                pass
         if lora_id is not None:
             self._adapter_ids_by_name.pop(name, None)
 

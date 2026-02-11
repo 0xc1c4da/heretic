@@ -196,6 +196,21 @@ class SGLangOfflineBackend(HereticBackend):
         engine_args: dict[str, Any] | None = None,
         hidden_states_dump_path: str | None = None,
     ):
+        # Config-driven control for SGLang MoE fused-path behavior.
+        #
+        # SGLang's `MoeRunner` can bypass runner_core via fused functions depending on backend and
+        # environment. Heretic's packed-MoE injection requires the non-fused runner_core path
+        # (for `triton` / `deep_gemm`). SGLang currently gates this via the env var
+        # `SGLANG_CI_DISABLE_MOE_FUSED_FUNC=1`.
+        #
+        # For the embedded/offline backend, prefer a TOML-driven switch over relying on the shell
+        # environment. Users can set one of these keys under `[sglang_offline_args]`:
+        # - `heretic_disable_moe_fused_func = true` (preferred)
+        # - `disable_moe_fused_func = true` (alias)
+        #
+        # We pop the key(s) before constructing `Engine(**args)` so SGLang does not see them.
+        import os
+
         try:
             from sglang.version import __version__ as sglang_version
             from sglang.srt.entrypoints.engine import Engine
@@ -213,6 +228,11 @@ class SGLangOfflineBackend(HereticBackend):
         self._hidden_states_dump_path = str(hidden_states_dump_path) if hidden_states_dump_path else None
 
         args = dict(engine_args or {})
+        disable_fused = bool(args.pop("heretic_disable_moe_fused_func", False)) or bool(
+            args.pop("disable_moe_fused_func", False)
+        )
+        if disable_fused:
+            os.environ["SGLANG_CI_DISABLE_MOE_FUSED_FUNC"] = "1"
         args.setdefault("model_path", model_path)
         args.setdefault("trust_remote_code", bool(trust_remote_code))
 
@@ -580,6 +600,44 @@ class SGLangOfflineBackend(HereticBackend):
         A = torch.from_numpy(arr_a.astype(np.float32, copy=False))
         B = torch.from_numpy(arr_b.astype(np.float32, copy=False))
         return A, B
+
+    def build_packed_w2_full_rownorm(
+        self,
+        *,
+        lora_id: str,
+        name: str,
+        v: torch.Tensor,
+        weight: float,
+        rank: int,
+        out_dtype: str = "float16",
+        svd_q: int | None = None,
+        svd_niter: int = 6,
+        clear_existing: bool = True,
+        timeout_s: float = 1800.0,
+    ) -> dict[str, Any]:
+        """Build+register packed MoE w2 FULL factors inside the embedded SGLang engine."""
+        from sglang.srt.managers.io_struct import HereticBuildPackedW2FullRownormReqInput
+
+        obj = HereticBuildPackedW2FullRownormReqInput(
+            lora_id=str(lora_id),
+            name=str(name),
+            v=[float(x) for x in v.detach().to(torch.float32).cpu().tolist()],
+            weight=float(weight),
+            rank=int(rank),
+            svd_q=int(svd_q) if svd_q is not None else None,
+            svd_niter=int(svd_niter),
+            out_dtype=str(out_dtype),
+            clear_existing=bool(clear_existing),
+        )
+        _ = timeout_s
+        data = self._run(
+            self._engine.tokenizer_manager.heretic_build_packed_w2_full_rownorm(obj, None)
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected build_packed_w2_full_rownorm output: {data}")
+        if not bool(data.get("success", False)):
+            raise RuntimeError(f"Packed w2 build failed: {data}")
+        return data
 
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
         logprobs_full, per_row_meta = self._score_full_vocab_with_lora_ids_and_meta(
@@ -1186,6 +1244,17 @@ class SGLangOfflineBackend(HereticBackend):
         out = self._run(self._engine.tokenizer_manager.unload_lora_adapter(obj, None))
         if not getattr(out, "success", True):
             raise RuntimeError(f"Unexpected unload_lora_adapter output: {out}")
+        if lora_id is not None:
+            # Best-effort cleanup for packed-MoE payload associated with this adapter id.
+            try:
+                from sglang.srt.managers.io_struct import HereticUnloadPackedMoEAdapterReqInput
+
+                pobj = HereticUnloadPackedMoEAdapterReqInput(lora_id=str(lora_id))
+                _ = self._run(
+                    self._engine.tokenizer_manager.heretic_unload_packed_moe_adapter(pobj, None)
+                )
+            except Exception:
+                pass
         if lora_id is not None:
             self._adapter_ids_by_name.pop(name, None)
 
