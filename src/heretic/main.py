@@ -654,6 +654,20 @@ def run():
                             v=it["v"],
                             weight=float(it["weight"]),
                             rank=int(it["rank"]),
+                            svd_q=(
+                                int(it["svd_q"])
+                                if it.get("svd_q", None) is not None
+                                else None
+                            ),
+                            svd_niter=int(it.get("svd_niter", 6)),
+                            build_device=str(it.get("build_device", "auto")),
+                            expert_chunk_size=int(it.get("expert_chunk_size", 8)),
+                            max_experts=(
+                                int(it["max_experts"])
+                                if it.get("max_experts", None) is not None
+                                else None
+                            ),
+                            max_identity_k=int(it.get("max_identity_k", 2048)),
                             out_dtype=str(it.get("out_dtype") or "float16"),
                         )
                 print("* Evaluating...")
@@ -973,6 +987,33 @@ def run():
                     tensors=bundle.tensors,
                     config=bundle.config_dict,
                 )
+
+                # Accurate rebuild for packed-MoE w2 factors (final/selected trials).
+                if (
+                    adapter_id is not None
+                    and getattr(bundle, "packed_w2_full_builds", None)
+                ):
+                    for it in bundle.packed_w2_full_builds or []:
+                        model.backend.build_packed_w2_full_rownorm(
+                            lora_id=str(adapter_id),
+                            name=str(it["name"]),
+                            v=it["v"],
+                            weight=float(it["weight"]),
+                            rank=int(it["rank"]),
+                            svd_q=getattr(settings, "sglang_packed_w2_svd_q", None),
+                            svd_niter=int(getattr(settings, "sglang_packed_w2_svd_niter", 6)),
+                            build_device=str(
+                                getattr(settings, "sglang_packed_w2_build_device", "auto")
+                            ),
+                            expert_chunk_size=int(
+                                getattr(settings, "sglang_packed_w2_expert_chunk_size", 8)
+                            ),
+                            max_experts=None,
+                            max_identity_k=int(
+                                getattr(settings, "sglang_packed_w2_max_identity_k", 2048)
+                            ),
+                            out_dtype=str(it.get("out_dtype") or "float16"),
+                        )
 
             try:
                 while True:

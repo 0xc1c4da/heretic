@@ -45,11 +45,26 @@ max_response_length = 100
 refusal_cache = true
 orthogonalize_direction = true
 sglang_abliterate_include_projs = ["o_proj", "down_proj"]
-sglang_abliterate_include_experts = false
+# Kimi-K2.5 is MoE; excluding routed experts makes ablation largely ineffective.
+sglang_abliterate_include_experts = true
 
 # Exercise FULL rownorm path (server-side primitive via embedded engine).
 row_normalization = "full"
-full_normalization_lora_rank = 64
+# Keep consistent with the historical local-backend default (commit 3525b1a...): rank=3 for FULL rownorm.
+full_normalization_lora_rank = 3
+
+# Packed-MoE (packed w2) FULL rownorm builder performance knobs (GPU-first).
+# Trials: use fast mode (reduced SVD effort, optional expert cap), then rebuild accurately when selecting a trial.
+sglang_packed_w2_trial_mode = "fast"          # "fast" | "accurate" | "skip"
+sglang_packed_w2_build_device = "auto"        # "auto" | "cuda" | "cpu"
+sglang_packed_w2_expert_chunk_size = 8        # build experts in chunks to cap peak memory
+sglang_packed_w2_max_experts_fast = 32        # cap experts per layer during trials (set to 384 for full)
+sglang_packed_w2_max_identity_k = 2048        # Marlin snapshot identity GEMM guard
+sglang_packed_w2_svd_niter_fast = 2
+sglang_packed_w2_svd_niter = 6
+# Optional: override q for svd_lowrank; unset uses the backend default (2*r + 4).
+# sglang_packed_w2_svd_q_fast = 8
+# sglang_packed_w2_svd_q = 16
 
 # Refusal evaluation / verbosity
 print_responses = false
@@ -65,8 +80,8 @@ residual_plot_style = "dark_background"
 damage_scale = 1.0
 damage_target = 0.01
 # topk_js noise observed near ~0.05 on TP8; allow a bit of slack and retry once.
-damage_noise_threshold = 0.07
-damage_retry_count = 2
+damage_noise_threshold = 0.075
+damage_retry_count = 5
 winsorization_quantile = 0.995
 
 # Damage metric

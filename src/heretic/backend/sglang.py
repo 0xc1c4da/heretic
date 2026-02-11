@@ -696,6 +696,10 @@ class SGLangBackend(HereticBackend):
         out_dtype: str = "float16",
         svd_q: int | None = None,
         svd_niter: int = 6,
+        build_device: str = "auto",
+        expert_chunk_size: int = 8,
+        max_experts: int | None = None,
+        max_identity_k: int = 2048,
         clear_existing: bool = True,
         timeout_s: float = 1800.0,
     ) -> dict[str, Any]:
@@ -708,6 +712,10 @@ class SGLangBackend(HereticBackend):
             "rank": int(rank),
             "svd_q": int(svd_q) if svd_q is not None else None,
             "svd_niter": int(svd_niter),
+            "build_device": str(build_device),
+            "expert_chunk_size": int(expert_chunk_size),
+            "max_experts": int(max_experts) if max_experts is not None else None,
+            "max_identity_k": int(max_identity_k),
             "out_dtype": str(out_dtype),
             "clear_existing": bool(clear_existing),
         }
