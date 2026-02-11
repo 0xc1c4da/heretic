@@ -174,6 +174,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    sglang_full_rownorm_build_device: Literal["auto", "cuda", "cpu"] = Field(
+        default="auto",
+        description=(
+            "Device preference for SGLang server-side FULL rownorm factor construction "
+            "(`heretic_build_full_rownorm_lora`). "
+            "'auto' uses CUDA when available; 'cuda' requires CUDA; 'cpu' forces CPU."
+        ),
+    )
+
+    sglang_prompt_source: Literal["sglang", "hf"] = Field(
+        default="sglang",
+        description=(
+            "When backend is 'sglang' or 'sglang_offline', which prompt token IDs to use for evaluation.\n"
+            "- 'sglang' uses backend.tokenize_chat (SGLang's canonical template/tokenizer).\n"
+            "- 'hf' uses local tokenizer.apply_chat_template (HF-local source of truth).\n"
+            "If 'hf' is used, the resulting input_ids are passed directly to SGLang (bypassing SGLang chat templating)."
+        ),
+    )
+
     # Packed-MoE (packed w2) FULL rownorm builder performance knobs (SGLang backends).
     sglang_packed_w2_trial_mode: Literal["fast", "accurate", "skip"] = Field(
         default="fast",

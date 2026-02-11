@@ -11,6 +11,8 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
+from .sglang_sampling import hf_greedy_sampling_params
+
 from .base import (
     BackendMetadata,
     HereticBackend,
@@ -284,7 +286,7 @@ class SGLangOfflineBackend(HereticBackend):
             max_context_len=getattr(tm.model_config, "context_len", None),
             supports={
                 "input_ids": True,
-                "prompt_ids_sha256": False,
+                "prompt_ids_sha256": True,
                 "capture_layers": True,
                 "logprobs_full": True,
                 # Paired base-vs-adapted scoring in one engine call/batch.
@@ -353,7 +355,7 @@ class SGLangOfflineBackend(HereticBackend):
             #
             # IMPORTANT: use prefill-only scoring (max_new_tokens=0). The prompt-boundary next-token
             # distribution exists at the end of EXTEND/prefill. Decode is not guaranteed to run.
-            sampling_params={"max_new_tokens": 0, "temperature": 0.0, "top_k": 1},
+            sampling_params=hf_greedy_sampling_params(max_new_tokens=0),
             stream=False,
             # For Heretic full-vocab scoring, we do NOT need input logprobs and should avoid the
             # return_logprob=True path (it changes pruning/padding behavior in logits processing).
@@ -423,6 +425,8 @@ class SGLangOfflineBackend(HereticBackend):
 
         out_t = torch.stack(rows, dim=0)
         out_meta: dict[str, Any] = {
+            # Stable prompt identity at scoring boundary.
+            "prompt_ids_sha256": prompt_sha256,
             "heretic_input_ids_sha256": prompt_sha256,
             "heretic_tp_rank": tp_rank,
             "heretic_vocab_dim": vocab_dim,
@@ -539,6 +543,7 @@ class SGLangOfflineBackend(HereticBackend):
                     name=str(it["name"]),
                     v=[float(x) for x in it["v"]],
                     dtype=str(it.get("dtype") or "float32"),
+                    row_normalization=str(it.get("row_normalization") or "none"),
                 )
             )
         obj = ComputeVTWBatchReqInput(items=batch_items)
@@ -559,6 +564,7 @@ class SGLangOfflineBackend(HereticBackend):
         out_dtype: str = "float16",
         svd_q: int | None = None,
         svd_niter: int = 6,
+        build_device: str = "auto",
         timeout_s: float = 600.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.managers.io_struct import HereticBuildFullRownormLoraReqInput
@@ -570,6 +576,7 @@ class SGLangOfflineBackend(HereticBackend):
             rank=int(rank),
             svd_q=int(svd_q) if svd_q is not None else None,
             svd_niter=int(svd_niter),
+            build_device=str(build_device),
             out_dtype=str(out_dtype),
         )
         _ = timeout_s
@@ -713,9 +720,14 @@ class SGLangOfflineBackend(HereticBackend):
     ) -> list[str]:
         from sglang.srt.managers.io_struct import GenerateReqInput
 
+        if float(temperature) == 0.0:
+            sp = hf_greedy_sampling_params(max_new_tokens=int(max_new_tokens))
+        else:
+            sp = {"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)}
+
         obj = GenerateReqInput(
             input_ids=input_ids_batch,
-            sampling_params={"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)},
+            sampling_params=sp,
             stream=False,
             return_logprob=False,
             lora_id=adapter,
@@ -741,9 +753,12 @@ class SGLangOfflineBackend(HereticBackend):
         """Generate token IDs (no detokenization), SGLang offline only."""
         from sglang.srt.managers.io_struct import GenerateReqInput
 
-        sp: dict[str, Any] = {"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)}
-        if top_k is not None:
-            sp["top_k"] = int(top_k)
+        if float(temperature) == 0.0 and (top_k is None or int(top_k) == 1):
+            sp = hf_greedy_sampling_params(max_new_tokens=int(max_new_tokens))
+        else:
+            sp: dict[str, Any] = {"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)}
+            if top_k is not None:
+                sp["top_k"] = int(top_k)
         obj = GenerateReqInput(
             input_ids=input_ids_batch,
             sampling_params=sp,
@@ -1142,7 +1157,7 @@ class SGLangOfflineBackend(HereticBackend):
 
         obj = GenerateReqInput(
             input_ids=input_ids_batch,
-            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+            sampling_params=hf_greedy_sampling_params(max_new_tokens=1),
             stream=False,
             return_hidden_states=True,
             capture_layers=capture_layers,

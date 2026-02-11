@@ -411,8 +411,20 @@ def validate_prompt_equivalence(
 
     expected = [sha256_token_ids(ids) for ids in input_ids_batch]
     result = backend.score(input_ids_batch)
-    raw = (result.meta or {}).get("raw")
-    got = _extract_prompt_hashes_from_raw(raw)
+
+    # Prefer explicit meta fields when the backend provides them.
+    meta = result.meta or {}
+    got: list[str | None] = []
+    if isinstance(meta.get("prompt_ids_sha256"), list):
+        got = [x if isinstance(x, str) else None for x in meta.get("prompt_ids_sha256") or []]
+    elif isinstance(meta.get("heretic_input_ids_sha256"), list):
+        got = [
+            x if isinstance(x, str) else None
+            for x in meta.get("heretic_input_ids_sha256") or []
+        ]
+    else:
+        raw = meta.get("raw")
+        got = _extract_prompt_hashes_from_raw(raw)
 
     # If the response only has one hash, treat it as ambiguous but still validate
     # when there's only one prompt in batch.
@@ -431,6 +443,77 @@ def validate_prompt_equivalence(
             raise PromptMismatchError(f"Missing prompt_ids_sha256 for batch item {i}.")
         if g != e:
             raise PromptMismatchError(f"Prompt hash mismatch at {i}: expected {e}, got {g}")
+
+
+def validate_tokenize_chat_equivalence(
+    backend: HereticBackend,
+    *,
+    prompts: list[Prompt],
+    trust_remote_code: bool | None,
+    model_id: str,
+) -> None:
+    """Best-effort check: HF apply_chat_template token IDs == backend.tokenize_chat token IDs.
+
+    This specifically catches drift between the HF template/tokenizer and SGLang's internal
+    chat processing. It only runs when backend supports tokenize_chat and when we can
+    load an HF tokenizer.
+    """
+    supports = backend.get_metadata().supports
+    if not bool(supports.get("tokenize_chat", False)):
+        return
+
+    try:
+        from transformers import AutoTokenizer  # ty: ignore[unresolved-import]
+    except Exception:
+        # Transformers not available in minimal envs.
+        return
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    try:
+        tokenizer.padding_side = "left"
+    except Exception:
+        pass
+
+    chats = [
+        [
+            {"role": "system", "content": p.system},
+            {"role": "user", "content": p.user},
+        ]
+        for p in prompts
+    ]
+
+    # Backend canonical
+    out = backend.tokenize_chat(chats, continue_final_message=False)
+    backend_ids = out.token_ids
+
+    # HF canonical
+    hf_ids = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
+        chats,
+        add_generation_prompt=True,
+        tokenize=True,
+    )
+
+    if not isinstance(hf_ids, list) or not hf_ids or not all(isinstance(x, list) for x in hf_ids):
+        raise PromptMismatchError("HF apply_chat_template returned unexpected token-id schema.")
+
+    if len(hf_ids) != len(backend_ids):
+        raise PromptMismatchError(
+            f"tokenize_chat batch size mismatch: hf={len(hf_ids)} backend={len(backend_ids)}"
+        )
+
+    for i, (a, b) in enumerate(zip(hf_ids, backend_ids, strict=True)):
+        if [int(x) for x in a] != [int(x) for x in b]:
+            ha = sha256_token_ids([int(x) for x in a])
+            hb = sha256_token_ids([int(x) for x in b])
+            raise PromptMismatchError(
+                "HF vs backend chat-tokenization mismatch.\n"
+                f"- item={i}\n"
+                f"- hf_sha256={ha}\n"
+                f"- backend_sha256={hb}\n"
+                f"- hf_len={len(a)} backend_len={len(b)}"
+            )
 
 
 def _iter_prompts_in_batches(prompts: list[Prompt], *, batch_size: int) -> Iterable[list[Prompt]]:
@@ -725,6 +808,16 @@ def run_startup_validations(
     # 1) Prompt equivalence
     try:
         validate_prompt_equivalence(backend, input_ids_batch=input_ids_batch)
+        # Additional best-effort check for chat template/tokenizer drift.
+        if settings is not None:
+            model_id = getattr(settings, "model", None)
+            if isinstance(model_id, str) and model_id:
+                validate_tokenize_chat_equivalence(
+                    backend,
+                    prompts=sample[: min(3, len(sample))],
+                    trust_remote_code=getattr(settings, "trust_remote_code", None),
+                    model_id=str(model_id),
+                )
     except Exception as e:
         prompt_ok = False
         notes.append(f"prompt_equivalence failed: {e}")

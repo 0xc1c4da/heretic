@@ -163,6 +163,7 @@ def _build_full_rownorm_adapter(
     rank: int,
     hidden_size: int,
     weight: float,
+    build_device: str = "auto",
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     """
     Build a minimal adapter (PEFT-style keys) for one module using SGLang's FULL rownorm builder.
@@ -182,6 +183,7 @@ def _build_full_rownorm_adapter(
         weight=float(weight),
         rank=int(rank),
         out_dtype="float16",
+        build_device=str(build_device),
     )
 
     # Fail fast if the backend produced invalid factors (this would poison scoring/KL).
@@ -356,6 +358,12 @@ def main() -> int:
     )
     ap.add_argument("--rank", type=int, default=64, help="LoRA rank for FULL rownorm sanity adapter.")
     ap.add_argument(
+        "--full-build-device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="Device preference for server-side FULL rownorm factor construction.",
+    )
+    ap.add_argument(
         "--adapter-mode",
         choices=["full_rownorm_zero", "explicit_zero"],
         default="full_rownorm_zero",
@@ -525,6 +533,7 @@ def main() -> int:
                 rank=int(args.rank),
                 hidden_size=hidden_size,
                 weight=w,
+                build_device=str(args.full_build_device),
             )
             label = f"full_rownorm(weight={w:g})"
 

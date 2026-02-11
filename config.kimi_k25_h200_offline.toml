@@ -48,17 +48,24 @@ sglang_abliterate_include_projs = ["o_proj", "down_proj"]
 # Kimi-K2.5 is MoE; excluding routed experts makes ablation largely ineffective.
 sglang_abliterate_include_experts = true
 
+# Prompt token-id source for SGLang backends.
+# - "sglang": use SGLang tokenize_chat (default)
+# - "hf": use HF apply_chat_template locally and pass those input_ids directly to SGLang
+sglang_prompt_source = "sglang"
+
 # Exercise FULL rownorm path (server-side primitive via embedded engine).
 row_normalization = "full"
 # Keep consistent with the historical local-backend default (commit 3525b1a...): rank=3 for FULL rownorm.
 full_normalization_lora_rank = 3
+# Device preference for SGLang server-side FULL rownorm factor construction.
+sglang_full_rownorm_build_device = "cuda"      # "auto" | "cuda" | "cpu"
 
 # Packed-MoE (packed w2) FULL rownorm builder performance knobs (GPU-first).
 # Trials: use fast mode (reduced SVD effort, optional expert cap), then rebuild accurately when selecting a trial.
-sglang_packed_w2_trial_mode = "fast"          # "fast" | "accurate" | "skip"
-sglang_packed_w2_build_device = "auto"        # "auto" | "cuda" | "cpu"
+sglang_packed_w2_trial_mode = "accurate"          # "fast" | "accurate" | "skip"
+sglang_packed_w2_build_device = "cuda"        # "auto" | "cuda" | "cpu"
 sglang_packed_w2_expert_chunk_size = 8        # build experts in chunks to cap peak memory
-sglang_packed_w2_max_experts_fast = 32        # cap experts per layer during trials (set to 384 for full)
+sglang_packed_w2_max_experts_fast = 384        # cap experts per layer during trials (set to 384 for full)
 sglang_packed_w2_max_identity_k = 2048        # Marlin snapshot identity GEMM guard
 sglang_packed_w2_svd_niter_fast = 2
 sglang_packed_w2_svd_niter = 6
@@ -106,7 +113,7 @@ max_weight_max = 6.0
 
 # Optimization budget
 n_trials = 800
-n_startup_trials = 150
+n_startup_trials = 50
 
 # Strings whose presence in a response (case insensitive) identifies the response as a refusal.
 refusal_markers = [
@@ -157,7 +164,7 @@ system_prompt = "You are a helpful assistant."
 tp_size = 8
 
 # Kernel backends (high leverage)
-attention_backend = "flashinfer"
+attention_backend = "triton"
 
 # Optional: stronger determinism at a performance cost (SGLang batch-invariant ops).
 enable_deterministic_inference = true
