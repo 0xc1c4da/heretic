@@ -362,7 +362,7 @@ def main() -> int:
     v[0] = 1.0
     v = F.normalize(v, p=2, dim=0)
 
-    _time_call(
+    build_out, _ = _time_call(
         "build_packed_w2_full_rownorm(rank=1, w=1e-3)",
         lambda: model.backend.build_packed_w2_full_rownorm(
             lora_id=str(adapter_id),
@@ -373,6 +373,9 @@ def main() -> int:
             out_dtype="float16",
         ),
     )
+    evidence["runtime"]["packed_build"] = dict(build_out) if isinstance(build_out, dict) else build_out
+    if not (isinstance(build_out, dict) and bool(build_out.get("success", False))):
+        raise RuntimeError(f"packed_w2 build failed: {build_out}")
 
     # Mixed-batch correctness: within-call paired scoring must change adapted rows but not base rows.
     ids = model.encode_prompts(eval_prompts)
