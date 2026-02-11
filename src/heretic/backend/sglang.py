@@ -12,6 +12,8 @@ from typing import Any
 import torch
 import numpy as np
 
+from .sglang_sampling import hf_greedy_sampling_params
+
 from .base import (
     BackendMetadata,
     HereticBackend,
@@ -513,10 +515,11 @@ class SGLangBackend(HereticBackend):
             f"{self.base_url}/generate",
             {
                 "input_ids": input_ids_batch,
-                "sampling_params": {
-                    "max_new_tokens": int(max_new_tokens),
-                    "temperature": float(temperature),
-                },
+                "sampling_params": (
+                    hf_greedy_sampling_params(max_new_tokens=int(max_new_tokens))
+                    if float(temperature) == 0.0
+                    else {"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)}
+                ),
                 "stream": False,
                 "return_logprob": False,
                 "lora_id": adapter,
@@ -550,9 +553,12 @@ class SGLangBackend(HereticBackend):
 
         This is used to cache base continuations for paired damage metrics.
         """
-        sp: dict[str, Any] = {"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)}
-        if top_k is not None:
-            sp["top_k"] = int(top_k)
+        if float(temperature) == 0.0 and (top_k is None or int(top_k) == 1):
+            sp = hf_greedy_sampling_params(max_new_tokens=int(max_new_tokens))
+        else:
+            sp: dict[str, Any] = {"max_new_tokens": int(max_new_tokens), "temperature": float(temperature)}
+            if top_k is not None:
+                sp["top_k"] = int(top_k)
         extra_key = [uuid.uuid4().hex for _ in range(len(input_ids_batch))]
         resp = _post_json(
             f"{self.base_url}/generate",
@@ -639,6 +645,7 @@ class SGLangBackend(HereticBackend):
         out_dtype: str = "float16",
         svd_q: int | None = None,
         svd_niter: int = 6,
+        build_device: str = "auto",
         timeout_s: float = 600.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Call SGLang /heretic/build_full_rownorm_lora and decode factors."""
@@ -651,6 +658,7 @@ class SGLangBackend(HereticBackend):
                 "rank": int(rank),
                 "svd_q": svd_q,
                 "svd_niter": int(svd_niter),
+                "build_device": str(build_device),
                 "out_dtype": out_dtype,
             },
             timeout_s=timeout_s,

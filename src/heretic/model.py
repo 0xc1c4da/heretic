@@ -787,6 +787,7 @@ class Model:
 
             # Precompute v^T W for all rank-1 modules in one batch call when possible.
             vtw_by_name: dict[str, list[float]] = {}
+            row_norms_by_name: dict[str, list[float]] = {}
             if self.settings.row_normalization != RowNormalization.FULL:
                 items: list[dict[str, Any]] = []
                 for (layer_index, comp), paths in by_layer_component.items():
@@ -804,6 +805,11 @@ class Model:
                                 "name": p,
                                 "v": v_vec.detach().to(torch.float32).cpu().tolist(),
                                 "dtype": "float32",
+                                "row_normalization": (
+                                    "pre"
+                                    if self.settings.row_normalization == RowNormalization.PRE
+                                    else "none"
+                                ),
                             }
                         )
                 if items:
@@ -811,8 +817,15 @@ class Model:
                     for r in results:
                         name = r.get("name")
                         vtw = r.get("vtw")
+                        rn = r.get("row_norms")
                         if isinstance(name, str) and isinstance(vtw, list):
                             vtw_by_name[name] = vtw
+                        if (
+                            self.settings.row_normalization == RowNormalization.PRE
+                            and isinstance(name, str)
+                            and isinstance(rn, list)
+                        ):
+                            row_norms_by_name[name] = rn
 
             for (layer_index, comp), paths in by_layer_component.items():
                 params = parameters[comp]
@@ -912,13 +925,23 @@ class Model:
                             weight=float(w),
                             rank=int(self.settings.full_normalization_lora_rank),
                             out_dtype="float16",
+                            build_device=str(
+                                getattr(self.settings, "sglang_full_rownorm_build_device", "auto")
+                            ),
                         )
                     else:
                         vtw = vtw_by_name.get(p)
                         if vtw is None:
                             raise RuntimeError(f"Missing v^T W for module {p}")
                         A = torch.tensor(vtw, dtype=torch.float32).view(1, -1)
-                        B = (-float(w) * v_vec).view(-1, 1)
+                        if self.settings.row_normalization == RowNormalization.PRE:
+                            rn = row_norms_by_name.get(p)
+                            if rn is None:
+                                raise RuntimeError(f"Missing row_norms for PRE module {p}")
+                            row_norms_t = torch.tensor(rn, dtype=torch.float32).view(-1, 1)
+                            B = row_norms_t * (-float(w) * v_vec).view(-1, 1)
+                        else:
+                            B = (-float(w) * v_vec).view(-1, 1)
 
                     # Preflight: ensure exported shapes match backend logical dims when provided.
                     # The backend's module_map is the source of truth for (out_features, in_features).
@@ -1199,8 +1222,18 @@ class Model:
         # available. This keeps scoring/generation aligned with the backend's true prompt identity
         # and avoids subtle mismatches between HF-local templates and SGLang templates.
         if self._backend_type in (BackendType.SGLANG, BackendType.SGLANG_OFFLINE):
+            prompt_source = str(getattr(self.settings, "sglang_prompt_source", "sglang") or "sglang")
             supports = self.backend.get_metadata().supports
-            if bool(supports.get("tokenize_chat", False)):
+            if prompt_source == "hf":
+                ids = cast(
+                    list[list[int]],
+                    self.tokenizer.apply_chat_template(
+                        chats,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                    ),
+                )
+            elif bool(supports.get("tokenize_chat", False)):
                 out = self.backend.tokenize_chat(chats, continue_final_message=False)
                 ids = out.token_ids
             else:

@@ -239,6 +239,7 @@ class HereticBackend(ABC):
         out_dtype: str = "float16",
         svd_q: int | None = None,
         svd_niter: int = 6,
+        build_device: str = "auto",
         timeout_s: float = 600.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Optional server-side FULL row-norm LoRA builder (SGLang-only)."""
