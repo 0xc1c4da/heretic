@@ -174,6 +174,52 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Packed-MoE (packed w2) FULL rownorm builder performance knobs (SGLang backends).
+    sglang_packed_w2_trial_mode: Literal["fast", "accurate", "skip"] = Field(
+        default="fast",
+        description=(
+            "How to build packed-MoE w2 FULL rownorm factors during Optuna trials. "
+            "'fast' uses reduced effort / optional expert cap; 'accurate' builds all experts with full effort; "
+            "'skip' disables packed-w2 builds during trials."
+        ),
+    )
+    sglang_packed_w2_build_device: Literal["auto", "cuda", "cpu"] = Field(
+        default="auto",
+        description=(
+            "Device preference for packed-w2 FULL builder. "
+            "'auto' uses CUDA when available; 'cuda' requires CUDA; 'cpu' forces CPU."
+        ),
+    )
+    sglang_packed_w2_expert_chunk_size: int = Field(
+        default=8,
+        description="Number of experts to build per chunk for packed-w2 FULL builder (controls peak memory).",
+    )
+    sglang_packed_w2_max_experts_fast: int | None = Field(
+        default=32,
+        description="Optional cap on number of experts per packed-w2 layer during fast trial builds.",
+    )
+    sglang_packed_w2_max_identity_k: int = Field(
+        default=2048,
+        description="Guard for Marlin snapshot path (identity GEMM K size) in packed-w2 builder.",
+    )
+    sglang_packed_w2_svd_niter_fast: int = Field(
+        default=2,
+        description="svd_lowrank niter used for packed-w2 builds in fast mode.",
+    )
+    sglang_packed_w2_svd_niter: int = Field(
+        default=6,
+        description="svd_lowrank niter used for packed-w2 builds in accurate mode.",
+    )
+    sglang_packed_w2_svd_q_fast: int | None = Field(
+        default=None,
+        description="Optional svd_lowrank q override used for packed-w2 builds in fast mode.",
+    )
+    sglang_packed_w2_svd_q: int | None = Field(
+        default=None,
+        description="Optional svd_lowrank q override used for packed-w2 builds in accurate mode.",
+    )
+
+
     evaluate_model: str | None = Field(
         default=None,
         description="If this model ID or path is set, then instead of abliterating the main model, evaluate this model relative to the main model.",

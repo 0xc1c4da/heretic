@@ -842,12 +842,46 @@ class Model:
                     # adapter is loaded (keyed by lora_id).
                     if kind == "moe_packed_w2":
                         exported_target_modules.add("down_proj")
+                        mode = str(
+                            getattr(self.settings, "sglang_packed_w2_trial_mode", "fast")
+                        )
+                        if mode == "skip":
+                            continue
+                        if mode == "fast":
+                            svd_niter = int(
+                                getattr(self.settings, "sglang_packed_w2_svd_niter_fast", 2)
+                            )
+                            svd_q = getattr(self.settings, "sglang_packed_w2_svd_q_fast", None)
+                            max_experts = getattr(
+                                self.settings, "sglang_packed_w2_max_experts_fast", None
+                            )
+                        else:
+                            svd_niter = int(
+                                getattr(self.settings, "sglang_packed_w2_svd_niter", 6)
+                            )
+                            svd_q = getattr(self.settings, "sglang_packed_w2_svd_q", None)
+                            max_experts = None
+
                         packed_w2_full_builds.append(
                             {
                                 "name": p,
                                 "v": v_vec.detach().to(torch.float32).cpu(),
                                 "weight": float(w),
                                 "rank": int(self.settings.full_normalization_lora_rank),
+                                "svd_q": (int(svd_q) if svd_q is not None else None),
+                                "svd_niter": int(svd_niter),
+                                "build_device": str(
+                                    getattr(self.settings, "sglang_packed_w2_build_device", "auto")
+                                ),
+                                "expert_chunk_size": int(
+                                    getattr(self.settings, "sglang_packed_w2_expert_chunk_size", 8)
+                                ),
+                                "max_experts": (
+                                    int(max_experts) if max_experts is not None else None
+                                ),
+                                "max_identity_k": int(
+                                    getattr(self.settings, "sglang_packed_w2_max_identity_k", 2048)
+                                ),
                                 "out_dtype": "float16",
                             }
                         )
