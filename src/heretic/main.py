@@ -647,6 +647,21 @@ def run():
                     config=bundle.config_dict,
                 )
                 adapter_loaded = True
+                # Register packed-MoE w2 factors (if any) under the same adapter id so paired/mixed
+                # scoring uses a single `lora_id` to select both standard LoRA and packed updates.
+                if (
+                    adapter_id is not None
+                    and getattr(bundle, "packed_w2_full_builds", None)
+                ):
+                    for it in bundle.packed_w2_full_builds or []:
+                        model.backend.build_packed_w2_full_rownorm(
+                            lora_id=str(adapter_id),
+                            name=str(it["name"]),
+                            v=it["v"],
+                            weight=float(it["weight"]),
+                            rank=int(it["rank"]),
+                            out_dtype=str(it.get("out_dtype") or "float16"),
+                        )
                 print("* Evaluating...")
                 score, damage, refusals = evaluator.get_score(
                     adapter=adapter_id,
