@@ -129,10 +129,7 @@ tool_call_parser = "glm47"
 
 # GLM-5 uses the DeepSeek DSA/NSA attention path in SGLang (`GlmMoeDsaForCausalLM`), so pin NSA explicitly.
 # H200 defaults (matching SGLang DeepSeek-V3.2 guidance): bf16 KV cache + flashmla_sparse prefill + fa3 decode.
-attention_backend = "nsa"
-kv_cache_dtype = "bfloat16"
-nsa_prefill_backend = "flashmla_sparse"
-nsa_decode_backend = "fa3"
+attention_backend = "triton"
 
 # Stronger determinism at a performance cost (SGLang batch-invariant ops).
 enable_deterministic_inference = true

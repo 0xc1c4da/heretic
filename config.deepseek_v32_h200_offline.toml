@@ -119,12 +119,10 @@ reasoning_parser = "deepseek-v3"
 tool_call_parser = "deepseekv32"
 
 # Let SGLang use the DeepSeek-V3.2 NSA backend.
-attention_backend = "nsa"
+attention_backend = "triton"
 
 # Hopper-friendly NSA kernel choices (bf16 KV cache + fa3 decode).
 kv_cache_dtype = "bfloat16"
-nsa_prefill_backend = "flashmla_sparse"
-nsa_decode_backend = "fa3"
 
 # Optional: stronger determinism at a performance cost (SGLang batch-invariant ops).
 enable_deterministic_inference = true
