@@ -139,8 +139,18 @@ class Model:
             resolved_dir = resolved.resolved_dir
 
             engine_args = dict(getattr(settings, "sglang_offline_args", None) or {})
-            # Ensure KT uses the same resolved directory unless explicitly set.
-            engine_args.setdefault("kt_weight_path", resolved_dir)
+            # Only configure KTransformers (KT) defaults when KT is actually requested.
+            #
+            # Some SGLang model paths (e.g. DeepSeek/GLM MoE variants) enable the KT EP wrapper when
+            # `kt_weight_path` is set, and will then expect additional KT knobs (e.g. kt_num_gpu_experts).
+            # For non-KT deployments (like GLM-5), defaulting kt_weight_path to the model directory
+            # can therefore crash early in weight init.
+            kt_requested = (
+                ("kt_method" in engine_args)
+                or any(str(k).startswith("kt_") for k in engine_args.keys())
+            )
+            if kt_requested:
+                engine_args.setdefault("kt_weight_path", resolved_dir)
             engine_args.setdefault("tokenizer_path", resolved_dir)
 
             self.backend = SGLangOfflineBackend(
