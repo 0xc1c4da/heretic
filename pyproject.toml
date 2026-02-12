@@ -34,7 +34,8 @@ dependencies = [
     "pydantic-settings>=2.10.1",
     "questionary>=2.1.1",
     "rich>=14.1.0",
-    # Keep compatible with vendored SGLang (pins transformers==4.57.1).
+    # Keep compatible with vendored SGLang (pins transformers==4.57.1),
+    # but override to a newer commit when needed (e.g. GLM-5 glm_moe_dsa).
     "transformers>=4.57.1",
 ]
 
@@ -82,7 +83,11 @@ module-name = "heretic"
 default-groups = ["dev", "inference"]
 # Work around torch==2.9.1 + CuDNN<9.15 Conv3d perf/mem bug for multimodal models.
 # SGLang hard-fails on this combination (see PyTorch issue 168167).
-override-dependencies = ["nvidia-cudnn-cu12==9.16.0.29"]
+override-dependencies = [
+    "nvidia-cudnn-cu12==9.16.0.29",
+    # GLM-5 support (model_type=glm_moe_dsa) landed in Transformers after 4.57.1.
+    "transformers @ git+https://github.com/huggingface/transformers.git@4d5d49c34474be7cc2b6abd3179e7b317a17d8b1",
+]
 
 [tool.uv.sources]
 # Vendored SGLang (submodule) as editable dependency.
