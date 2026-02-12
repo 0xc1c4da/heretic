@@ -935,7 +935,9 @@ class SGLangOfflineBackend(HereticBackend):
         )
         gen = self._generate_req(obj)
 
-        def _mean_nll_from_out(out: dict[str, Any], *, cont_len: int, item: int) -> float:
+        def _mean_nll_from_out(
+            out: dict[str, Any], *, cont_len: int, expected_cont: list[int], item: int
+        ) -> float:
             meta = out.get("meta_info") or {}
             itlp = meta.get("input_token_logprobs")
             if not isinstance(itlp, list) or not itlp:
@@ -959,6 +961,12 @@ class SGLangOfflineBackend(HereticBackend):
                     f"input_token_logprobs too short for continuation: got {len(vals)} need {cont_len} (item={item})"
                 )
             vals_suf = vals[-cont_len:]
+            tids_suf = tids[-cont_len:]
+            if tids_suf != list(expected_cont):
+                raise RuntimeError(
+                    "Continuation token-id mismatch in input_token_logprobs suffix. "
+                    f"item={item} got={tids_suf[:8]}... expected={list(expected_cont)[:8]}..."
+                )
             # Return mean NLL (positive scalar) for stability across lengths.
             return float((-torch.tensor(vals_suf, dtype=torch.float32)).mean().item())
 
@@ -968,7 +976,10 @@ class SGLangOfflineBackend(HereticBackend):
             raise RuntimeError(f"Unexpected offline logprob batch size: {len(gen.outputs)} != {3*b}")
         for i, out in enumerate(gen.outputs):
             cont_len = cont_lens[i % b]
-            all_mean_nll.append(_mean_nll_from_out(out, cont_len=cont_len, item=i))
+            expected_cont = continuation_ids_batch[i % b]
+            all_mean_nll.append(
+                _mean_nll_from_out(out, cont_len=cont_len, expected_cont=expected_cont, item=i)
+            )
 
         base1 = all_mean_nll[:b]
         adapted = all_mean_nll[b : 2 * b]
@@ -1033,7 +1044,9 @@ class SGLangOfflineBackend(HereticBackend):
         if len(gen.outputs) != 3 * b:
             raise RuntimeError(f"Unexpected offline logprob batch size: {len(gen.outputs)} != {3*b}")
 
-        def _parse_topk_positions(out: dict[str, Any], *, cont_len: int, item: int) -> list[dict[int, float]]:
+        def _parse_topk_positions(
+            out: dict[str, Any], *, cont_len: int, expected_cont: list[int], item: int
+        ) -> list[dict[int, float]]:
             meta = out.get("meta_info") or {}
             xtop = meta.get("input_top_logprobs")
             if not isinstance(xtop, list) or not xtop:
@@ -1060,12 +1073,33 @@ class SGLangOfflineBackend(HereticBackend):
                 raise RuntimeError(
                     f"input_top_logprobs too short for continuation: got {len(pos_dicts)} need {cont_len} (item={item})"
                 )
+            # Alignment check: ensure token ids in input_token_logprobs match the continuation suffix.
+            itlp = meta.get("input_token_logprobs")
+            if isinstance(itlp, list) and itlp:
+                tids: list[int] = []
+                for tup in itlp:
+                    if (
+                        isinstance(tup, (list, tuple))
+                        and len(tup) >= 2
+                        and isinstance(tup[1], int)
+                    ):
+                        tids.append(int(tup[1]))
+                if len(tids) >= cont_len:
+                    tids_suf = tids[-cont_len:]
+                    if tids_suf != list(expected_cont):
+                        raise RuntimeError(
+                            "Continuation token-id mismatch (topk_js alignment check). "
+                            f"item={item} got={tids_suf[:8]}... expected={list(expected_cont)[:8]}..."
+                        )
             return pos_dicts[-cont_len:]
 
         all_topk: list[list[dict[int, float]]] = []
         for i, out in enumerate(gen.outputs):
             cont_len = cont_lens[i % b]
-            all_topk.append(_parse_topk_positions(out, cont_len=cont_len, item=i))
+            expected_cont = continuation_ids_batch[i % b]
+            all_topk.append(
+                _parse_topk_positions(out, cont_len=cont_len, expected_cont=expected_cont, item=i)
+            )
 
         base1 = all_topk[:b]
         adapted = all_topk[b : 2 * b]

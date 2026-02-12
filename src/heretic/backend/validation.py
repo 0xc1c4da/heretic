@@ -619,6 +619,90 @@ def validate_lora_sanity(
         raise LoRASanityError("Adapter had no observable effect on backend score response.")
 
 
+def validate_topk_js_not_saturated_with_synthetic_lora(
+    backend: HereticBackend,
+    *,
+    input_ids_batch: list[list[int]],
+    build_synthetic_adapter: Callable[[], tuple[dict[str, torch.Tensor], dict[str, Any]]] | None,
+    cont_len: int = 16,
+    top_k: int = 64,
+    positions: int = 16,
+    adapter_name: str = "_heretic_validation_synthetic_topk",
+    saturated_threshold: float = 0.69,
+) -> None:
+    """Fail fast if a small synthetic LoRA causes top-k JS to saturate near ln(2).
+
+    This is designed to catch catastrophic adapter application/construction failures (e.g. FP8
+    scale bugs) that manifest as distributions becoming nearly disjoint (JS ≈ ln(2)).
+
+    Notes:
+    - Runs only when the backend supports continuation top-k scoring and LoRA hot-swap.
+    - Uses a *non-zero* synthetic adapter (unlike damage repeatability validation, which must be no-op).
+    """
+    supports = backend.get_metadata().supports
+    if not (supports.get("lora_hot_swap", False) and supports.get("score_continuation_topk_paired_with_noise", False)):
+        return
+    if build_synthetic_adapter is None:
+        return
+    if not input_ids_batch:
+        raise BackendValidationError("topk_js saturation check requires non-empty input_ids_batch.")
+
+    gen_ids = getattr(backend, "generate_token_ids", None)
+    scorer = getattr(backend, "score_continuation_topk_paired_with_noise", None)
+    if gen_ids is None or scorer is None:
+        return
+
+    cont_ids = gen_ids(  # type: ignore[misc]
+        input_ids_batch[:1],
+        max_new_tokens=int(cont_len),
+        adapter=None,
+        temperature=0.0,
+        top_k=1,
+    )
+    if not isinstance(cont_ids, list) or not cont_ids or not isinstance(cont_ids[0], list) or not cont_ids[0]:
+        raise BackendValidationError("generate_token_ids returned empty continuation in topk_js saturation check.")
+
+    tensors, config = build_synthetic_adapter()
+    if not tensors:
+        raise BackendValidationError("Synthetic adapter builder returned no tensors.")
+
+    adapter_ref = backend.load_adapter(name=adapter_name, tensors=tensors, config=config)
+    try:
+        b1_topk, ad_topk, b2_topk = scorer(  # type: ignore[misc]
+            prompt_ids_batch=input_ids_batch[:1],
+            continuation_ids_batch=cont_ids[:1],
+            adapter=str(adapter_ref or adapter_name),
+            top_k=int(top_k),
+        )
+        b1_pos = b1_topk[0] if isinstance(b1_topk, list) and b1_topk else None
+        ad_pos = ad_topk[0] if isinstance(ad_topk, list) and ad_topk else None
+        b2_pos = b2_topk[0] if isinstance(b2_topk, list) and b2_topk else None
+        if not (isinstance(b1_pos, list) and isinstance(ad_pos, list) and isinstance(b2_pos, list)):
+            raise BackendValidationError("topk_js returned unexpected per-item schema in saturation check.")
+        npos = min(int(positions), len(b1_pos), len(ad_pos), len(b2_pos))
+        if npos <= 0:
+            raise BackendValidationError("topk_js returned no continuation positions in saturation check.")
+        dmg = 0.0
+        noi = 0.0
+        for t in range(npos):
+            dmg += float(_js_other_bucket(b1_pos[t], ad_pos[t]))
+            noi += float(_js_other_bucket(b1_pos[t], b2_pos[t]))
+        dmg = float(dmg / npos)
+        noi = float(noi / npos)
+        if not math.isfinite(dmg) or not math.isfinite(noi):
+            raise BackendValidationError(f"Non-finite topk_js in saturation check: damage={dmg!r} noise={noi!r}")
+        if dmg >= float(saturated_threshold):
+            raise BackendValidationError(
+                f"topk_js appears saturated (synthetic LoRA): damage={dmg:.6g} noise={noi:.6g} "
+                f"(threshold={saturated_threshold:.6g}). This often indicates adapter/FP8 scale bugs."
+            )
+    finally:
+        try:
+            backend.unload_adapter(name=adapter_name)
+        except Exception:
+            pass
+
+
 def validate_compute_vtw(
     backend: HereticBackend,
     *,
@@ -870,6 +954,13 @@ def run_startup_validations(
             input_ids_batch=input_ids_batch[:1],
             build_synthetic_adapter=build_synthetic_adapter,
             min_abs_delta=cfg.lora_sanity_min_abs_delta,
+        )
+        # Extra guard: ensure a small non-zero synthetic adapter doesn't catastrophically break
+        # continuation top-k scoring (JS ≈ ln(2) saturation).
+        validate_topk_js_not_saturated_with_synthetic_lora(
+            backend,
+            input_ids_batch=input_ids_batch[:1],
+            build_synthetic_adapter=build_synthetic_adapter,
         )
     except Exception as e:
         lora_ok = False
