@@ -23,6 +23,3 @@ wheels/
 
 # Residual plots
 /plots/
-
-# Local reference clones (do not commit)
-/references/transformers/
