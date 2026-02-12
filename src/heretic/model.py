@@ -35,7 +35,7 @@ from .backend.base import HereticBackend
 from .backend.sglang import SGLangBackend
 from .backend.sglang_offline import SGLangOfflineBackend
 from .hf_resolve import resolve_model_dir
-from .utils import Prompt, batchify, empty_cache, print, sha256_token_ids
+from .utils import Prompt, batchify, empty_cache, normalize_hf_token_ids, print, sha256_token_ids
 
 
 def get_model_class(
@@ -1232,34 +1232,31 @@ class Model:
             prompt_source = str(getattr(self.settings, "sglang_prompt_source", "sglang") or "sglang")
             supports = self.backend.get_metadata().supports
             if prompt_source == "hf":
-                ids = cast(
-                    list[list[int]],
+                ids = normalize_hf_token_ids(
                     self.tokenizer.apply_chat_template(
                         chats,
                         add_generation_prompt=True,
                         tokenize=True,
-                    ),
+                    )
                 )
             elif bool(supports.get("tokenize_chat", False)):
                 out = self.backend.tokenize_chat(chats, continue_final_message=False)
                 ids = out.token_ids
             else:
-                ids = cast(
-                    list[list[int]],
+                ids = normalize_hf_token_ids(
                     self.tokenizer.apply_chat_template(
                         chats,
                         add_generation_prompt=True,
                         tokenize=True,
-                    ),
+                    )
                 )
         else:
-            ids = cast(
-                list[list[int]],
+            ids = normalize_hf_token_ids(
                 self.tokenizer.apply_chat_template(
                     chats,
                     add_generation_prompt=True,
                     tokenize=True,
-                ),
+                )
             )
 
         if self.response_prefix:

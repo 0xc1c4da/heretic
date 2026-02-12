@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterable, cast
 import torch
 import math
 
-from ..utils import Prompt, sha256_token_ids
+from ..utils import Prompt, normalize_hf_token_ids, sha256_token_ids
 from .base import HereticBackend, ModuleRef
 
 
@@ -468,7 +468,31 @@ def validate_tokenize_chat_equivalence(
         # Transformers not available in minimal envs.
         return
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    # Prefer the tokenizer identity the backend reports (it is the true source of truth for
+    # SGLang's tokenize_chat behavior). Fall back to `model_id` if it's not usable locally.
+    tokenizer_id = model_id
+    try:
+        meta = backend.get_metadata()
+        tid = getattr(meta, "tokenizer_id", None)
+        if isinstance(tid, str) and tid:
+            tokenizer_id = tid
+    except Exception:
+        tokenizer_id = model_id
+
+    tokenizer = None
+    for cand in [tokenizer_id, model_id]:
+        if tokenizer is not None:
+            break
+        if not isinstance(cand, str) or not cand:
+            continue
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(cand, trust_remote_code=trust_remote_code)
+        except Exception as e:
+            tokenizer = None
+            continue
+    if tokenizer is None:
+        # Best-effort check: if we can't load an HF tokenizer, skip equivalence rather than failing the run.
+        return
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
     try:
@@ -489,14 +513,12 @@ def validate_tokenize_chat_equivalence(
     backend_ids = out.token_ids
 
     # HF canonical
-    hf_ids = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
+    hf_raw = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
         chats,
         add_generation_prompt=True,
         tokenize=True,
     )
-
-    if not isinstance(hf_ids, list) or not hf_ids or not all(isinstance(x, list) for x in hf_ids):
-        raise PromptMismatchError("HF apply_chat_template returned unexpected token-id schema.")
+    hf_ids = normalize_hf_token_ids(hf_raw)
 
     if len(hf_ids) != len(backend_ids):
         raise PromptMismatchError(

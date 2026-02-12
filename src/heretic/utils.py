@@ -45,6 +45,62 @@ def sha256_token_ids(token_ids: list[int]) -> str:
     return h.hexdigest()
 
 
+def normalize_hf_token_ids(hf_out: Any) -> list[list[int]]:
+    """Normalize HF token-id outputs to a stable `list[list[int]]` ABI.
+
+    Transformers tokenization APIs (notably `apply_chat_template(tokenize=True)`) can return:
+    - `BatchEncoding` / mapping-like objects with `input_ids`
+    - `torch.Tensor`
+    - `list[int]` (single item)
+    - `list[list[int]]` (batched)
+
+    Heretic's internal contract is always `list[list[int]]`.
+    """
+    # Unwrap mapping-like containers (BatchEncoding behaves like a dict).
+    try:
+        if hasattr(hf_out, "get") and "input_ids" in hf_out:  # type: ignore[operator]
+            hf_out = hf_out.get("input_ids")
+    except Exception:
+        pass
+
+    # Unwrap tensors.
+    try:
+        if isinstance(hf_out, torch.Tensor):
+            hf_out = hf_out.tolist()
+    except Exception:
+        pass
+
+    # Normalize list shapes.
+    if isinstance(hf_out, list):
+        if not hf_out:
+            raise ValueError("HF token-id output is an empty list.")
+        # Single item: list[int]
+        if all(isinstance(x, int) for x in hf_out):
+            return [[int(x) for x in hf_out]]
+        # Batched: list[list[int]]
+        if all(isinstance(x, list) for x in hf_out):
+            out: list[list[int]] = []
+            for i, row in enumerate(hf_out):
+                if not row:
+                    raise ValueError(f"HF token-id row is empty (item={i}).")
+                if not all(isinstance(t, int) for t in row):
+                    bad = next((type(t).__name__ for t in row if not isinstance(t, int)), "unknown")
+                    raise TypeError(f"HF token-id row has non-int entries (item={i}, bad_type={bad}).")
+                out.append([int(t) for t in row])
+            return out
+
+    # Unsupported schema: include best-effort type information.
+    keys = None
+    try:
+        if hasattr(hf_out, "keys"):
+            keys = list(hf_out.keys())  # type: ignore[call-arg]
+    except Exception:
+        keys = None
+    raise TypeError(
+        f"Unsupported HF token-id schema: type={type(hf_out).__name__} keys={keys}"
+    )
+
+
 def print_memory_usage():
     def p(label: str, size_in_bytes: int):
         print(f"[grey50]{label}: [bold]{size_in_bytes / (1024**3):.2f} GB[/][/]")
