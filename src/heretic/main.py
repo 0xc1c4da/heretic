@@ -67,6 +67,53 @@ from .utils import (
 )
 
 
+def _truncate_chat_response(text: str, *, max_chars: int) -> str:
+    """Defensive cap for interactive chat output (print + stored context)."""
+    try:
+        max_chars_i = int(max_chars)
+    except Exception:
+        max_chars_i = 0
+    if max_chars_i <= 0:
+        return text
+    if len(text) <= max_chars_i:
+        return text
+    return text[:max_chars_i] + "\n[... truncated ...]"
+
+
+def _safe_write_stdout(text: str) -> None:
+    """Best-effort write to stdout that tolerates EAGAIN from non-blocking pipes."""
+    try:
+        fd = sys.stdout.fileno()
+    except Exception:
+        return
+    try:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    except Exception:
+        enc = "utf-8"
+
+    data = text.encode(enc, errors="replace")
+    i = 0
+    chunk = 8 * 1024
+    while i < len(data):
+        try:
+            n = os.write(fd, data[i : i + chunk])
+            if n <= 0:
+                break
+            i += int(n)
+        except BlockingIOError:
+            time.sleep(0.01)
+        except BrokenPipeError:
+            break
+
+
+def _safe_print(obj: object = "", *, end: str = "\n") -> None:
+    """Best-effort print that won't crash if stdout is non-blocking."""
+    try:
+        print(obj, end=end)
+    except BlockingIOError:
+        _safe_write_stdout(f"{obj}{end}")
+
+
 def obtain_merge_strategy(settings: Settings) -> str | None:
     """
     Prompts the user for how to proceed with saving the model.
@@ -1186,12 +1233,20 @@ def run():
                                             tok = model.backend.tokenize_chat([chat])
                                             texts = model.backend.generate_text(
                                                 tok.token_ids,
-                                                max_new_tokens=4096,
+                                                max_new_tokens=int(settings.chat_max_new_tokens),
                                                 adapter=adapter_id,
                                                 temperature=0.0,
                                             )
                                             response = texts[0]
-                                            print(response)
+                                            response = _truncate_chat_response(
+                                                response,
+                                                max_chars=int(settings.chat_max_response_chars),
+                                            )
+                                            _safe_print(response)
+                                        response = _truncate_chat_response(
+                                            response,
+                                            max_chars=int(settings.chat_max_response_chars),
+                                        )
                                         chat.append(
                                             {"role": "assistant", "content": response}
                                         )
@@ -1200,7 +1255,7 @@ def run():
                                         break
 
                     except Exception as error:
-                        print(f"[red]Error: {error}[/]")
+                        _safe_print(f"[red]Error: {error}[/]")
             finally:
                 if backend_type != BackendType.LOCAL:
                     # Best-effort cleanup so we don't accumulate dynamic adapters.

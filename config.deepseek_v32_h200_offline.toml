@@ -109,8 +109,6 @@ system_prompt = "You are a helpful assistant."
 [sglang_offline_args]
 # Parallelism: DeepSeek-V3.2 DSA kernels are tuned for dp_size=8.
 tp_size = 8
-dp_size = 8
-enable_dp_attention = true
 
 # DeepSeek-V3.2 parsing (SGLang OpenAI protocol).
 # - reasoning parser: DeepSeek-V3.* uses `deepseek-v3` and the request-time `thinking` parameter.

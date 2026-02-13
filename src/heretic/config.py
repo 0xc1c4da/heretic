@@ -305,6 +305,22 @@ class Settings(BaseSettings):
         description="Maximum number of tokens to generate for each response.",
     )
 
+    chat_max_new_tokens: int = Field(
+        default=4000,
+        description=(
+            "Maximum number of tokens to generate for each interactive chat response "
+            "(used by the 'Chat with the model' menu entry)."
+        ),
+    )
+
+    chat_max_response_chars: int = Field(
+        default=20000,
+        description=(
+            "Hard cap (in characters) applied to interactive chat responses before printing/storing them. "
+            "This is a defensive guardrail against runaway/looping generations and excessive console output."
+        ),
+    )
+
     print_responses: bool = Field(
         default=False,
         description="Whether to print prompt/response pairs when counting refusals.",

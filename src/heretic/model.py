@@ -1521,7 +1521,7 @@ class Model:
         outputs = self.model.generate(
             **inputs,
             streamer=streamer,
-            max_new_tokens=4096,
+            max_new_tokens=int(self.settings.chat_max_new_tokens),
         )  # ty:ignore[call-non-callable]
 
         return self.tokenizer.decode(

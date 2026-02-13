@@ -513,11 +513,20 @@ def validate_tokenize_chat_equivalence(
     backend_ids = out.token_ids
 
     # HF canonical
-    hf_raw = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
-        chats,
-        add_generation_prompt=True,
-        tokenize=True,
-    )
+    # Some tokenizers (especially with `trust_remote_code`) do not ship a chat template.
+    # This check is explicitly best-effort; skip rather than failing startup validation.
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(chat_template, str) or not chat_template.strip():
+        return
+    try:
+        hf_raw = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
+            chats,
+            add_generation_prompt=True,
+            tokenize=True,
+        )
+    except Exception:
+        # Best-effort: if HF chat templating isn't available/compatible, skip the check.
+        return
     hf_ids = normalize_hf_token_ids(hf_raw)
 
     if len(hf_ids) != len(backend_ids):

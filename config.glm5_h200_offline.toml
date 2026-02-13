@@ -100,7 +100,7 @@ topk_js_positions = 32
 
 # Range for max_weight parameter during optimization.
 max_weight_min = 0.8
-max_weight_max = 6.0
+max_weight_max = 8.0
 
 # Optimization budget
 n_trials = 800
@@ -130,6 +130,7 @@ tool_call_parser = "glm47"
 # GLM-5 uses the DeepSeek DSA/NSA attention path in SGLang (`GlmMoeDsaForCausalLM`), so pin NSA explicitly.
 # H200 defaults (matching SGLang DeepSeek-V3.2 guidance): bf16 KV cache + flashmla_sparse prefill + fa3 decode.
 attention_backend = "triton"
+kv_cache_dtype = "bfloat16"
 
 # Stronger determinism at a performance cost (SGLang batch-invariant ops).
 enable_deterministic_inference = true
@@ -183,4 +184,3 @@ column = "text"
 dataset = "mlabonne/harmful_behaviors"
 split = "test[:100]"
 column = "text"
-
