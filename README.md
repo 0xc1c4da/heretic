@@ -152,6 +152,18 @@ After Heretic has finished decensoring a model, you are given the option to
 save the model, upload it to Hugging Face, chat with it to test how well it works,
 or any combination of those actions.
 
+### Chat with a local (merged) checkpoint via SGLang offline
+
+If you have a local model directory (for example the output of `tools/merge_lora.py`)
+and want to quickly test it with the embedded SGLang backend, you can use:
+
+```bash
+uv run python tools/sglang_offline_chat.py \
+  --model-dir /path/to/merged_checkpoint_dir \
+  --trust-remote-code \
+  --engine-args-json '{"tp_size":8, "attention_backend":"triton"}'
+```
+
 
 ## Research features
 
