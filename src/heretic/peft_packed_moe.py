@@ -11,9 +11,79 @@ modules like:
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List
 
 import torch
+
+
+def reconstruct_moe_tp_blockdiag_factors(
+    *,
+    A_shards: List[torch.Tensor],
+    B_shards: List[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reconstruct full-width expert factors from MoE-TP shards exactly.
+
+    Each MoE-TP rank k holds factors:
+      A_k: [E, r, in_k]
+      B_k: [E, out, r]
+
+    The full delta is the horizontal concatenation:
+      ΔW = [B_0@A_0 | ... | B_{tp-1}@A_{tp-1}]
+
+    We encode this as a single LoRA with rank r*tp:
+      B_full = cat(B_k, dim=rank)                 -> [E, out, r*tp]
+      A_full = block_diag(A_0..A_{tp-1})          -> [E, r*tp, in_full]
+    """
+    if not A_shards or not B_shards:
+        raise ValueError("A_shards and B_shards must be non-empty.")
+    if len(A_shards) != len(B_shards):
+        raise ValueError(
+            f"Shard list length mismatch: {len(A_shards)} != {len(B_shards)}"
+        )
+
+    tp = len(A_shards)
+    A0 = A_shards[0]
+    B0 = B_shards[0]
+    if not isinstance(A0, torch.Tensor) or not isinstance(B0, torch.Tensor):
+        raise ValueError("Shards must be torch.Tensors.")
+    if A0.ndim != 3 or B0.ndim != 3:
+        raise ValueError(
+            f"Expected 3D shards; got A.ndim={A0.ndim} B.ndim={B0.ndim}"
+        )
+    E, r, _ = (int(A0.shape[0]), int(A0.shape[1]), int(A0.shape[2]))
+    if int(B0.shape[0]) != E:
+        raise ValueError("A/B expert dim mismatch in shard 0.")
+    out = int(B0.shape[1])
+    if int(B0.shape[2]) != r:
+        raise ValueError("A/B rank mismatch in shard 0.")
+
+    in_sizes: list[int] = []
+    for i, (A, B) in enumerate(zip(A_shards, B_shards)):
+        if A.ndim != 3 or B.ndim != 3:
+            raise ValueError(f"Shard {i} has wrong ndim: A.ndim={A.ndim} B.ndim={B.ndim}")
+        if int(A.shape[0]) != E or int(B.shape[0]) != E:
+            raise ValueError(f"Shard {i} has wrong expert dim.")
+        if int(A.shape[1]) != r or int(B.shape[2]) != r:
+            raise ValueError(f"Shard {i} has wrong rank.")
+        if int(B.shape[1]) != out:
+            raise ValueError(f"Shard {i} has wrong out dim.")
+        in_sizes.append(int(A.shape[2]))
+
+    in_full = int(sum(in_sizes))
+    r_full = int(r * tp)
+
+    B_full = torch.cat(B_shards, dim=2).contiguous()  # [E, out, r_full]
+    A_full = torch.zeros(
+        (E, r_full, in_full),
+        dtype=A0.dtype,
+        device=A0.device,
+    )
+    col = 0
+    for k, A_k in enumerate(A_shards):
+        in_k = int(A_k.shape[2])
+        A_full[:, k * r : (k + 1) * r, col : col + in_k] = A_k
+        col += in_k
+    return A_full.contiguous(), B_full
 
 
 def materialize_packed_w2_factors_to_peft_tensors(
@@ -73,4 +143,97 @@ def materialize_packed_w2_factors_to_peft_tensors(
         out[f"{base}.lora_A.default.weight"] = A_e.contiguous()
         out[f"{base}.lora_B.default.weight"] = B_e.contiguous()
     return out
+
+
+def inject_exported_packed_w2_factors_into_bundle(
+    *,
+    bundle: Any,
+    backend: Any,
+    adapter_id: str,
+    expert_down_proj_leaf: str = "down_proj",
+) -> None:
+    """Export packed-MoE w2 factors from backend and inject into a PEFT bundle.
+
+    This mutates `bundle.tensors` and `bundle.config_dict` in-place.
+
+    - Adds per-expert PEFT keys via `materialize_packed_w2_factors_to_peft_tensors`.
+    - If the exported expert rank differs from the bundle default `r`, adds a
+      `rank_pattern`/`alpha_pattern` entry for routed experts so PEFT can load/merge.
+    """
+    if bundle is None:
+        raise ValueError("bundle is required")
+    if backend is None:
+        raise ValueError("backend is required")
+    if not isinstance(adapter_id, str) or not adapter_id:
+        raise ValueError("adapter_id must be a non-empty string")
+
+    builds = getattr(bundle, "packed_w2_full_builds", None)
+    if not builds:
+        return
+
+    cfg = getattr(bundle, "config_dict", None)
+    if not isinstance(cfg, dict):
+        raise ValueError("bundle.config_dict must be a dict")
+
+    default_r = cfg.get("r", None)
+    default_alpha = cfg.get("lora_alpha", None)
+    try:
+        default_r_i = int(default_r)
+    except Exception:
+        default_r_i = -1
+
+    expert_rank_seen: int | None = None
+
+    for it in builds or []:
+        packed_name = str(it.get("name") or "")
+        if not packed_name:
+            continue
+
+        expert_ids, A_stack, B_stack = backend.export_packed_w2_factors(
+            lora_id=str(adapter_id),
+            name=packed_name,
+        )
+        if not isinstance(A_stack, torch.Tensor) or A_stack.ndim != 3:
+            raise RuntimeError(
+                f"export_packed_w2_factors returned invalid A_stack for {packed_name}: "
+                f"{type(A_stack).__name__} ndim={getattr(A_stack, 'ndim', None)}"
+            )
+        if expert_rank_seen is None:
+            expert_rank_seen = int(A_stack.shape[1])
+        else:
+            expert_rank_seen = max(expert_rank_seen, int(A_stack.shape[1]))
+
+        peft_tensors = materialize_packed_w2_factors_to_peft_tensors(
+            packed_w2_param_name=packed_name,
+            expert_ids=list(expert_ids),
+            A_stack=A_stack,
+            B_stack=B_stack,
+            expert_down_proj_leaf=expert_down_proj_leaf,
+        )
+        bundle.tensors.update(peft_tensors)
+
+    # If experts have a larger rank (e.g. r*moe_tp_size), ensure PEFT can load them.
+    if expert_rank_seen is not None and default_r_i > 0 and int(expert_rank_seen) != int(default_r_i):
+        # Match routed expert down-proj modules while avoiding shared_experts.
+        # PEFT's rank_pattern keys are matched against module names; using a narrow substring
+        # is the most robust across model wrappers/prefixes.
+        key = ".mlp.experts."
+
+        rank_pattern = cfg.get("rank_pattern")
+        if not isinstance(rank_pattern, dict):
+            rank_pattern = {}
+        rank_pattern.setdefault(key, int(expert_rank_seen))
+        cfg["rank_pattern"] = rank_pattern
+
+        if isinstance(default_alpha, (int, float)) and default_r_i > 0:
+            # Preserve alpha/r scaling by scaling alpha linearly with rank.
+            alpha_expert = float(default_alpha) * (float(expert_rank_seen) / float(default_r_i))
+            alpha_expert_out: int | float
+            alpha_expert_out = int(round(alpha_expert)) if isinstance(default_alpha, int) else alpha_expert
+
+            alpha_pattern = cfg.get("alpha_pattern")
+            if not isinstance(alpha_pattern, dict):
+                alpha_pattern = {}
+            alpha_pattern.setdefault(key, alpha_expert_out)
+            cfg["alpha_pattern"] = alpha_pattern
 

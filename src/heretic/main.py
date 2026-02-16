@@ -1118,30 +1118,17 @@ def run():
                                 if backend_type != BackendType.LOCAL:
                                     try:
                                         from .peft_packed_moe import (
-                                            materialize_packed_w2_factors_to_peft_tensors,
+                                            inject_exported_packed_w2_factors_into_bundle,
                                         )
 
-                                        if (
-                                            adapter_id is not None
-                                            and getattr(bundle, "packed_w2_full_builds", None)
-                                        ):
+                                        if adapter_id is not None:
                                             print("* Exporting packed MoE expert LoRA factors...")
-                                            for it in bundle.packed_w2_full_builds or []:
-                                                packed_name = str(it.get("name") or "")
-                                                if not packed_name:
-                                                    continue
-                                                expert_ids, A_stack, B_stack = model.backend.export_packed_w2_factors(
-                                                    lora_id=str(adapter_id),
-                                                    name=packed_name,
-                                                )
-                                                peft_tensors = materialize_packed_w2_factors_to_peft_tensors(
-                                                    packed_w2_param_name=packed_name,
-                                                    expert_ids=expert_ids,
-                                                    A_stack=A_stack,
-                                                    B_stack=B_stack,
-                                                    expert_down_proj_leaf="down_proj",
-                                                )
-                                                bundle.tensors.update(peft_tensors)
+                                            inject_exported_packed_w2_factors_into_bundle(
+                                                bundle=bundle,
+                                                backend=model.backend,
+                                                adapter_id=str(adapter_id),
+                                                expert_down_proj_leaf="down_proj",
+                                            )
                                     except Exception as e:
                                         raise RuntimeError(
                                             f"Failed to export packed MoE LoRA factors for adapter save: {e}"
