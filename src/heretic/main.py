@@ -1112,6 +1112,40 @@ def run():
                                 if not save_directory:
                                     continue
                                 assert bundle is not None
+                                # For SGLang backends, trials can include routed-expert packed-w2 updates
+                                # that are not part of the standard PEFT tensors. Persist them into the
+                                # adapter artifact so downstream merges reproduce trial behavior.
+                                if backend_type != BackendType.LOCAL:
+                                    try:
+                                        from .peft_packed_moe import (
+                                            materialize_packed_w2_factors_to_peft_tensors,
+                                        )
+
+                                        if (
+                                            adapter_id is not None
+                                            and getattr(bundle, "packed_w2_full_builds", None)
+                                        ):
+                                            print("* Exporting packed MoE expert LoRA factors...")
+                                            for it in bundle.packed_w2_full_builds or []:
+                                                packed_name = str(it.get("name") or "")
+                                                if not packed_name:
+                                                    continue
+                                                expert_ids, A_stack, B_stack = model.backend.export_packed_w2_factors(
+                                                    lora_id=str(adapter_id),
+                                                    name=packed_name,
+                                                )
+                                                peft_tensors = materialize_packed_w2_factors_to_peft_tensors(
+                                                    packed_w2_param_name=packed_name,
+                                                    expert_ids=expert_ids,
+                                                    A_stack=A_stack,
+                                                    B_stack=B_stack,
+                                                    expert_down_proj_leaf="down_proj",
+                                                )
+                                                bundle.tensors.update(peft_tensors)
+                                    except Exception as e:
+                                        raise RuntimeError(
+                                            f"Failed to export packed MoE LoRA factors for adapter save: {e}"
+                                        ) from e
                                 bundle.save_pretrained(
                                     save_directory,
                                     tokenizer=model.tokenizer,

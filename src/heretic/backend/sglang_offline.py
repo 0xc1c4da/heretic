@@ -654,6 +654,60 @@ class SGLangOfflineBackend(HereticBackend):
             raise RuntimeError(f"Packed w2 build failed: {data}")
         return data
 
+    def export_packed_w2_factors(
+        self,
+        *,
+        lora_id: str,
+        name: str,
+        timeout_s: float = 1800.0,
+    ) -> tuple[list[int], torch.Tensor, torch.Tensor]:
+        """Export registered packed-MoE w2 factors (A/B stacks) from the embedded engine."""
+        from sglang.srt.managers.io_struct import HereticExportPackedW2FactorsReqInput
+
+        obj = HereticExportPackedW2FactorsReqInput(
+            lora_id=str(lora_id),
+            name=str(name),
+        )
+        _ = timeout_s
+        data = self._run(
+            self._engine.tokenizer_manager.heretic_export_packed_w2_factors(obj, None)
+        )
+        if not isinstance(data, dict) or not bool(data.get("success", False)):
+            raise RuntimeError(f"Unexpected export_packed_w2_factors output: {data}")
+        if data.get("dtype") != "float16":
+            raise RuntimeError(
+                f"Unexpected dtype in export_packed_w2_factors: {data.get('dtype')}"
+            )
+
+        expert_ids = data.get("expert_ids")
+        a_b64 = data.get("lora_A_b64")
+        b_b64 = data.get("lora_B_b64")
+        a_shape = data.get("lora_A_shape")
+        b_shape = data.get("lora_B_shape")
+        if (
+            not isinstance(expert_ids, list)
+            or not all(isinstance(x, int) for x in expert_ids)
+            or not isinstance(a_b64, str)
+            or not isinstance(b_b64, str)
+            or not isinstance(a_shape, list)
+            or not isinstance(b_shape, list)
+            or len(a_shape) != 3
+            or len(b_shape) != 3
+        ):
+            raise RuntimeError(f"Malformed export_packed_w2_factors output: {data}")
+
+        raw_a = base64.b64decode(a_b64.encode("ascii"))
+        raw_b = base64.b64decode(b_b64.encode("ascii"))
+        arr_a = np.frombuffer(raw_a, dtype=np.float16).reshape(
+            (int(a_shape[0]), int(a_shape[1]), int(a_shape[2]))
+        )
+        arr_b = np.frombuffer(raw_b, dtype=np.float16).reshape(
+            (int(b_shape[0]), int(b_shape[1]), int(b_shape[2]))
+        )
+        A = torch.from_numpy(arr_a)
+        B = torch.from_numpy(arr_b)
+        return list(expert_ids), A, B
+
     def score(self, input_ids_batch: list[list[int]], *, adapter: str | None = None) -> ScoreResult:
         logprobs_full, per_row_meta = self._score_full_vocab_with_lora_ids_and_meta(
             input_ids_batch, lora_id=adapter
