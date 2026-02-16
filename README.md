@@ -89,6 +89,42 @@ greater control. Run `heretic --help` to see available command-line options,
 or look at [`config.default.toml`](config.default.toml) if you prefer to use
 a configuration file.
 
+## Reconstruct LoRA from saved parameters
+
+If you already have a completed trial or explicit abliteration parameters, you
+can export a LoRA adapter directly (without running the optimization loop):
+
+```bash
+python tools/generate_lora.py \
+  --config config.glm5_h200_offline.toml \
+  --study-jsonl checkpoints/moonshotai--Kimi-K2-5.jsonl \
+  --trial 347 \
+  --output ./out/trial-347
+```
+
+Alternative parameter sources are also supported:
+
+```bash
+# JSON payload containing direction_index + parameters
+python tools/generate_lora.py \
+  --config config.glm5_h200_offline.toml \
+  --params-json trial347_params.json \
+  --output ./out/trial-347
+
+# Explicit component parameters
+python tools/generate_lora.py \
+  --config config.glm5_h200_offline.toml \
+  --direction-index 26.74 \
+  --param attn.o_proj.max_weight=2.58 \
+  --param attn.o_proj.max_weight_position=40.80 \
+  --param attn.o_proj.min_weight=2.14 \
+  --param attn.o_proj.min_weight_distance=26.79 \
+  --output ./out/custom
+```
+
+Use `--save-tokenizer` to also write tokenizer files next to
+`adapter_config.json` and `adapter_model.safetensors`.
+
 ## SGLang backends (remote HTTP and embedded offline)
 
 Heretic can optionally use [SGLang](https://github.com/sgl-project/sglang) as its

@@ -16,6 +16,56 @@ from typing import Any, Dict, List
 import torch
 
 
+def register_packed_w2_full_builds(
+    *,
+    backend: Any,
+    adapter_id: str,
+    builds: list[dict[str, Any]] | None,
+) -> None:
+    """Register packed-MoE w2 FULL row-norm factors under a loaded adapter id.
+
+    This is the *authoritative* consumer of `bundle.packed_w2_full_builds`.
+    Callers must not substitute settings/hardcoded defaults when `builds` provides them.
+    """
+    if backend is None:
+        raise ValueError("backend is required")
+    if not isinstance(adapter_id, str) or not adapter_id:
+        raise ValueError("adapter_id must be a non-empty string")
+    if not builds:
+        return
+    if not isinstance(builds, list):
+        raise ValueError("builds must be a list when provided")
+
+    for it in builds:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "")
+        if not name:
+            continue
+
+        v = it.get("v")
+        if not isinstance(v, torch.Tensor):
+            raise ValueError(f"packed_w2_full_builds[{name!r}].v must be a torch.Tensor")
+
+        svd_q_raw = it.get("svd_q", None)
+        max_experts_raw = it.get("max_experts", None)
+
+        backend.build_packed_w2_full_rownorm(
+            lora_id=str(adapter_id),
+            name=name,
+            v=v,
+            weight=float(it.get("weight")),
+            rank=int(it.get("rank")),
+            svd_q=(int(svd_q_raw) if svd_q_raw is not None else None),
+            svd_niter=int(it.get("svd_niter", 6)),
+            build_device=str(it.get("build_device", "auto")),
+            expert_chunk_size=int(it.get("expert_chunk_size", 8)),
+            max_experts=(int(max_experts_raw) if max_experts_raw is not None else None),
+            max_identity_k=int(it.get("max_identity_k", 2048)),
+            out_dtype=str(it.get("out_dtype") or "float16"),
+        )
+
+
 def reconstruct_moe_tp_blockdiag_factors(
     *,
     A_shards: List[torch.Tensor],
