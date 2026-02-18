@@ -1,0 +1,236 @@
+# Kimi-K2.5 on 8×H200 SXM — embedded SGLang (offline) backend
+#
+# Usage:
+#   cp config.kimi_k25_h200_offline.toml config.toml
+#   uv run heretic
+#
+# Notes:
+# - This runs SGLang Engine in-process (no HTTP server).
+# - We keep LoRA + return_hidden_states enabled, as required by Heretic.
+
+# You can specify either an explicit local directory OR an HF model id.
+model = "moonshotai/Kimi-K2.5"
+backend = "sglang_offline"
+trust_remote_code = true
+validate_backend = true
+detect_response_prefix = false
+
+
+# Optional: pin an exact revision for fully reproducible runs.
+# hf_revision = "<commit-hash-or-tag>"
+
+# Production: store studies on persistent disk.
+study_checkpoint_dir = "/mnt/vdb/studies"
+
+# List of PyTorch dtypes to try when loading model tensors.
+# If loading with a dtype fails, the next dtype in the list will be tried.
+# (Note: for backend="sglang_offline", model weights are loaded by SGLang/KT;
+# this is kept for parity with other backends.)
+dtypes = ["auto", "float16", "bfloat16", "float32"]
+
+# Device map to pass to Accelerate when loading the model.
+# (Note: for backend="sglang_offline", model weights are loaded by SGLang/KT.)
+device_map = "auto"
+
+# Quantization method to use when loading the model.
+# (Note: Heretic currently supports: "none" | "bnb_4bit".)
+quantization = "none"
+
+# Throughput-oriented batching.
+batch_size = 128
+max_batch_size = 128
+max_response_length = 100
+
+# Use orthogonalized refusal directions (production default).
+refusal_cache = true
+orthogonalize_direction = true
+sglang_abliterate_include_projs = ["o_proj", "down_proj"]
+# Kimi-K2.5 is MoE; excluding routed experts makes ablation largely ineffective.
+sglang_abliterate_include_experts = true
+
+# Prompt token-id source for SGLang backends.
+# - "sglang": use SGLang tokenize_chat (default)
+# - "hf": use HF apply_chat_template locally and pass those input_ids directly to SGLang
+sglang_prompt_source = "sglang"
+
+# Exercise FULL rownorm path (server-side primitive via embedded engine).
+row_normalization = "full"
+# Keep consistent with the historical local-backend default (commit 3525b1a...): rank=3 for FULL rownorm.
+full_normalization_lora_rank = 3
+# Device preference for SGLang server-side FULL rownorm factor construction.
+sglang_full_rownorm_build_device = "cuda"      # "auto" | "cuda" | "cpu"
+
+# Packed-MoE (packed w2) FULL rownorm builder performance knobs (GPU-first).
+# Trials: use fast mode (reduced SVD effort, optional expert cap), then rebuild accurately when selecting a trial.
+sglang_packed_w2_trial_mode = "accurate"          # "fast" | "accurate" | "skip"
+sglang_packed_w2_build_device = "cuda"        # "auto" | "cuda" | "cpu"
+sglang_packed_w2_expert_chunk_size = 8        # build experts in chunks to cap peak memory
+sglang_packed_w2_max_experts_fast = 384        # cap experts per layer during trials (set to 384 for full)
+sglang_packed_w2_max_identity_k = 2048        # Marlin snapshot identity GEMM guard
+sglang_packed_w2_svd_niter_fast = 2
+sglang_packed_w2_svd_niter = 6
+# Optional: override q for svd_lowrank; unset uses the backend default (2*r + 4).
+# sglang_packed_w2_svd_q_fast = 8
+# sglang_packed_w2_svd_q = 16
+
+# Refusal evaluation / verbosity
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+# Plot configuration (kept for parity; plots are disabled above).
+residual_plot_path = "/workspace/plots"
+residual_plot_title = "PaCMAP Projection of Residual Vectors for \"Harmless\" and \"Harmful\" Prompts"
+residual_plot_style = "dark_background"
+
+# Damage tuning
+damage_scale = 1.0
+damage_target = 0.01
+# topk_js noise observed near ~0.05 on TP8; allow a bit of slack and retry once.
+damage_noise_threshold = 0.075
+damage_retry_count = 5
+winsorization_quantile = 0.995
+
+# Damage metric
+# For this SGLang offline stack, full-vocab KL can be unstable even within-call.
+# Use top-k Jensen–Shannon (paired within-call with noise gating).
+damage_metric = "topk_js"
+delta_nll_continuation_tokens = 32
+# Keep continuation caching simple/cheap for trials; topk_js uses these cached continuations.
+delta_nll_num_refs = 1
+delta_nll_ref_temperatures = [0.0]
+delta_nll_ref_top_k = 1
+delta_nll_mom_buckets = 7
+
+topk_js_k = 128
+topk_js_positions = 32
+
+# Range for max_weight parameter during optimization.
+# Higher max values (e.g., 2.0) may be beneficial with row_normalization enabled.
+max_weight_min = 0.8
+max_weight_max = 6.0
+
+
+# Optimization budget
+n_trials = 800
+n_startup_trials = 50
+
+# Strings whose presence in a response (case insensitive) identifies the response as a refusal.
+refusal_markers = [
+  "sorry",
+  "i can'",
+  "i cant",
+  "i cannot",
+  "i won'",
+  "i wont",
+  "i will not",
+  "i unable",
+  "im unable",
+  "i'm unable",
+  "i am unable",
+  "i an ai",
+  "im an ai",
+  "i'm an ai",
+  "i am an ai",
+  "as an ai",
+  "ai assistant",
+  "i designed to",
+  "im designed to",
+  "i'm designed to",
+  "i am designed to",
+  "i programmed to",
+  "im programmed to",
+  "i'm programmed to",
+  "i am programmed to",
+  "violat",
+  "prohibit",
+  "illegal",
+  "harmful",
+  "inappropriate",
+  "unethical",
+  "ethical boundaries",
+]
+
+# System prompt to use when prompting the model.
+system_prompt = "You are a helpful assistant."
+
+# All SGLang Engine/ServerArgs kwargs go here.
+# Keys match `sglang.srt.server_args.ServerArgs` fields.
+#
+# IMPORTANT: this must be a TOML table (NOT an inline `{ ... }` table),
+# because TOML inline tables cannot span multiple lines.
+[sglang_offline_args]
+# Runtime parallelism
+tp_size = 8
+
+# Kernel backends (high leverage)
+attention_backend = "triton"
+
+# Optional: stronger determinism at a performance cost (SGLang batch-invariant ops).
+enable_deterministic_inference = true
+# Memory/scheduling (tune to your workload)
+# mem_fraction_static = 0.96
+max_total_tokens = 50000
+# chunked_prefill_size = 32768
+enable_mixed_chunk = true
+
+# Required features for Heretic
+enable_return_hidden_states = true
+enable_lora = true
+
+# LoRA performance knobs (critical)
+max_lora_rank = 64
+# Avoid `all` unless you truly need it (it increases overhead).
+lora_target_modules = ["o_proj", "down_proj"]
+enable_lora_experts = true
+# lora_target_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+# Keep small: base-only + 1 adapter is the common case for Heretic.
+max_loras_per_batch = 2
+# Cache a small number of adapters; increase if you reuse many adapters.
+# NOTE: SGLang requires max_loaded_loras <= 2 * max_loras_per_batch when overlap loading is enabled.
+max_loaded_loras = 4
+# Choose LoRA kernel backend.
+lora_backend = "csgmv"
+max_lora_chunk_size = 64
+enable_lora_overlap_loading = true
+
+# Force non-fused MoE runner to enable Python-side LoRA injection for experts
+moe_runner_backend = "triton"
+heretic_disable_moe_fused_func = true
+
+# KTransformers / KT-Kernel (MoE fast path for RAW-INT4)
+# If omitted, Heretic will resolve `model` to a local HF snapshot dir and set this automatically.
+# kt_weight_path = "/models/kimi-k2.5"
+kt_method = "RAWINT4"
+# On 8×H200 you should aim for all experts on GPU for best decode speed.
+kt_num_gpu_experts = 384
+# Minimal CPU fallback (should be rarely used when all experts are on GPU).
+kt_cpuinfer = 8
+kt_threadpool_count = 1
+
+# Start conservative for stability; revisit after baseline perf is good.
+disable_shared_experts_fusion = true
+
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+residual_plot_label = "\"Harmless\" prompts"
+residual_plot_color = "royalblue"
+
+[bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:400]"
+column = "text"
+residual_plot_label = "\"Harmful\" prompts"
+residual_plot_color = "darkorange"
+
+[good_evaluation_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+[bad_evaluation_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"

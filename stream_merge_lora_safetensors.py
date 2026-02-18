@@ -370,27 +370,57 @@ def _build_lora_maps(
 
 
 def _copy_support_files(base_dir: Path, out_dir: Path) -> None:
-    # Best-effort copy of common HF repo artifacts needed for loading.
-    candidates = [
-        "config.json",
-        "generation_config.json",
-        "tokenizer.json",
-        "tokenizer.model",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "vocab.json",
-        "merges.txt",
-        "added_tokens.json",
-        "chat_template.json",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "spiece.model",
-        "modeling_rope_utils.py",  # some repos ship helpers; harmless if missing
-    ]
-    for name in candidates:
-        src = base_dir / name
-        if src.exists() and src.is_file():
-            shutil.copy2(src, out_dir / name)
+    """
+    Replicate the base model directory into out_dir, excluding weight shards.
+
+    Goal: the merged output should look like a "copy" of the base repo snapshot with
+    modified/linked `.safetensors` shards. We therefore bring over *everything*
+    except the large weight shard files (and index json that we regenerate).
+
+    Implementation: prefer hardlinks (fast, space-efficient), fall back to copy.
+    """
+
+    def _should_skip(src_rel: Path) -> bool:
+        name = src_rel.name
+        if name.endswith(".safetensors"):
+            return True
+        # We always regenerate the index json (may differ if we attach extras).
+        if name.endswith(".safetensors.index.json"):
+            return True
+        return False
+
+    def _link_or_copy(src_abs: Path, dst_abs: Path) -> None:
+        dst_abs.parent.mkdir(parents=True, exist_ok=True)
+        if dst_abs.exists() or dst_abs.is_symlink():
+            # Never clobber anything the merger already wrote/linked.
+            return
+        # If src_abs is a symlink (HF snapshots often are), link/copy the resolved
+        # target to avoid producing broken relative symlinks in out_dir.
+        src_target = src_abs.resolve(strict=False)
+        try:
+            os.link(src_target.as_posix(), dst_abs.as_posix())
+            return
+        except OSError:
+            shutil.copy2(src_target, dst_abs)
+
+    base_dir = base_dir.resolve()
+    out_dir = out_dir.resolve()
+
+    for src_abs in base_dir.rglob("*"):
+        try:
+            src_rel = src_abs.relative_to(base_dir)
+        except Exception:
+            continue
+        if src_rel == Path("."):
+            continue
+        if _should_skip(src_rel):
+            continue
+        dst_abs = out_dir / src_rel
+        if src_abs.is_dir():
+            dst_abs.mkdir(parents=True, exist_ok=True)
+            continue
+        if src_abs.is_file() or src_abs.is_symlink():
+            _link_or_copy(src_abs, dst_abs)
 
 
 def _parse_device(s: str) -> torch.device:
@@ -464,9 +494,21 @@ def _link_unchanged_shard(
             _die(f"Destination already exists: {dst}")
         dst.unlink()
 
+    # HuggingFace snapshot shards are often symlinks into ../../blobs/<hash>. If we
+    # symlink such a snapshot file into an arbitrary output directory, the symlink
+    # target text may be invalid relative to the new location, producing broken
+    # symlinks and failing structural validation (Path.exists() follows symlinks).
+    #
+    # Always link against the resolved *target* path to ensure the created link
+    # points at real data regardless of the output directory location.
+    #
+    # NOTE: resolve(strict=False) preserves behavior if the file is temporarily
+    # missing; callers will hit errors later when reading.
+    src_target = src.resolve(strict=False)
+
     if mode in {"auto", "hardlink"}:
         try:
-            os.link(src.as_posix(), dst.as_posix())
+            os.link(src_target.as_posix(), dst.as_posix())
             return
         except OSError as e:
             if mode == "hardlink":
@@ -476,7 +518,7 @@ def _link_unchanged_shard(
                 pass
 
     if mode in {"auto", "symlink"}:
-        rel = os.path.relpath(src.as_posix(), start=dst.parent.as_posix())
+        rel = os.path.relpath(src_target.as_posix(), start=dst.parent.as_posix())
         try:
             os.symlink(rel, dst.as_posix())
             return

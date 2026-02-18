@@ -1,0 +1,24 @@
+{
+  "tp_size": 8,
+
+  "reasoning_parser": "deepseek-v3",
+  "tool_call_parser": "deepseekv32",
+
+  "attention_backend": "triton",
+  "kv_cache_dtype": "bfloat16",
+
+  "mem_fraction_static": 0.88,
+  "max_total_tokens": 32000,
+  "max_prefill_tokens": 8192,
+  "max_running_requests": 1,
+
+  "enable_mixed_chunk": false,
+  "enable_deterministic_inference": true,
+
+  "enable_return_hidden_states": false,
+  "enable_lora": false,
+
+  "moe_runner_backend": "triton",
+  "disable_shared_experts_fusion": true
+}
+

@@ -204,12 +204,74 @@ def _dtype_name(dtype: Any) -> str:
     return str(dtype)
 
 
+# --- safetensors API compatibility -------------------------------------------------
+#
+# Newer safetensors versions (e.g. 0.7.0) return a PySafeSlice from
+# safe_open(...).get_slice(key) that exposes get_dtype()/get_shape() but does NOT
+# expose a .dtype attribute. Older versions had .dtype.
+#
+# This merger relies on dtype without materializing tensors, so we provide a small
+# shim that works across versions.
+_SAFETENSORS_DTYPE_CODE_TO_TORCH: dict[str, torch.dtype] = {
+    # floats
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "BF16": torch.bfloat16,
+    # ints / bool
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+# float8 codes observed in the wild / in DeepSeek V3.x shards
+if hasattr(torch, "float8_e4m3fn"):
+    _SAFETENSORS_DTYPE_CODE_TO_TORCH["F8_E4M3"] = torch.float8_e4m3fn
+    _SAFETENSORS_DTYPE_CODE_TO_TORCH["F8_E4M3FN"] = torch.float8_e4m3fn
+if hasattr(torch, "float8_e5m2"):
+    _SAFETENSORS_DTYPE_CODE_TO_TORCH["F8_E5M2"] = torch.float8_e5m2
+if hasattr(torch, "float8_e4m3fnuz"):
+    _SAFETENSORS_DTYPE_CODE_TO_TORCH["F8_E4M3FNUZ"] = torch.float8_e4m3fnuz
+if hasattr(torch, "float8_e5m2fnuz"):
+    _SAFETENSORS_DTYPE_CODE_TO_TORCH["F8_E5M2FNUZ"] = torch.float8_e5m2fnuz
+if hasattr(torch, "float8_e8m0fnu"):
+    _SAFETENSORS_DTYPE_CODE_TO_TORCH["F8_E8M0"] = torch.float8_e8m0fnu
+    _SAFETENSORS_DTYPE_CODE_TO_TORCH["F8_E8M0FNU"] = torch.float8_e8m0fnu
+
+
+def _slice_dtype_torch(slice_obj: Any) -> torch.dtype:
+    """
+    Return a torch.dtype for a safetensors slice object across safetensors versions.
+    """
+    dt = getattr(slice_obj, "dtype", None)
+    if isinstance(dt, torch.dtype):
+        return dt
+
+    if hasattr(slice_obj, "get_dtype"):
+        code = slice_obj.get_dtype()
+        if isinstance(code, str):
+            norm = code.strip().upper().replace("-", "_")
+            mapped = _SAFETENSORS_DTYPE_CODE_TO_TORCH.get(norm)
+            if mapped is not None:
+                return mapped
+            raise ValueError(f"Unsupported safetensors dtype code {code!r} (normalized {norm!r})")
+
+    raise AttributeError(f"Cannot determine dtype from safetensors slice type={type(slice_obj)}")
+
+
+def _tensor_dtype_from_shard(shard_f: Any, key: str) -> torch.dtype:
+    return _slice_dtype_torch(shard_f.get_slice(key))
+
+
 def detect_quant_format(
     *,
     weight_key: str,
-    shard_keys: set[str],
     dtype: torch.dtype,
-    shard_f: Any,
+    has_key: Any,
+    get_slice: Any,
 ) -> QuantFormat:
     base = weight_key.removesuffix(".weight").removesuffix(".weight_packed")
     scale_inv_key = f"{base}.weight_scale_inv"
@@ -217,15 +279,15 @@ def detect_quant_format(
     shape_key = f"{base}.weight_shape"
 
     if _is_float8(dtype):
-        if scale_inv_key in shard_keys:
-            scale_slice = shard_f.get_slice(scale_inv_key)
+        if bool(has_key(scale_inv_key)):
+            scale_slice = get_slice(scale_inv_key)
             shape = tuple(int(x) for x in scale_slice.get_shape())
             if len(shape) != 2:
                 raise ValueError(
                     f"FP8 tensor {weight_key} has invalid companion shape for "
                     f"{scale_inv_key}: {shape}"
                 )
-            sd = scale_slice.dtype
+            sd = _slice_dtype_torch(scale_slice)
             if sd == torch.int32:
                 return QuantFormat.FP8_BLOCK_INV_UE8M0
             if _is_floating_dtype(sd):
@@ -234,10 +296,10 @@ def detect_quant_format(
                 f"FP8 tensor {weight_key} has unsupported companion dtype for "
                 f"{scale_inv_key}: {_dtype_name(sd)}"
             )
-        if scale_key in shard_keys:
-            scale_slice = shard_f.get_slice(scale_key)
+        if bool(has_key(scale_key)):
+            scale_slice = get_slice(scale_key)
             shape = tuple(int(x) for x in scale_slice.get_shape())
-            sd = scale_slice.dtype
+            sd = _slice_dtype_torch(scale_slice)
             if not _is_floating_dtype(sd):
                 raise ValueError(
                     f"FP8 tensor {weight_key} has non-float companion dtype for "
@@ -255,7 +317,7 @@ def detect_quant_format(
         )
 
     if weight_key.endswith(".weight_packed") and dtype == torch.int32:
-        if scale_key in shard_keys and shape_key in shard_keys:
+        if bool(has_key(scale_key)) and bool(has_key(shape_key)):
             return QuantFormat.INT4_CT
         raise ValueError(
             f"Packed INT4 tensor {weight_key} missing companions: "
@@ -263,8 +325,8 @@ def detect_quant_format(
         )
 
     if dtype == torch.uint8:
-        if scale_key in shard_keys:
-            sd = shard_f.get_slice(scale_key).dtype
+        if bool(has_key(scale_key)):
+            sd = _slice_dtype_torch(get_slice(scale_key))
             if sd == torch.uint8:
                 return QuantFormat.MXFP4
         raise ValueError(
@@ -278,7 +340,7 @@ def detect_quant_format(
     raise ValueError(f"Unsupported tensor format for {weight_key}: dtype={dtype}")
 
 
-def get_companion_keys(weight_key: str, fmt: QuantFormat, shard_keys: set[str]) -> list[str]:
+def get_companion_keys(weight_key: str, fmt: QuantFormat, has_key: Any) -> list[str]:
     base = weight_key.removesuffix(".weight").removesuffix(".weight_packed")
     if fmt in {QuantFormat.FP8_BLOCK_INV, QuantFormat.FP8_BLOCK_INV_UE8M0}:
         return [f"{base}.weight_scale_inv"]
@@ -288,7 +350,7 @@ def get_companion_keys(weight_key: str, fmt: QuantFormat, shard_keys: set[str]) 
         keys = [f"{base}.weight_scale", f"{base}.weight_shape"]
         for suffix in (".weight_zero_point", ".weight_g_idx"):
             k = f"{base}{suffix}"
-            if k in shard_keys:
+            if bool(has_key(k)):
                 keys.append(k)
         return keys
     if fmt == QuantFormat.MXFP4:
@@ -700,7 +762,7 @@ def _collect_all_tensor_meta(model_dir: Path, weight_map: Mapping[str, str]) -> 
         with safe_open((model_dir / shard).as_posix(), framework="pt", device="cpu") as f:
             for k in keys:
                 sl = f.get_slice(k)
-                out[k] = (sl.dtype, tuple(int(x) for x in sl.get_shape()))
+                out[k] = (_slice_dtype_torch(sl), tuple(int(x) for x in sl.get_shape()))
     return out
 
 
@@ -784,20 +846,59 @@ def _run_verify_checks(
     sample_targeted = _sample_items(targeted, samples, seed=123)
     sample_non = _sample_items(non_targeted, samples, seed=456)
 
-    with safe_open(adapter_weights_path.as_posix(), framework="pt", device="cpu") as af:
-        for k in sample_targeted:
-            shard = weight_map[k]
-            with safe_open((base_dir / shard).as_posix(), framework="pt", device="cpu") as bf:
-                with safe_open((out_dir / shard).as_posix(), framework="pt", device="cpu") as of:
-                    shard_keys = set(bf.keys())
-                    dtype = bf.get_slice(k).dtype
-                    fmt = detect_quant_format(weight_key=k, shard_keys=shard_keys, dtype=dtype, shard_f=bf)
-                    ckeys = get_companion_keys(k, fmt, shard_keys)
-                    comp_base = {ck: bf.get_tensor(ck) for ck in ckeys}
-                    comp_out = {ck: of.get_tensor(ck) for ck in ckeys}
-                    if fmt == QuantFormat.MXFP4:
-                        comp_base[k] = bf.get_tensor(k)
-                        comp_out[k] = of.get_tensor(k)
+    def _has_key(k: str) -> bool:
+        return k in weight_map
+
+    base_handles: dict[str, Any] = {}
+    out_handles: dict[str, Any] = {}
+
+    def _handle_for(model_dir: Path, shard: str) -> Any:
+        if model_dir == base_dir:
+            h = base_handles.get(shard)
+            if h is None:
+                h = safe_open((model_dir / shard).as_posix(), framework="pt", device="cpu")
+                base_handles[shard] = h
+            return h
+        if model_dir == out_dir:
+            h = out_handles.get(shard)
+            if h is None:
+                h = safe_open((model_dir / shard).as_posix(), framework="pt", device="cpu")
+                out_handles[shard] = h
+            return h
+        # Fallback: open ad-hoc.
+        return safe_open((model_dir / shard).as_posix(), framework="pt", device="cpu")
+
+    def _slice_from_dir(model_dir: Path, k: str) -> Any:
+        shard = weight_map.get(k)
+        if shard is None:
+            raise KeyError(k)
+        return _handle_for(model_dir, shard).get_slice(k)
+
+    def _tensor_from_dir(model_dir: Path, k: str) -> torch.Tensor:
+        shard = weight_map.get(k)
+        if shard is None:
+            raise KeyError(k)
+        return _handle_for(model_dir, shard).get_tensor(k)
+
+    try:
+        with safe_open(adapter_weights_path.as_posix(), framework="pt", device="cpu") as af:
+            for k in sample_targeted:
+                shard = weight_map[k]
+                bf = _handle_for(base_dir, shard)
+                of = _handle_for(out_dir, shard)
+                dtype = _tensor_dtype_from_shard(bf, k)
+                fmt = detect_quant_format(
+                    weight_key=k,
+                    dtype=dtype,
+                    has_key=_has_key,
+                    get_slice=lambda kk: _slice_from_dir(base_dir, kk),
+                )
+                ckeys = get_companion_keys(k, fmt, _has_key)
+                comp_base = {ck: _tensor_from_dir(base_dir, ck) for ck in ckeys}
+                comp_out = {ck: _tensor_from_dir(out_dir, ck) for ck in ckeys}
+                if fmt == QuantFormat.MXFP4:
+                    comp_base[k] = bf.get_tensor(k)
+                    comp_out[k] = of.get_tensor(k)
 
                     w_base_q = bf.get_tensor(k)
                     w_out_q = of.get_tensor(k)
@@ -839,19 +940,23 @@ def _run_verify_checks(
                             f"fmt={fmt.value} max_abs_err={err} tol={tol}"
                         )
 
-        for k in sample_non:
-            shard = weight_map[k]
-            with safe_open((base_dir / shard).as_posix(), framework="pt", device="cpu") as bf:
-                shard_keys = set(bf.keys())
-                dtype = bf.get_slice(k).dtype
+            for k in sample_non:
+                shard = weight_map[k]
+                bf = _handle_for(base_dir, shard)
+                dtype = _tensor_dtype_from_shard(bf, k)
                 try:
-                    fmt = detect_quant_format(weight_key=k, shard_keys=shard_keys, dtype=dtype, shard_f=bf)
+                    fmt = detect_quant_format(
+                        weight_key=k,
+                        dtype=dtype,
+                        has_key=_has_key,
+                        get_slice=lambda kk: _slice_from_dir(base_dir, kk),
+                    )
                 except Exception:
                     continue
                 if fmt == QuantFormat.FLOAT:
                     continue
-                ckeys = get_companion_keys(k, fmt, shard_keys)
-                companions = {ck: bf.get_tensor(ck) for ck in ckeys}
+                ckeys = get_companion_keys(k, fmt, _has_key)
+                companions = {ck: _tensor_from_dir(base_dir, ck) for ck in ckeys}
                 if fmt == QuantFormat.MXFP4:
                     companions[k] = bf.get_tensor(k)
                 wq = bf.get_tensor(k)
@@ -882,6 +987,17 @@ def _run_verify_checks(
                     )
                     if not math.isfinite(max_err) or max_err > tol:
                         _die(f"[verify] codec roundtrip failed for {k}: fmt={fmt.value} max_err={max_err} tol={tol}")
+    finally:
+        for h in list(base_handles.values()):
+            try:
+                h.close()
+            except Exception:
+                pass
+        for h in list(out_handles.values()):
+            try:
+                h.close()
+            except Exception:
+                pass
 
     dt = time.monotonic() - t0
     print(f"[verify] completed in {dt:.1f}s")
@@ -962,7 +1078,29 @@ def merge_lora_quantized(
     base_override_keys = set(overrides.keys()) & base_keys
     affected_keys = set(lora_by_base_weight.keys()) | base_override_keys | set(bias_updates.keys())
     affected_keys = {k for k in affected_keys if k in base_keys}
-    changed_shards = {base_layout.weight_map[k] for k in affected_keys}
+
+    # IMPORTANT: some quantization companions (e.g. FP8 *.weight_scale_inv) are not
+    # co-located with the weight tensor in DeepSeek V3.x sharding. If we modify a
+    # quantized weight, we may also need to update its companion tensors, which can
+    # live in a *different* shard. Therefore include companion shards in the rewrite
+    # set up-front (before we decide which shards to link).
+    affected_keys_all = set(affected_keys)
+    for k in list(affected_keys):
+        if not (k.endswith(".weight") or k.endswith(".weight_packed")):
+            continue
+        base = k.removesuffix(".weight").removesuffix(".weight_packed")
+        for suffix in (
+            ".weight_scale_inv",
+            ".weight_scale",
+            ".weight_shape",
+            ".weight_zero_point",
+            ".weight_g_idx",
+        ):
+            ck = f"{base}{suffix}"
+            if ck in base_layout.weight_map:
+                affected_keys_all.add(ck)
+
+    changed_shards = {base_layout.weight_map[k] for k in affected_keys_all}
 
     if link_unchanged != "off":
         if _is_subpath(out_dir, base_dir) or _is_subpath(base_dir, out_dir):
@@ -992,6 +1130,21 @@ def merge_lora_quantized(
 
     t_start = time.monotonic()
     try:
+        # Cache of additional base shard file handles for cross-shard companions.
+        # DeepSeek V3.x has FP8 scale_inv tensors sometimes placed in the *next* shard.
+        base_shard_handles: dict[str, Any] = {}
+        pending_updates: dict[str, dict[str, torch.Tensor]] = {}
+
+        def _base_handle_for_shard(shard_name: str) -> Any:
+            h = base_shard_handles.get(shard_name)
+            if h is None:
+                h = safe_open((base_dir / shard_name).as_posix(), framework="pt", device="cpu")
+                base_shard_handles[shard_name] = h
+            return h
+
+        def _has_base_key(key: str) -> bool:
+            return key in base_layout.weight_map
+
         for shard_path in base_layout.shard_files:
             shard_name = shard_path.name
             out_shard_path = out_dir / shard_name
@@ -1009,11 +1162,37 @@ def merge_lora_quantized(
             with safe_open(shard_path.as_posix(), framework="pt", device="cpu") as base_f:
                 shard_keys = set(base_f.keys())
                 out_tensors: dict[str, torch.Tensor] = {}
+                # Apply any cross-shard pending updates destined for this shard.
+                incoming = pending_updates.pop(shard_name, None)
+                if incoming:
+                    out_tensors.update(incoming)
+
+                def _get_slice_global(key: str) -> Any:
+                    sn = base_layout.weight_map.get(key)
+                    if sn is None:
+                        raise KeyError(key)
+                    if sn == shard_name:
+                        return base_f.get_slice(key)
+                    return _base_handle_for_shard(sn).get_slice(key)
+
+                def _get_tensor_global(key: str) -> torch.Tensor:
+                    sn = base_layout.weight_map.get(key)
+                    if sn is None:
+                        raise KeyError(key)
+                    if sn == shard_name:
+                        return base_f.get_tensor(key)
+                    return _base_handle_for_shard(sn).get_tensor(key)
+
                 for k in base_f.keys():
+                    # If this key was already written (e.g. updated companion coming
+                    # from another weight), do not overwrite it.
+                    if k in out_tensors:
+                        continue
+
                     # Direct override wins.
                     if k in overrides:
                         src_k = overrides[k]
-                        base_dtype = base_f.get_slice(k).dtype
+                        base_dtype = _tensor_dtype_from_shard(base_f, k)
                         out_tensors[k] = adapter_f.get_tensor(src_k).to(dtype=base_dtype, device="cpu").contiguous()
                         continue
 
@@ -1039,12 +1218,17 @@ def merge_lora_quantized(
                         alpha_patterns=[(p, float(v)) for p, v in alpha_patterns],
                     )
                     scale = _scaling(alpha, int(A.shape[0]), adapter_spec.use_rslora)
-                    dtype = base_f.get_slice(k).dtype
-                    fmt = detect_quant_format(weight_key=k, shard_keys=shard_keys, dtype=dtype, shard_f=base_f)
-                    ckeys = get_companion_keys(k, fmt, shard_keys)
-                    companions = {ck: base_f.get_tensor(ck) for ck in ckeys}
+                    dtype = _tensor_dtype_from_shard(base_f, k)
+                    fmt = detect_quant_format(
+                        weight_key=k,
+                        dtype=dtype,
+                        has_key=_has_base_key,
+                        get_slice=_get_slice_global,
+                    )
+                    ckeys = get_companion_keys(k, fmt, _has_base_key)
+                    companions = {ck: _get_tensor_global(ck) for ck in ckeys}
                     if fmt == QuantFormat.MXFP4:
-                        companions[k] = base_f.get_tensor(k)
+                        companions[k] = _get_tensor_global(k)
 
                     if fmt == QuantFormat.FLOAT:
                         W = base_f.get_tensor(k)
@@ -1102,17 +1286,39 @@ def merge_lora_quantized(
                     )
                     out_tensors[k] = new_weight.contiguous()
                     for ck, cv in updated_companions.items():
-                        out_tensors[ck] = cv.contiguous()
-                    # Preserve non-updated companion tensors.
+                        dst_shard = base_layout.weight_map.get(ck)
+                        if dst_shard is None:
+                            raise KeyError(f"Updated companion key missing from weight_map: {ck}")
+                        if dst_shard == shard_name:
+                            out_tensors[ck] = cv.contiguous()
+                        else:
+                            pending_updates.setdefault(dst_shard, {})[ck] = cv.contiguous()
+                    # Preserve non-updated companion tensors (in their home shards).
                     for ck in ckeys:
-                        if ck not in out_tensors:
-                            out_tensors[ck] = companions[ck].contiguous()
+                        if ck in updated_companions:
+                            continue
+                        dst_shard = base_layout.weight_map.get(ck)
+                        if dst_shard is None:
+                            raise KeyError(f"Companion key missing from weight_map: {ck}")
+                        if dst_shard == shard_name:
+                            # Might already be present via a later overwrite; only set if absent.
+                            if ck not in out_tensors:
+                                out_tensors[ck] = companions[ck].contiguous()
+                        else:
+                            pending_updates.setdefault(dst_shard, {})[ck] = companions[ck].contiguous()
 
                 save_file(out_tensors, out_shard_path.as_posix(), metadata={"format": "pt"})
                 del out_tensors
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+        if pending_updates:
+            # This should never happen for DeepSeek V3.x sharding (companions are in the same
+            # shard or a later shard), but keep a hard check to avoid silently producing an
+            # inconsistent checkpoint.
+            leftovers = sorted((sn, len(v)) for sn, v in pending_updates.items() if v)
+            _die(f"[merge] internal error: unflushed companion updates remain: {leftovers[:5]}")
 
         # Preserve index shape and mapping exactly.
         if base_layout.index_json is not None:
@@ -1130,6 +1336,12 @@ def merge_lora_quantized(
             adapter_f.close()
         except Exception:
             pass
+        # Close any extra base shard handles.
+        for h in list(locals().get("base_shard_handles", {}).values()):
+            try:
+                h.close()
+            except Exception:
+                pass
 
     elapsed = time.monotonic() - t_start
     print(f"[merge] merge completed in {elapsed:.1f}s")

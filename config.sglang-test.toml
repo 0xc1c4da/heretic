@@ -1,0 +1,63 @@
+model = "moonshotai/Kimi-K2.5"
+backend = "sglang_offline"
+trust_remote_code = true
+validate_backend = true
+detect_response_prefix = false
+
+batch_size = 1
+max_batch_size = 8
+max_response_length = 64
+
+row_normalization = "full"
+full_normalization_lora_rank = 64
+
+n_trials = 1
+n_startup_trials = 0
+study_checkpoint_dir = "checkpoints/kimi_k25_h200_offline_trial1"
+
+[sglang_offline_args]
+tp_size = 8
+attention_backend = "flashinfer"
+
+mem_fraction_static = 0.96
+max_total_tokens = 50000
+chunked_prefill_size = 32768
+enable_mixed_chunk = true
+
+enable_return_hidden_states = true
+enable_lora = true
+
+max_lora_rank = 64
+lora_target_modules = ["o_proj", "down_proj"]
+max_loras_per_batch = 2
+max_loaded_loras = 4 
+lora_backend = "csgmv"
+max_lora_chunk_size = 64
+enable_lora_overlap_loading = true
+
+kt_method = "RAWINT4"
+kt_num_gpu_experts = 384
+kt_cpuinfer = 8
+kt_threadpool_count = 1
+
+disable_shared_experts_fusion = true
+
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:32]"
+column = "text"
+
+[bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:32]"
+column = "text"
+
+[good_evaluation_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:16]"
+column = "text"
+
+[bad_evaluation_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:16]"
+column = "text"

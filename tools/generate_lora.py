@@ -107,7 +107,18 @@ def _load_settings_from_toml(config_path: str, *, model_override: str | None) ->
         raise ValueError(f"Config at {config_path!r} must parse to a TOML table.")
     if model_override:
         raw["model"] = model_override
-    return Settings.model_validate(raw)
+    # NOTE: Settings is a pydantic-settings BaseSettings subclass with a CliSettingsSource enabled.
+    # In our environment, Settings.model_validate(...) still consults CLI sources and will attempt
+    # to parse sys.argv. That breaks this tool because sys.argv contains *this* script's flags
+    # (e.g. --config/--trial/--output), which are not valid Settings CLI args.
+    #
+    # Workaround: temporarily strip argv to just the program name while validating TOML.
+    saved_argv = list(sys.argv)
+    try:
+        sys.argv[:] = sys.argv[:1]
+        return Settings.model_validate(raw)
+    finally:
+        sys.argv[:] = saved_argv
 
 
 def _sanitized_model_study_name(model_name: str) -> str:
@@ -403,9 +414,34 @@ def _materialize_packed_moe_factors(model: Model, bundle: Any) -> None:
                 print(f"Warning: failed to unload adapter {adapter_name!r}: {exc}")
 
 
+def _print_resolved_parameters(
+    *,
+    direction_index: float | None,
+    parameters: dict[str, AbliterationParameters],
+) -> None:
+    # Keep output stable/diffable for runs and logs.
+    payload: dict[str, Any] = {
+        "direction_index": direction_index,
+        "parameters": {},
+    }
+    for component in sorted(parameters.keys()):
+        p = parameters[component]
+        payload["parameters"][component] = {field: float(getattr(p, field)) for field in _ABLITERATION_FIELDS}
+    print("Resolved trial parameters:")
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def run(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    # Mirror heretic's allocator guardrail (best-effort).
+    if (
+        torch.cuda.is_available()
+        and "PYTORCH_ALLOC_CONF" not in os.environ
+        and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+    ):
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
     settings = _load_settings_from_toml(args.config, model_override=args.model)
     backend_type = getattr(settings, "backend", BackendType.LOCAL)
@@ -418,6 +454,7 @@ def run(argv: list[str] | None = None) -> int:
     model = Model(settings)
     refusal_directions = _load_or_compute_refusal_directions(settings, model)
     direction_index, parameters = _resolve_parameter_source(args, settings)
+    _print_resolved_parameters(direction_index=direction_index, parameters=parameters)
 
     bundle = model.build_lora_adapter_bundle(
         refusal_directions,
@@ -429,6 +466,8 @@ def run(argv: list[str] | None = None) -> int:
     tokenizer = model.tokenizer if bool(args.save_tokenizer) else None
     bundle.save_pretrained(str(args.output), tokenizer=tokenizer)
     print(f"Adapter exported to {args.output}")
+    if tokenizer is None:
+        print("Note: tokenizer files were not saved. Re-run with --save-tokenizer to export them.")
     return 0
 
 

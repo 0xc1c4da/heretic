@@ -1,17 +1,23 @@
-# DeepSeek-V3.2 on 8×H200 — embedded SGLang (offline) backend
+# GLM-5 on H200 — embedded SGLang (offline) backend
 #
 # Usage:
-#   cp config.deepseek_v32_h200_offline.toml config.toml
+#   cp config.glm5_h200_offline.toml config.toml
 #   uv run heretic
 #
 # Notes:
-# - DeepSeek-V3.2 is a DSA/NSA model in SGLang. For best stability/perf on 8×H200,
-#   the recommended setup is DP attention with dp_size=8.
-# - `validate_backend=true` runs Heretic's backend startup validations, including a LoRA hot-swap
-#   sanity check. (This repo includes a non-zero synthetic adapter for sanity, while the damage
-#   repeatability validation still enforces a strict no-op adapter.)
+# - GLM-5 is a DeepSeek-V3/V3.2-style MoE model with sparse attention (DSA). In SGLang this
+#   typically maps to the "nsa" attention backend.
+# - GLM-5 "thinking" is on by default in SGLang's `glm45` reasoning parser.
+#   If the model emits a stable boilerplate prefix (e.g. `<think>...</think>`), you can enable
+#   `detect_response_prefix=true` below to probe/suppress it.
+# - GPU sizing (from SGLang GLM-5 guidance):
+#   - H200 FP8: tp=8  (use model `zai-org/GLM-5-FP8`)  ← this config
+#   - H200 BF16: tp=16 (use model `zai-org/GLM-5`)
+#
+# IMPORTANT: This config is for the embedded/offline engine, not the HTTP server.
 
-model = "deepseek-ai/DeepSeek-V3.2"
+# You can specify either an explicit local directory OR an HF model id.
+model = "zai-org/GLM-5-FP8"
 backend = "sglang_offline"
 trust_remote_code = true
 
@@ -35,9 +41,9 @@ max_response_length = 100
 
 # Use orthogonalized refusal directions (production default).
 refusal_cache = true
-orthogonalize_direction = false
+orthogonalize_direction = true
 
-# For DeepSeek (MoE), including experts often matters for strong refusal reduction.
+# GLM-5 is MoE; including experts often matters for strong refusal reduction.
 sglang_abliterate_include_projs = ["o_proj", "down_proj"]
 sglang_abliterate_include_experts = true
 
@@ -48,6 +54,7 @@ sglang_prompt_source = "sglang"
 
 # Exercise FULL rownorm path (server-side primitive via embedded engine).
 row_normalization = "full"
+# Keep consistent with the historical local-backend default (commit 3525b1a...): rank=3 for FULL rownorm.
 full_normalization_lora_rank = 3
 # Device preference for SGLang server-side FULL rownorm factor construction.
 sglang_full_rownorm_build_device = "cuda"      # "auto" | "cuda" | "cpu"
@@ -56,9 +63,10 @@ sglang_full_rownorm_build_device = "cuda"      # "auto" | "cuda" | "cpu"
 # Trials: use accurate mode so we always build all experts (more stable/correct, slower).
 sglang_packed_w2_trial_mode = "accurate"       # "fast" | "accurate" | "skip"
 sglang_packed_w2_build_device = "cuda"         # "auto" | "cuda" | "cpu"
-sglang_packed_w2_expert_chunk_size = 8         # build experts in chunks to cap peak memory
-sglang_packed_w2_max_experts_fast = 384        # cap experts per layer during trials (set to 384 for full)
-sglang_packed_w2_max_identity_k = 2048         # Marlin snapshot identity GEMM guard
+sglang_packed_w2_expert_chunk_size = 8
+# Cap used only in "fast" mode; keep high so switching modes doesn't silently drop experts.
+sglang_packed_w2_max_experts_fast = 384
+sglang_packed_w2_max_identity_k = 2048
 sglang_packed_w2_svd_niter_fast = 2
 sglang_packed_w2_svd_niter = 6
 
@@ -96,7 +104,7 @@ max_weight_max = 8.0
 
 # Optimization budget
 n_trials = 800
-n_startup_trials = 100
+n_startup_trials = 50
 
 # System prompt to use when prompting the model.
 system_prompt = "You are a helpful assistant."
@@ -107,22 +115,24 @@ system_prompt = "You are a helpful assistant."
 # IMPORTANT: this must be a TOML table (NOT an inline `{ ... }` table),
 # because TOML inline tables cannot span multiple lines.
 [sglang_offline_args]
-# Parallelism: DeepSeek-V3.2 DSA kernels are tuned for dp_size=8.
+# Parallelism:
+# - For FP8 (zai-org/GLM-5-FP8) on 8×H200, use tp_size=8.
+# - For BF16 (zai-org/GLM-5) on H200, use tp_size=16.
 tp_size = 8
 
-# DeepSeek-V3.2 parsing (SGLang OpenAI protocol).
-# - reasoning parser: DeepSeek-V3.* uses `deepseek-v3` and the request-time `thinking` parameter.
-# - tool-call parser: DeepSeek-V3.2 uses `deepseekv32`.
-reasoning_parser = "deepseek-v3"
-tool_call_parser = "deepseekv32"
+# Reasoning & tool-call parsing (SGLang OpenAI protocol).
+# - `glm45` reasoning parser: thinking by default; can be disabled in OpenAI requests via
+#   chat_template_kwargs.enable_thinking=false (not exposed by Heretic today).
+# - `glm47` tool-call parser: used for GLM-4.7 and GLM-5 models.
+reasoning_parser = "glm45"
+tool_call_parser = "glm47"
 
-# Let SGLang use the DeepSeek-V3.2 NSA backend.
-attention_backend = "fa3"
-
-# Hopper-friendly NSA kernel choices (bf16 KV cache + fa3 decode).
+# GLM-5 uses the DeepSeek DSA/NSA attention path in SGLang (`GlmMoeDsaForCausalLM`), so pin NSA explicitly.
+# H200 defaults (matching SGLang DeepSeek-V3.2 guidance): bf16 KV cache + flashmla_sparse prefill + fa3 decode.
+attention_backend = "triton"
 kv_cache_dtype = "bfloat16"
 
-# Optional: stronger determinism at a performance cost (SGLang batch-invariant ops).
+# Stronger determinism at a performance cost (SGLang batch-invariant ops).
 enable_deterministic_inference = true
 
 # Memory/scheduling (tune to your workload)
@@ -143,11 +153,12 @@ lora_backend = "csgmv"
 max_lora_chunk_size = 64
 enable_lora_overlap_loading = true
 
-# Force non-fused MoE runner to enable Python-side LoRA injection for experts
+# MoE execution path requirements for Heretic packed-MoE injection (correct per-expert down-proj).
+# Force a non-fused runner backend and disable fused-function fast paths.
 moe_runner_backend = "triton"
 heretic_disable_moe_fused_func = true
 
-# Start conservative for stability; revisit after baseline perf is good.
+# Start conservative for stability/repeatability.
 disable_shared_experts_fusion = true
 
 [good_prompts]

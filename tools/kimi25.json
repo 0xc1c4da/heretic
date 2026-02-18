@@ -1,0 +1,13 @@
+{
+    "tp_size": 8,
+  
+    "reasoning_parser": "kimi_k2",
+    "tool_call_parser": "kimi_k2",
+
+    "mem_fraction_static": 0.9,
+    "max_total_tokens": 3000,
+    "max_prefill_tokens": 3000,
+    "max_running_requests": 1
+  }
+  
+  
